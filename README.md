@@ -3,6 +3,11 @@
 Excel 使用時に **`Ctrl+B` を `Ctrl+Shift+V`（値貼り付け）にリマップ**する、Windows 常駐アプリです。
 Rust 製・単体 EXE（ポータブル）で、通常ユーザー権限で動作します。
 
+[![CI](https://github.com/Yu5rin/MyPaste/actions/workflows/ci.yml/badge.svg)](https://github.com/Yu5rin/MyPaste/actions/workflows/ci.yml)
+
+> **ダウンロード**: ビルド済みの `atai-paste.exe` は
+> [Releases](https://github.com/Yu5rin/MyPaste/releases) から入手できます。
+
 <p align="center">
   <img src="src/icons/icon_on@256.png" width="96" alt="ON アイコン">
   &nbsp;&nbsp;&nbsp;&nbsp;
