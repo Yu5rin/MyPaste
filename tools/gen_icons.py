@@ -39,14 +39,29 @@ def load_font(size: int) -> ImageFont.FreeTypeFont:
     raise SystemExit("太字 TTF フォントが見つかりません。FONT_CANDIDATES を編集してください。")
 
 
-def draw_b(img: Image.Image) -> None:
+def draw_b(img: Image.Image, stroke_width: int = 0, stroke_fill=None) -> None:
     d = ImageDraw.Draw(img)
     font = load_font(210)
-    bbox = d.textbbox((0, 0), "B", font=font)
+    bbox = d.textbbox((0, 0), "B", font=font, stroke_width=stroke_width)
     w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
     x = (MASTER - w) / 2 - bbox[0]
     y = (MASTER - h) / 2 - bbox[1]
-    d.text((x, y), "B", font=font, fill=(15, 15, 15, 255))
+    # 文字色は黒のまま。stroke_* を渡すと縁取りを付ける。
+    d.text(
+        (x, y),
+        "B",
+        font=font,
+        fill=(15, 15, 15, 255),
+        stroke_width=stroke_width,
+        stroke_fill=stroke_fill,
+    )
+
+
+def draw_white_disc(img: Image.Image) -> None:
+    """禁止マークの内側を埋める白い円（背景）を描く。"""
+    d = ImageDraw.Draw(img)
+    margin = 14  # draw_prohibition の円と同じ位置に合わせる
+    d.ellipse([margin, margin, MASTER - margin, MASTER - margin], fill=(255, 255, 255, 255))
 
 
 def draw_prohibition(img: Image.Image) -> None:
@@ -75,11 +90,14 @@ def save_set(img: Image.Image, name: str) -> None:
 def main() -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
 
+    # ON: 黒い「B」＋白い縁取り（暗い背景でも見やすく）。
     on = Image.new("RGBA", (MASTER, MASTER), (0, 0, 0, 0))
-    draw_b(on)
+    draw_b(on, stroke_width=12, stroke_fill=(255, 255, 255, 255))
     save_set(on, "icon_on")
 
+    # OFF: 禁止マーク内を白背景にし、その上に黒い「B」＋赤い禁止マーク。
     off = Image.new("RGBA", (MASTER, MASTER), (0, 0, 0, 0))
+    draw_white_disc(off)
     draw_b(off)
     draw_prohibition(off)
     save_set(off, "icon_off")
