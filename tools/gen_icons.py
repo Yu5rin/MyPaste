@@ -106,8 +106,8 @@ def main() -> None:
     draw_prohibition(off)
     save_set(off, "icon_off")
 
-    # 実行ファイルアイコンは ON と同じ絵柄（マルチサイズ ICO）。
-    on.save(
+    # 実行ファイルアイコンは OFF と同じ絵柄（禁止マーク付き・白背景・マルチサイズ ICO）。
+    off.save(
         os.path.join(OUT_DIR, "app.ico"),
         format="ICO",
         sizes=[(s, s) for s in SIZES],
