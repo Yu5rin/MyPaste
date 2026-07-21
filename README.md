@@ -3,8 +3,6 @@
 Excel 使用時に **`Ctrl+B` を `Ctrl+Shift+V`（値貼り付け）にリマップ**する、Windows 常駐アプリです。
 Rust 製・単体 EXE（ポータブル）で、通常ユーザー権限で動作します。
 
-[![CI](https://github.com/Yu5rin/MyPaste/actions/workflows/ci.yml/badge.svg)](https://github.com/Yu5rin/MyPaste/actions/workflows/ci.yml)
-
 > **ダウンロード**: ビルド済みの `atai-paste.exe` は
 > [Releases](https://github.com/Yu5rin/MyPaste/releases) から入手できます。
 
@@ -73,6 +71,15 @@ cargo build --release
 ```powershell
 cargo build --release --features devlog
 ```
+
+### GitHub Actions（手動実行のみ）
+
+`.github/workflows/` の CI / Release ワークフローは自動実行せず、**Actions タブから手動実行**する設定（`workflow_dispatch`）です。
+
+- **CI**: 手動実行すると `clippy` + リリースビルドを行い、`atai-paste.exe` を Artifact として保存します。
+- **Release**: タグ（例 `v1.0.0`）を入力して手動実行すると、EXE をビルドして `RELEASE_NOTES.md` を本文に GitHub Release を作成・添付します。
+
+> ローカルに Windows 環境がある場合は、これらを使わず `cargo build --release` で直接ビルドできます。
 
 ## アイコン素材
 

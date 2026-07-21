@@ -1,9 +1,14 @@
 name: Release
 
+# 自動実行はせず、Actions タブから手動でのみ実行する（workflow_dispatch）。
+# 入力したタグで EXE をビルドし、GitHub Release を作成して添付する。
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "リリースタグ（例: v1.0.0）"
+        required: true
+        default: "v1.0.0"
 
 permissions:
   contents: write
@@ -31,6 +36,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag }}
+          name: アタイの貼り付け ${{ inputs.tag }}
           files: dist/atai-paste.exe
           body_path: RELEASE_NOTES.md
           draft: false
