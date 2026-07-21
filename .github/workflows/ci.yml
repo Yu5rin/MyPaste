@@ -27,6 +27,6 @@ jobs:
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
-          name: atai-paste-exe
-          path: target/release/atai-paste.exe
+          name: Atai-paste-exe
+          path: target/release/Atai-paste.exe
           if-no-files-found: error

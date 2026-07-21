@@ -31,14 +31,14 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/release/atai-paste.exe dist/atai-paste.exe
+          Copy-Item target/release/Atai-paste.exe dist/Atai-paste.exe
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag }}
           name: アタイの貼り付け ${{ inputs.tag }}
-          files: dist/atai-paste.exe
+          files: dist/Atai-paste.exe
           body_path: RELEASE_NOTES.md
           draft: false
           prerelease: false

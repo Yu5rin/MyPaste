@@ -3,7 +3,7 @@
 Excel 使用時に **`Ctrl+B` を `Ctrl+Shift+V`（値貼り付け）にリマップ**する、Windows 常駐アプリです。
 Rust 製・単体 EXE（ポータブル）で、通常ユーザー権限で動作します。
 
-> **ダウンロード**: ビルド済みの `atai-paste.exe` は
+> **ダウンロード**: ビルド済みの `Atai-paste.exe` は
 > [Releases](https://github.com/Yu5rin/MyPaste/releases) から入手できます。
 
 <p align="center">
@@ -35,7 +35,7 @@ Rust 製・単体 EXE（ポータブル）で、通常ユーザー権限で動�
 
 ## 使い方
 
-1. `atai-paste.exe` を任意のフォルダに置いて起動します（インストール不要）。
+1. `Atai-paste.exe` を任意のフォルダに置いて起動します（インストール不要）。
 2. タスクトレイに「B」アイコンが表示されます（起動時は ON）。
 3. Excel を最前面にして `Ctrl+B` を押すと、`Ctrl+Shift+V`（値貼り付け）が送出されます。
 4. 一時的に無効化したいときは、トレイアイコンを右クリック →「ON/OFF切替」。
@@ -58,7 +58,7 @@ cargo build
 cargo build --release
 ```
 
-生成物: `target/release/atai-paste.exe`（単体で配布可能）。
+生成物: `target/release/Atai-paste.exe`（単体で配布可能）。
 
 ### ビルドに関する補足
 
@@ -76,7 +76,7 @@ cargo build --release --features devlog
 
 `.github/workflows/` の CI / Release ワークフローは自動実行せず、**Actions タブから手動実行**する設定（`workflow_dispatch`）です。
 
-- **CI**: 手動実行すると `clippy` + リリースビルドを行い、`atai-paste.exe` を Artifact として保存します。
+- **CI**: 手動実行すると `clippy` + リリースビルドを行い、`Atai-paste.exe` を Artifact として保存します。
 - **Release**: タグ（例 `v1.0.0`）を入力して手動実行すると、EXE をビルドして `RELEASE_NOTES.md` を本文に GitHub Release を作成・添付します。
 
 > ローカルに Windows 環境がある場合は、これらを使わず `cargo build --release` で直接ビルドできます。
