@@ -119,11 +119,9 @@ unsafe extern "system" fn low_level_keyboard_proc(
                         return LRESULT(1);
                     }
                 }
-                WM_KEYUP | WM_SYSKEYUP => {
-                    // 押下を握りつぶしていた場合は、対応する解放も握りつぶす。
-                    if B_ACTIVE.swap(false, Ordering::SeqCst) {
-                        return LRESULT(1);
-                    }
+                // 押下を握りつぶしていた場合は、対応する解放も握りつぶす。
+                WM_KEYUP | WM_SYSKEYUP if B_ACTIVE.swap(false, Ordering::SeqCst) => {
+                    return LRESULT(1);
                 }
                 _ => {}
             }
