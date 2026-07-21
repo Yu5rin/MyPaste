@@ -77,13 +77,17 @@ def draw_prohibition(img: Image.Image) -> None:
 
 
 def save_set(img: Image.Image, name: str) -> None:
-    frames = [img.resize((s, s), Image.LANCZOS) for s in SIZES]
-    frames[0].save(os.path.join(OUT_DIR, f"{name}.png"))
-    img.resize((256, 256), Image.LANCZOS).save(os.path.join(OUT_DIR, f"{name}@256.png"))
-    frames[0].save(
+    # 256 のマスターから保存する。ICO は必ず「大きい画像」を基準に保存すること。
+    # 16px 画像を基準にすると Pillow は 16px しか内包せず、拡大表示でぼやける。
+    master = img if img.size == (256, 256) else img.resize((256, 256), Image.LANCZOS)
+    # プレビュー用 PNG（16px と 256px）
+    master.resize((16, 16), Image.LANCZOS).save(os.path.join(OUT_DIR, f"{name}.png"))
+    master.save(os.path.join(OUT_DIR, f"{name}@256.png"))
+    # マルチサイズ ICO（16〜256 を内包。Pillow が各サイズを LANCZOS で生成）
+    master.save(
         os.path.join(OUT_DIR, f"{name}.ico"),
+        format="ICO",
         sizes=[(s, s) for s in SIZES],
-        append_images=frames[1:],
     )
 
 
@@ -102,12 +106,11 @@ def main() -> None:
     draw_prohibition(off)
     save_set(off, "icon_off")
 
-    # 実行ファイルアイコンは ON と同じ絵柄。
-    frames = [on.resize((s, s), Image.LANCZOS) for s in SIZES]
-    frames[0].save(
+    # 実行ファイルアイコンは ON と同じ絵柄（マルチサイズ ICO）。
+    on.save(
         os.path.join(OUT_DIR, "app.ico"),
+        format="ICO",
         sizes=[(s, s) for s in SIZES],
-        append_images=frames[1:],
     )
 
     print(f"アイコンを生成しました: {OUT_DIR}")

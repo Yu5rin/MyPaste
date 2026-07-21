@@ -1,7 +1,12 @@
 #include <winuser.h>
 
-// 実行ファイル自身のアイコン（エクスプローラ表示用）。ID 1 が既定。
-1               ICON    "src/icons/app.ico"
+// 実行ファイル自身のアイコン（エクスプローラ表示用）。
+// 名前付きリソースはリソースディレクトリ上で数値 ID より先に、かつ名前の
+// 昇順で並ぶ。Explorer は最初のアイコングループを既定アイコンとして使うため、
+// トレイ用の "ICON_ON"/"ICON_OFF" より前に来るよう "APP"（A 始まり）とする。
+// これを数値 ID 1 にすると ICON_OFF が先に選ばれてしまい、EXE のアイコンが
+// 禁止マークになってしまう。
+app             ICON    "src/icons/app.ico"
 
 // タスクトレイ用のアイコン。tray-item から名前で参照する。
 icon_on         ICON    "src/icons/icon_on.ico"
