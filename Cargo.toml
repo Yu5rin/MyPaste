@@ -1,0 +1,49 @@
+[package]
+name = "atai-paste"
+version = "1.0.0"
+edition = "2021"
+description = "Excel使用時に Ctrl+B を Ctrl+Shift+V にリマップする常駐アプリ「アタイの貼り付け」"
+authors = ["Yu5rin"]
+license = "MIT"
+repository = "https://github.com/Yu5rin/MyPaste"
+readme = "README.md"
+
+# ポータブルな単体EXEを目指すため、リリースビルドを最適化する
+[profile.release]
+opt-level = "z"     # サイズ優先の最適化
+lto = true          # リンク時最適化
+codegen-units = 1
+panic = "abort"     # パニック時のアンワインドコードを省く
+strip = true        # シンボル情報を除去
+
+[dependencies]
+# ログ出力（開発時のみ有効）
+log = "0.4"
+simplelog = "0.12"
+# 本番ビルドでは log マクロ自体をコンパイル時に無効化する
+# （下記 features で最大レベルを制御）
+
+[dependencies.tray-item]
+version = "0.10"
+
+# Windows API バインディング
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+]
+
+# 開発時のログを完全に無効化したい本番ビルド向けの feature
+[features]
+default = []
+# `--features devlog` を付けたビルドでのみ log.txt を出力する
+devlog = []
+
+[build-dependencies]
+embed-resource = "2.4"

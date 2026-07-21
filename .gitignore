@@ -1,0 +1,5 @@
+/target
+*.log
+log.txt
+
+# バイナリアプリのため Cargo.lock はコミットする（意図的に無視しない）。

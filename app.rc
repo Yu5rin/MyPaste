@@ -1,0 +1,11 @@
+#include <winuser.h>
+
+// 実行ファイル自身のアイコン（エクスプローラ表示用）。ID 1 が既定。
+1               ICON    "src/icons/app.ico"
+
+// タスクトレイ用のアイコン。tray-item から名前で参照する。
+icon_on         ICON    "src/icons/icon_on.ico"
+icon_off        ICON    "src/icons/icon_off.ico"
+
+// 管理者権限を要求せず通常ユーザーで動作するためのマニフェスト。
+CREATEPROCESS_MANIFEST_RESOURCE_ID  RT_MANIFEST  "app.manifest"
