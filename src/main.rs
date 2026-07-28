@@ -28,8 +28,6 @@ mod logging;
 use std::sync::mpsc;
 use std::thread;
 
-use tray_item::IconSource;
-
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 
 /// タスクトレイのメニュー操作をメインスレッドへ伝えるメッセージ。
@@ -58,8 +56,9 @@ fn main() {
     }
 
     // --- タスクトレイを構築 ---
+    // 起動時の状態（キーリマップは ON、自動起動は現在の設定）をメニューに反映する。
     let (tx, rx) = mpsc::channel::<TrayMessage>();
-    let mut tray = match tray::build(tx) {
+    let mut tray = match tray::build(tx, keyboard::is_enabled(), startup::is_enabled()) {
         Ok(t) => t,
         Err(e) => {
             log::error!("トレイ初期化失敗: {e}");
@@ -74,14 +73,19 @@ fn main() {
         match msg {
             TrayMessage::Toggle => {
                 let on = keyboard::toggle();
-                let icon = if on { tray::ICON_ON } else { tray::ICON_OFF };
-                if let Err(e) = tray.set_icon(IconSource::Resource(icon)) {
+                if let Err(e) = tray.set_icon(on) {
                     log::warn!("アイコン更新失敗: {e}");
                 }
-                log::info!("ON/OFF 切替: {}", if on { "ON" } else { "OFF" });
+                if let Err(e) = tray.set_remap_checked(on) {
+                    log::warn!("メニュー更新失敗: {e}");
+                }
+                log::info!("キーリマップ: {}", if on { "有効" } else { "無効" });
             }
             TrayMessage::ToggleStartup => match startup::toggle() {
                 Ok(enabled) => {
+                    if let Err(e) = tray.set_startup_checked(enabled) {
+                        log::warn!("メニュー更新失敗: {e}");
+                    }
                     log::info!("自動起動: {}", if enabled { "有効" } else { "無効" })
                 }
                 Err(e) => log::error!("自動起動設定失敗: {e}"),
