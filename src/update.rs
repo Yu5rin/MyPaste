@@ -36,6 +36,11 @@ use crate::{http, TrayMessage};
 const DIALOG_TITLE: &str = "アタイの貼り付け";
 /// GitHub API に指定する Accept ヘッダ。
 const GITHUB_ACCEPT: &str = "application/vnd.github+json";
+/// 一時フォルダへ書き出す更新ファイルの名前の接頭辞。
+const TEMP_PREFIX: &str = "Atai-paste-";
+/// 一時ファイルを残骸とみなすまでの時間（秒）。
+/// 更新処理は数秒で終わるため、これより古いものは中断された残骸と判断する。
+const TEMP_STALE_SECS: u64 = 60 * 60;
 
 /// 三つ組みのバージョン番号。
 ///
@@ -192,9 +197,12 @@ fn download_and_verify(
         log::warn!("リリースに SHA256 が無いため検証を省略しました");
     }
 
-    // 一時フォルダへ書き出す。
-    let path = std::env::temp_dir().join(format!("Atai-paste-{}.exe", info.version));
-    std::fs::write(&path, &bytes).map_err(|e| format!("一時ファイルの書き出しに失敗: {e}"))?;
+    // 一時フォルダへ書き出す。途中で失敗した場合は中途半端なファイルを残さない。
+    let path = std::env::temp_dir().join(format!("{TEMP_PREFIX}{}.exe", info.version));
+    if let Err(e) = std::fs::write(&path, &bytes) {
+        let _ = std::fs::remove_file(&path);
+        return Err(format!("一時ファイルの書き出しに失敗: {e}"));
+    }
     Ok(path)
 }
 
@@ -249,19 +257,74 @@ fn install(new_exe: &Path) -> Result<PathBuf, String> {
     Ok(current)
 }
 
-/// 前回の更新で残った `.old` を削除する（起動時に呼ぶ）。
+/// 前回の更新で残った残骸を削除する（起動時に呼ぶ）。
+///
+/// 対象は次の 2 つ。
+/// - 入れ替えで退避した `Atai-paste.exe.old`
+/// - 一時フォルダに残った更新ファイル（書き出しの失敗や強制終了で残ることがある）
 pub fn cleanup_old() {
-    let Ok(current) = std::env::current_exe() else {
-        return;
-    };
-    let old = old_path(&current);
-    if old.exists() {
-        match std::fs::remove_file(&old) {
-            Ok(()) => log::info!("前回の更新の残骸を削除しました"),
-            // まだロックされている場合もある。次回の起動で消えるので無視してよい。
-            Err(e) => log::warn!("残骸の削除に失敗しました（次回起動時に再試行）: {e}"),
+    if let Ok(current) = std::env::current_exe() {
+        let old = old_path(&current);
+        if old.exists() {
+            match std::fs::remove_file(&old) {
+                Ok(()) => log::info!("前回の更新の残骸を削除しました"),
+                // まだロックされている場合もある。次回の起動で消えるので無視してよい。
+                Err(e) => log::warn!("残骸の削除に失敗しました（次回起動時に再試行）: {e}"),
+            }
         }
     }
+    cleanup_temp_files();
+}
+
+/// 一時フォルダに残った更新ファイルを削除する。
+///
+/// 更新中の別インスタンスが使っているファイルを消さないよう、
+/// 十分に古いもの（[`TEMP_STALE_SECS`] 以上前）だけを対象にする。
+fn cleanup_temp_files() {
+    let dir = std::env::temp_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !is_temp_update_file(name) {
+            continue;
+        }
+
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age.as_secs() >= TEMP_STALE_SECS);
+        if !stale {
+            continue;
+        }
+
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => log::info!("一時フォルダの更新ファイルを削除しました: {name}"),
+            Err(e) => log::warn!("一時ファイルの削除に失敗しました: {name}: {e}"),
+        }
+    }
+}
+
+/// 自分が書き出した更新用の一時ファイルかどうか。
+///
+/// 無関係なファイルを削除しないよう、名前を厳密に判定する。
+fn is_temp_update_file(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(TEMP_PREFIX) else {
+        return false;
+    };
+    let Some(version) = rest.strip_suffix(".exe") else {
+        return false;
+    };
+    // 接頭辞と拡張子の間はバージョン番号（数字とドットのみ）であること。
+    !version.is_empty() && version.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
 /// 更新を確認し、必要ならインストールまで行う。別スレッドから呼ぶこと。
@@ -419,7 +482,26 @@ fn message_box(text: &str, style: MESSAGEBOX_STYLE) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::Version;
+    use super::{is_temp_update_file, Version};
+
+    #[test]
+    fn recognizes_own_temp_files() {
+        assert!(is_temp_update_file("Atai-paste-1.2.1.exe"));
+        assert!(is_temp_update_file("Atai-paste-10.0.0.exe"));
+    }
+
+    #[test]
+    fn never_deletes_unrelated_files() {
+        // 無関係なファイルを消してしまわないこと。特に本体の実行ファイル。
+        assert!(!is_temp_update_file("Atai-paste.exe"));
+        assert!(!is_temp_update_file("Atai-paste.exe.old"));
+        assert!(!is_temp_update_file("important.exe"));
+        assert!(!is_temp_update_file("Atai-paste-1.2.1.txt"));
+        assert!(!is_temp_update_file("Atai-paste-.exe"));
+        assert!(!is_temp_update_file("Atai-paste-メモ.exe"));
+        assert!(!is_temp_update_file("XAtai-paste-1.0.0.exe"));
+        assert!(!is_temp_update_file(""));
+    }
 
     #[test]
     fn parses_common_forms() {
