@@ -9,16 +9,21 @@
 //!   チャネル経由で受け取ってアイコン切替・自動起動切替・終了処理を行う。
 //!   tray-item は内部で独自のメッセージループを持つため、メインスレッドは
 //!   チャネル受信に専念できる。
+//! - **更新スレッド**: 更新の確認・ダウンロード・適用を行う。通信が起動や
+//!   キー操作を妨げないよう、必ず別スレッドで実行する。
 
 // 本番（release）ビルドではコンソールウィンドウを出さない。
 // デバッグビルドではパニック出力などを確認できるよう残す。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod config;
 mod excel_check;
+mod http;
 mod keyboard;
 mod sendinput;
 mod startup;
 mod tray;
+mod update;
 
 // 仕様上のファイル名 log.rs を保ちつつ、`log` クレートと名前が衝突しないよう
 // モジュール名は logging とする。
@@ -36,13 +41,23 @@ pub enum TrayMessage {
     Toggle,
     /// 自動起動 ON/OFF 切替
     ToggleStartup,
+    /// 更新を確認（メニューからの手動操作）
+    CheckUpdate,
+    /// 更新ファイルのダウンロード進捗（パーセント）
+    UpdateProgress(u64),
+    /// 更新処理が終わった（進捗表示を戻す）
+    UpdateFinished,
     /// 終了
     Quit,
 }
 
 fn main() {
     logging::init();
-    log::info!("アタイの貼り付け 起動");
+    log::info!("アタイの貼り付け 起動 (v{})", env!("CARGO_PKG_VERSION"));
+
+    // 前回の更新で残った .old があれば削除する。
+    update::cleanup_old();
+    let settings = config::Settings::load();
 
     // --- フックスレッドを起動し、そのスレッド ID を受け取る ---
     let (id_tx, id_rx) = mpsc::channel::<u32>();
@@ -58,7 +73,7 @@ fn main() {
     // --- タスクトレイを構築 ---
     // 起動時の状態（キーリマップは ON、自動起動は現在の設定）をメニューに反映する。
     let (tx, rx) = mpsc::channel::<TrayMessage>();
-    let mut tray = match tray::build(tx, keyboard::is_enabled(), startup::is_enabled()) {
+    let mut tray = match tray::build(tx.clone(), keyboard::is_enabled(), startup::is_enabled()) {
         Ok(t) => t,
         Err(e) => {
             log::error!("トレイ初期化失敗: {e}");
@@ -67,6 +82,14 @@ fn main() {
             return;
         }
     };
+
+    // --- 起動時の更新確認（設定で有効な場合のみ、1 日 1 回まで） ---
+    // 通信が起動を妨げないよう別スレッドで行う。
+    if settings.update.check_on_startup {
+        let tx_update = tx.clone();
+        let settings_for_update = settings.clone();
+        thread::spawn(move || update::run(settings_for_update, tx_update, false));
+    }
 
     // --- メインループ: トレイのメニュー操作を処理 ---
     for msg in rx {
@@ -90,6 +113,22 @@ fn main() {
                 }
                 Err(e) => log::error!("自動起動設定失敗: {e}"),
             },
+            TrayMessage::CheckUpdate => {
+                // 手動確認。結果（最新である／失敗した）もダイアログで知らせる。
+                let tx_update = tx.clone();
+                let settings_for_update = settings.clone();
+                thread::spawn(move || update::run(settings_for_update, tx_update, true));
+            }
+            TrayMessage::UpdateProgress(percent) => {
+                if let Err(e) = tray.set_progress(percent) {
+                    log::warn!("進捗表示の更新に失敗: {e}");
+                }
+            }
+            TrayMessage::UpdateFinished => {
+                if let Err(e) = tray.clear_progress() {
+                    log::warn!("進捗表示の復帰に失敗: {e}");
+                }
+            }
             TrayMessage::Quit => {
                 log::info!("終了要求を受信");
                 break;

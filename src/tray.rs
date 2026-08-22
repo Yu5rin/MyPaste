@@ -28,6 +28,11 @@ const MARK_OFF: &str = "　 ";
 const LABEL_REMAP: &str = "Ctrl+B で値貼り付け";
 /// 自動起動のメニュー文言。
 const LABEL_STARTUP: &str = "自動起動";
+/// 更新確認のメニュー文言。
+const LABEL_CHECK_UPDATE: &str = "更新を確認";
+
+/// 通常時のツールチップ（トレイアイコンにカーソルを合わせたときの表示）。
+const TOOLTIP_IDLE: &str = "アタイの貼り付け";
 
 /// 構築したメニュー項目のハンドル。ラベル更新に使う ID を保持する。
 pub struct Menu {
@@ -57,6 +62,18 @@ impl Menu {
         self.tray
             .inner_mut()
             .set_menu_item_label(&label, self.startup_id)
+    }
+
+    /// ダウンロードの進捗をツールチップに表示する。
+    pub fn set_progress(&mut self, percent: u64) -> Result<(), tray_item::TIError> {
+        self.tray
+            .inner_mut()
+            .set_tooltip(&format!("{TOOLTIP_IDLE} — 更新を取得中 {percent}%"))
+    }
+
+    /// ツールチップを通常の表示に戻す。
+    pub fn clear_progress(&mut self) -> Result<(), tray_item::TIError> {
+        self.tray.inner_mut().set_tooltip(TOOLTIP_IDLE)
     }
 }
 
@@ -96,6 +113,15 @@ pub fn build(
         .add_menu_item_with_id(&labeled(LABEL_STARTUP, startup), move || {
             let _ = tx_startup.send(TrayMessage::ToggleStartup);
         })?;
+
+    // 設定項目と操作項目を区切る。
+    tray.inner_mut().add_separator()?;
+
+    // 更新の確認（押したときだけ通信する）
+    let tx_update = tx.clone();
+    tray.add_menu_item(LABEL_CHECK_UPDATE, move || {
+        let _ = tx_update.send(TrayMessage::CheckUpdate);
+    })?;
 
     // 区切り線を挟んで「終了」を分ける。
     tray.inner_mut().add_separator()?;

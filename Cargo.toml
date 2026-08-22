@@ -1,6 +1,6 @@
 [package]
 name = "Atai-paste"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "Excel使用時に Ctrl+B を Ctrl+Shift+V にリマップする常駐アプリ「アタイの貼り付け」"
 authors = ["Yu5rin"]
@@ -20,8 +20,17 @@ strip = true        # シンボル情報を除去
 # ログ出力（開発時のみ有効）
 log = "0.4"
 simplelog = "0.12"
+# 更新確認: GitHub Releases API のレスポンス解析と設定ファイルの読み書き
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+# 更新ファイルの SHA256 検証
+sha2 = "0.11.0"
 # 本番ビルドでは log マクロ自体をコンパイル時に無効化する
 # （下記 features で最大レベルを制御）
+#
+# HTTPS 通信には Windows 標準の WinHTTP を使う（下記 windows crate の feature）。
+# rustls / OpenSSL 系のクレートは C・アセンブリのビルドを伴い、
+# 環境によってはビルドに失敗するため採用しない。証明書の検証は OS に任せる。
 
 [dependencies.tray-item]
 version = "0.10"
@@ -37,6 +46,8 @@ features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Com",
     "Win32_UI_Shell",
+    # 更新確認の HTTPS 通信（OS の証明書ストアで検証される）
+    "Win32_Networking_WinHttp",
 ]
 
 # 開発時のログを完全に無効化したい本番ビルド向けの feature

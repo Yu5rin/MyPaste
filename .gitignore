@@ -3,3 +3,8 @@
 log.txt
 
 # バイナリアプリのため Cargo.lock はコミットする（意図的に無視しない）。
+
+# 実行時に生成される設定・状態ファイル
+settings.json
+update_state.json
+*.exe.old
