@@ -2,8 +2,9 @@
 //!
 //! - **設定** (`settings.json`): 利用者が編集する項目。更新の確認先 URL などを保持する。
 //!   ファイルが無い場合や壊れている場合は既定値で動作する（起動を妨げない）。
-//! - **状態** (`update_state.json`): アプリが書き込む項目。前回の確認時刻を保持し、
-//!   「起動時に 1 日 1 回まで」の判定に使う。
+//! - **状態** (`update_state.json`): アプリが書き込む項目。前回の確認時刻を保持する。
+//!   既定では起動のたびに確認するため使わないが、`check_interval_hours` に
+//!   0 以外を設定したときの間隔判定に使う。
 //!
 //! 確認先の URL をコードに直書きせず設定ファイルに持たせているのは、
 //! 将来リポジトリを移しても設定を変えるだけで済むようにするためと、
@@ -18,8 +19,6 @@ use serde::{Deserialize, Serialize};
 const SETTINGS_FILE: &str = "settings.json";
 /// 状態ファイル名。
 const STATE_FILE: &str = "update_state.json";
-/// 起動時チェックの最短間隔（24 時間）。
-const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 
 /// 設定全体。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -34,6 +33,10 @@ pub struct Settings {
 pub struct UpdateSettings {
     /// 起動時に更新を確認するか（`false` ならメニューからの手動確認のみ）。
     pub check_on_startup: bool,
+    /// 起動時チェックの最短間隔（時間）。
+    ///
+    /// `0` なら**起動のたびに**確認する（既定）。`24` にすると 1 日 1 回までになる。
+    pub check_interval_hours: u64,
     /// GitHub Releases API のエンドポイント。
     pub api_url: String,
     /// 更新が見つかったときにブラウザで開くページ。
@@ -46,6 +49,8 @@ impl Default for UpdateSettings {
     fn default() -> Self {
         Self {
             check_on_startup: true,
+            // 既定は 0 = 起動のたびに確認する。
+            check_interval_hours: 0,
             api_url: "https://api.github.com/repos/Yu5rin/MyPaste/releases/latest".to_string(),
             releases_page: "https://github.com/Yu5rin/MyPaste/releases/latest".to_string(),
             asset_name: "Atai-paste.exe".to_string(),
@@ -91,12 +96,22 @@ impl Settings {
     }
 }
 
-/// 起動時チェックを実行してよいか（前回から 24 時間以上経過しているか）。
-pub fn should_check_now() -> bool {
-    let last = load_state().last_checked_unix;
-    let now = now_unix();
+/// 起動時チェックを実行してよいか。
+///
+/// `interval_hours` が `0` なら常に `true`（起動のたびに確認する）。
+/// それ以外は、前回の確認から指定時間以上経過している場合だけ `true` を返す。
+pub fn should_check_now(interval_hours: u64) -> bool {
+    is_due(now_unix(), load_state().last_checked_unix, interval_hours)
+}
+
+/// 確認すべきかの判定そのもの（時刻を引数に取る純粋な関数。テストのため分離）。
+fn is_due(now: u64, last: u64, interval_hours: u64) -> bool {
+    if interval_hours == 0 {
+        // 毎回確認する。
+        return true;
+    }
     // 時計が巻き戻った場合（now < last）も確認してよいものとする。
-    now < last || now.saturating_sub(last) >= CHECK_INTERVAL_SECS
+    now < last || now.saturating_sub(last) >= interval_hours.saturating_mul(3600)
 }
 
 /// 「今チェックした」ことを記録する（失敗は無視。起動を妨げない）。
@@ -160,5 +175,47 @@ pub fn is_writable(dir: &Path) -> bool {
             true
         }
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_due;
+
+    const HOUR: u64 = 3600;
+
+    #[test]
+    fn interval_zero_always_checks() {
+        // 既定の 0 は「起動のたびに確認」。直前に確認していても必ず true。
+        assert!(is_due(1_000_000, 1_000_000, 0));
+        assert!(is_due(1_000_000, 999_999, 0));
+        assert!(is_due(0, 0, 0));
+    }
+
+    #[test]
+    fn interval_respects_elapsed_time() {
+        let last = 1_000_000;
+        // 24 時間ちょうどで確認する。1 秒でも足りなければ待つ。
+        assert!(!is_due(last + 24 * HOUR - 1, last, 24));
+        assert!(is_due(last + 24 * HOUR, last, 24));
+        assert!(is_due(last + 48 * HOUR, last, 24));
+    }
+
+    #[test]
+    fn clock_going_backwards_still_checks() {
+        // 時計が巻き戻っても確認できなくならないこと。
+        assert!(is_due(500, 1_000_000, 24));
+    }
+
+    #[test]
+    fn never_checked_before() {
+        // 未確認（last = 0）なら確認する。
+        assert!(is_due(1_000_000, 0, 24));
+    }
+
+    #[test]
+    fn huge_interval_does_not_overflow() {
+        // 極端な設定値でも panic しないこと（saturating 演算）。
+        assert!(!is_due(1_000_000, 999_999, u64::MAX));
     }
 }

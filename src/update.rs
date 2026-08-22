@@ -272,9 +272,10 @@ pub fn cleanup_old() {
 ///   利用者に尋ね、それ以外は黙ってログに残す。
 pub fn run(settings: Settings, tx: Sender<TrayMessage>, manual: bool) {
     if !manual {
-        // 起動時チェックは 1 日 1 回まで。
-        if !config::should_check_now() {
-            log::info!("前回の確認から 24 時間経っていないため、更新確認を省略しました");
+        // 起動時チェック。既定では毎回確認する（設定で間隔を空けられる）。
+        let interval = settings.update.check_interval_hours;
+        if !config::should_check_now(interval) {
+            log::info!("前回の確認から {interval} 時間経っていないため、更新確認を省略しました");
             return;
         }
         config::mark_checked();

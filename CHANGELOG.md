@@ -2,6 +2,18 @@
 
 本プロジェクトの主な変更点をまとめます。バージョンは [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
+## [1.2.1] - 2026-08-22
+
+### 変更
+- **起動のたびに更新を確認するようにした**（従来は 1 日 1 回まで）。
+- 設定 `check_interval_hours` を追加し、確認の間隔を指定できるようにした。
+  既定は `0`（毎回）。`24` にすると従来どおり 1 日 1 回までになる。
+
+### 修正
+- `build.rs` が Windows 以外のホストからのクロスビルドで、リソースコンパイラが
+  無い場合にビルドを失敗させていた問題を修正。型チェック目的のビルドでは
+  リソースの埋め込みを省略する。
+
 ## [1.2.0] - 2026-08-22
 
 ### 追加
@@ -59,6 +71,7 @@
 - ON/OFF 切替は右クリックメニューから行う（左クリックによるトグルは `tray-item` の制約により非対応）。
 - 他ソフトとのキー競合は対象外。
 
+[1.2.1]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.2.1
 [1.2.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.2.0
 [1.1.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.0.0

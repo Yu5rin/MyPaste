@@ -10,6 +10,22 @@ fn main() {
         return;
     }
 
+    // リソースのコンパイルには外部ツールが要る。
+    // - MSVC ABI: Windows SDK の rc.exe（Windows ホストでしか使えない）
+    // - GNU  ABI: windres（mingw-w64 があれば Windows 以外でも使える）
+    // Windows 以外のホストから MSVC ABI 向けに型チェックだけ行う場合
+    // （cargo check --target x86_64-pc-windows-msvc）は rc.exe が無くて失敗するため、
+    // ここは飛ばす。実行ファイルを作るビルドではないのでリソースは不要。
+    let host_is_windows = cfg!(target_os = "windows");
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if !host_is_windows && target_env == "msvc" {
+        println!(
+            "cargo:warning=Windows 以外のホストでは MSVC 向けのリソースを埋め込めないため省略しました\
+             （型チェック用のビルドのため実害はありません）"
+        );
+        return;
+    }
+
     // app.rc に定義したアイコン（app / icon_on / icon_off）とマニフェストを
     // 実行ファイルへ埋め込む。tray-item は IconSource::Resource("icon_on") の
     // ように、ここで付けた名前で HICON を参照する。
