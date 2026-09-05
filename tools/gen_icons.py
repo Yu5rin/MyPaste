@@ -95,8 +95,11 @@ def main() -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
 
     # ON: 黒い「B」＋白い縁取り（暗い背景でも見やすく）。
+    # 縁取りが細いと 16px 縮小時に 1px 未満になり、既定が黒い
+    # Windows 11 のタスクバーで「B」が背景に溶けて見えなくなるため、
+    # 暗い背景でも視認できる太さ（かつ「B」の穴を潰さない範囲）に調整している。
     on = Image.new("RGBA", (MASTER, MASTER), (0, 0, 0, 0))
-    draw_b(on, stroke_width=12, stroke_fill=(255, 255, 255, 255))
+    draw_b(on, stroke_width=20, stroke_fill=(255, 255, 255, 255))
     save_set(on, "icon_on")
 
     # OFF: 禁止マーク内を白背景にし、その上に黒い「B」＋赤い禁止マーク。
