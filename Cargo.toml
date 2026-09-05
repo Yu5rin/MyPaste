@@ -1,6 +1,6 @@
 [package]
 name = "Atai-paste"
-version = "1.2.1"
+version = "1.2.2"
 edition = "2021"
 description = "Excel使用時に Ctrl+B を Ctrl+Shift+V にリマップする常駐アプリ「アタイの貼り付け」"
 authors = ["Yu5rin"]
