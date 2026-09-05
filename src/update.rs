@@ -8,15 +8,26 @@
 //! 実行中の EXE は Windows がロックしているため上書きできないが、**リネームはできる**。
 //! そこで次の順で入れ替える（Chrome などと同じ考え方）。
 //!
-//! 1. `Atai-paste.exe` → `Atai-paste.exe.old` にリネーム（実行中でも可能）
-//! 2. 新しい `Atai-paste.exe` を配置
-//! 3. 新しい EXE を起動して、自分は終了する
-//! 4. 次回起動時に `.old` を削除する（[`cleanup_old`]）
+//! 1. 新しい実行ファイルを、同じフォルダに `Atai-paste.exe.new` としてコピーで書き出す
+//! 2. `Atai-paste.exe` → `Atai-paste.exe.old` にリネーム（実行中でも可能）
+//! 3. `Atai-paste.exe.new` → `Atai-paste.exe` にリネーム
+//! 4. 新しい EXE を起動して、自分は終了する
+//! 5. 次回起動時に `.old` を削除する（[`cleanup_old`]）
 //!
-//! 2 で失敗した場合は 1 を巻き戻す（[`install`] のロールバック）。アプリが壊れた状態で
-//! 残らないようにするため、この巻き戻しは省略しない。
+//! 時間のかかる「コピー」を先に済ませておき、実際の入れ替えはリネーム 2 回
+//! （2→3）だけで行う。リネームは同一ボリューム上ならほぼ一瞬で終わるため、
+//! 実行ファイルが存在しない瞬間の窓は大幅に狭い。
+//!
+//! 3 が失敗した場合は 2 を巻き戻す（[`install`] のロールバック）。ただし、
+//! **電源断や強制終了など OS ごと落ちるケースでは、この巻き戻しコード自体が
+//! 実行されない**ため保証の対象外である。そのために [`cleanup_old`] が
+//! 次回起動時、`.exe` が無く `.old` だけが残っている場合に `.old` を
+//! `.exe` へ戻す（復元を試みる）。それでも、複製元の `.old` 自体が壊れて
+//! いた場合などは救えない。詳細は README の「実行中の EXE を入れ替える仕組み」
+//! を参照。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 
 use serde::Deserialize;
@@ -41,6 +52,51 @@ const TEMP_PREFIX: &str = "Atai-paste-";
 /// 一時ファイルを残骸とみなすまでの時間（秒）。
 /// 更新処理は数秒で終わるため、これより古いものは中断された残骸と判断する。
 const TEMP_STALE_SECS: u64 = 60 * 60;
+
+/// 更新処理（[`run`]）が現在実行中かどうか。多重実行の防止に使う。
+///
+/// 起動時の自動確認とメニューからの手動確認が同時に走ると、確認ダイアログが
+/// 二重に出たり、同じ一時ファイルへ同時に書き込んだり、EXE を二重に入れ替えたり
+/// する恐れがある。[`RunningGuard`] で `run()` の実行区間を排他制御する。
+static UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// [`UPDATE_RUNNING`] の実行権を表すガード。
+///
+/// 生存している間だけフラグが `true` になり、Drop で確実に `false` へ戻す。
+/// `run()` は早期 return が多いため、戻し忘れを防ぐのに Drop での解放を使う。
+struct RunningGuard;
+
+impl RunningGuard {
+    /// 実行権の取得を試みる。既に実行中であれば `None` を返す。
+    fn acquire() -> Option<Self> {
+        try_acquire(&UPDATE_RUNNING).then_some(Self)
+    }
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        release(&UPDATE_RUNNING);
+    }
+}
+
+/// `false` → `true` への切替を試みる（純粋なロジック本体。テストのため分離）。
+fn try_acquire(flag: &AtomicBool) -> bool {
+    flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
+/// フラグを `false` に戻す。
+fn release(flag: &AtomicBool) {
+    flag.store(false, Ordering::SeqCst);
+}
+
+/// 更新処理が現在実行中かどうか。
+///
+/// `main.rs` が終了処理（`Quit`）で、実行中の入れ替えを中断させないよう
+/// 完了を待つために使う。
+pub fn is_running() -> bool {
+    UPDATE_RUNNING.load(Ordering::SeqCst)
+}
 
 /// 三つ組みのバージョン番号。
 ///
@@ -183,14 +239,30 @@ fn download_and_verify(
         }
     })?;
 
+    // 最低限の妥当性検査: PE 実行ファイルの署名（先頭 2 バイトが `MZ`）を確認する。
+    // GitHub がリリース資産に `digest`（SHA256）を付与していない場合でも、
+    // 明らかに壊れた・別種のファイルを実行ファイルとして書き出さないようにする。
+    if !has_mz_signature(&bytes) {
+        return Err(
+            "ダウンロードしたファイルが実行ファイルの形式ではありません。\
+             もう一度お試しください。"
+                .to_string(),
+        );
+    }
+
     if let Some(expected) = &info.sha256 {
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
         let actual = hex(&hasher.finalize());
         if &actual != expected {
-            return Err(format!(
-                "ダウンロードしたファイルの検証に失敗しました。\n期待: {expected}\n実際: {actual}"
-            ));
+            // 64 桁の hex を利用者に見せても意味がなく不安を与えるだけなので、
+            // ダイアログには出さずログにのみ残す。
+            log::error!("SHA256 検証に失敗しました（期待: {expected} / 実際: {actual}）");
+            return Err(
+                "ダウンロードしたファイルが壊れている可能性があります。\
+                 もう一度お試しください。"
+                    .to_string(),
+            );
         }
         log::info!("SHA256 検証に成功しました");
     } else {
@@ -204,6 +276,14 @@ fn download_and_verify(
         return Err(format!("一時ファイルの書き出しに失敗: {e}"));
     }
     Ok(path)
+}
+
+/// 先頭 2 バイトが `MZ`（PE 実行ファイルの署名）であるかを確認する。
+///
+/// GitHub の `digest` が無い場合でも、明らかに実行ファイルでないもの
+/// （HTML のエラーページなど）を弾ける最低限の妥当性検査になる。
+fn has_mz_signature(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"MZ")
 }
 
 /// バイト列を 16 進文字列にする。
@@ -222,9 +302,22 @@ fn old_path(exe: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// `.new` を付けたパスを返す（入れ替え前に新しい EXE を暫定的に置く場所）。
+fn staged_path(exe: &Path) -> PathBuf {
+    let mut s = exe.to_path_buf().into_os_string();
+    s.push(".new");
+    PathBuf::from(s)
+}
+
 /// ダウンロード済みの実行ファイルを、現在の実行ファイルと入れ替える。
 ///
-/// 失敗した場合はリネームを巻き戻すため、アプリが壊れた状態にはならない。
+/// 時間のかかる「コピー」を先に同じフォルダへ済ませておき、実際の入れ替えは
+/// リネーム 2 回（`exe → .old`、`.new → exe`）だけで行う。リネームはほぼ一瞬で
+/// 終わるため、実行ファイルが存在しない瞬間の窓を最小限にできる。
+///
+/// 失敗を検知できた場合はリネームを巻き戻す。ただし電源断や強制終了など
+/// OS ごと落ちるケースはこの関数のコード自体が実行されないため対象外であり、
+/// その場合の復元は次回起動時の [`cleanup_old`] に委ねる。
 fn install(new_exe: &Path) -> Result<PathBuf, String> {
     let current = std::env::current_exe().map_err(|e| format!("自身のパスを取得できません: {e}"))?;
     let dir = current
@@ -241,14 +334,24 @@ fn install(new_exe: &Path) -> Result<PathBuf, String> {
     }
 
     let old = old_path(&current);
+    let staged = staged_path(&current);
     // 前回の残骸があれば先に消しておく（残っていてもリネームは失敗する）。
     let _ = std::fs::remove_file(&old);
+    let _ = std::fs::remove_file(&staged);
 
-    // 1) 実行中の EXE をリネーム（実行中でも可能）
-    std::fs::rename(&current, &old).map_err(|e| format!("現在の実行ファイルを退避できません: {e}"))?;
+    // 1) 新しい EXE を同じフォルダへ `.new` としてコピーで配置しておく。
+    //    ここで失敗しても現在の EXE には一切手を付けていないので安全。
+    std::fs::copy(new_exe, &staged)
+        .map_err(|e| format!("新しい実行ファイルの配置に失敗しました: {e}"))?;
 
-    // 2) 新しい EXE を配置。失敗したらリネームを巻き戻す。
-    if let Err(e) = std::fs::copy(new_exe, &current) {
+    // 2) 実行中の EXE をリネーム（実行中でも可能）。
+    if let Err(e) = std::fs::rename(&current, &old) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(format!("現在の実行ファイルを退避できません: {e}"));
+    }
+
+    // 3) `.new` を本来の場所へリネーム。失敗したら 2 を巻き戻す。
+    if let Err(e) = std::fs::rename(&staged, &current) {
         let _ = std::fs::rename(&old, &current);
         return Err(format!("新しい実行ファイルを配置できません（元に戻しました）: {e}"));
     }
@@ -257,19 +360,48 @@ fn install(new_exe: &Path) -> Result<PathBuf, String> {
     Ok(current)
 }
 
+/// 実行ファイル自体の復元が必要かどうかの判定（純粋なロジック本体。テストのため分離）。
+///
+/// `.exe` が無く `.old` だけが残っている状態は、[`install`] の 2 と 3 の間で
+/// 処理が中断されたことを示す。この場合は `.old` を `.exe` へ戻さないと
+/// 次回起動できなくなる。
+fn needs_exe_restore(exe_exists: bool, old_exists: bool) -> bool {
+    !exe_exists && old_exists
+}
+
 /// 前回の更新で残った残骸を削除する（起動時に呼ぶ）。
 ///
-/// 対象は次の 2 つ。
-/// - 入れ替えで退避した `Atai-paste.exe.old`
+/// 対象は次の 3 つ。
+/// - `.exe` が無く `.old` だけが残っている場合: 中断された入れ替えとみなし、
+///   `.old` を `.exe` へ復元する（[`needs_exe_restore`]）。
+/// - 通常どおり入れ替えが完了して残った `Atai-paste.exe.old`: 削除する。
+/// - 入れ替え直前まで使っていた `Atai-paste.exe.new`: 残っていれば削除する
+///   （中断時に配置済みのまま残ることがある）。
 /// - 一時フォルダに残った更新ファイル（書き出しの失敗や強制終了で残ることがある）
 pub fn cleanup_old() {
     if let Ok(current) = std::env::current_exe() {
         let old = old_path(&current);
-        if old.exists() {
+        let staged = staged_path(&current);
+
+        if needs_exe_restore(current.exists(), old.exists()) {
+            match std::fs::rename(&old, &current) {
+                Ok(()) => log::warn!(
+                    "中断された更新を検知したため、以前の実行ファイルを復元しました"
+                ),
+                Err(e) => log::error!("実行ファイルの復元に失敗しました: {e}"),
+            }
+        } else if old.exists() {
             match std::fs::remove_file(&old) {
                 Ok(()) => log::info!("前回の更新の残骸を削除しました"),
                 // まだロックされている場合もある。次回の起動で消えるので無視してよい。
                 Err(e) => log::warn!("残骸の削除に失敗しました（次回起動時に再試行）: {e}"),
+            }
+        }
+
+        if staged.exists() {
+            match std::fs::remove_file(&staged) {
+                Ok(()) => log::info!("入れ替え前の一時ファイル（.new）を削除しました"),
+                Err(e) => log::warn!(".new ファイルの削除に失敗しました: {e}"),
             }
         }
     }
@@ -334,6 +466,19 @@ fn is_temp_update_file(name: &str) -> bool {
 /// - `manual` が `false`（起動時の自動確認）のときは、更新が見つかったときだけ
 ///   利用者に尋ね、それ以外は黙ってログに残す。
 pub fn run(settings: Settings, tx: Sender<TrayMessage>, manual: bool) {
+    // 起動時の自動確認と手動確認が同時に走らないようにする。既に実行中なら、
+    // 手動操作のときだけその旨を知らせて何もしない（自動確認は黙って諦める）。
+    let Some(_guard) = RunningGuard::acquire() else {
+        log::info!("更新処理は既に実行中のため、今回の要求は無視します");
+        if manual {
+            message_box(
+                "現在、更新を確認しています。完了までしばらくお待ちください。",
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+        return;
+    };
+
     if !manual {
         // 起動時チェック。既定では毎回確認する（設定で間隔を空けられる）。
         let interval = settings.update.check_interval_hours;
@@ -350,10 +495,13 @@ pub fn run(settings: Settings, tx: Sender<TrayMessage>, manual: bool) {
             // 通信の失敗は起動を妨げない。手動確認のときだけ知らせる。
             log::warn!("更新の確認に失敗しました: {e}");
             if manual {
-                message_box(
-                    &format!("更新を確認できませんでした。\n\n{e}"),
-                    MB_OK | MB_ICONERROR,
+                let summary = format!(
+                    "更新を確認できませんでした。インターネットに接続できないか、\
+                     GitHub が混み合っている可能性があります。\n\n\
+                     このページから最新版を確認することもできます。\n{}",
+                    settings.update.releases_page
                 );
+                message_box(&with_detail(&summary, &e), MB_OK | MB_ICONERROR);
             }
             return;
         }
@@ -394,10 +542,13 @@ pub fn run(settings: Settings, tx: Sender<TrayMessage>, manual: bool) {
         Ok(p) => p,
         Err(e) => {
             log::error!("更新の取得に失敗しました: {e}");
-            message_box(
-                &format!("更新の取得に失敗しました。\n\n{e}"),
-                MB_OK | MB_ICONERROR,
+            let summary = format!(
+                "更新ファイルの取得に失敗しました。インターネットの接続状況をご確認のうえ、\
+                 もう一度お試しください。\n\n\
+                 このページから手動でダウンロードすることもできます。\n{}",
+                info.page_url
             );
+            message_box(&with_detail(&summary, &e), MB_OK | MB_ICONERROR);
             let _ = tx.send(TrayMessage::UpdateFinished);
             return;
         }
@@ -411,10 +562,9 @@ pub fn run(settings: Settings, tx: Sender<TrayMessage>, manual: bool) {
             let _ = std::fs::remove_file(&downloaded);
             // 自動で置き換えられない場合（書き込み権限が無いなど）は、
             // 手動で入れ替えられるようリリースページを開く。
-            message_box(
-                &format!("更新を適用できませんでした。\n\n{e}\n\nリリースページを開きます。"),
-                MB_OK | MB_ICONERROR,
-            );
+            let summary = "更新を適用できませんでした。リリースページを開きますので、\
+                            お手数ですが手動で置き換えてください。";
+            message_box(&with_detail(summary, &e), MB_OK | MB_ICONERROR);
             open_in_browser(&info.page_url);
             let _ = tx.send(TrayMessage::UpdateFinished);
             return;
@@ -430,13 +580,9 @@ pub fn run(settings: Settings, tx: Sender<TrayMessage>, manual: bool) {
         }
         Err(e) => {
             log::error!("新しいバージョンの起動に失敗しました: {e}");
-            message_box(
-                &format!(
-                    "更新は完了しましたが、自動で再起動できませんでした。\n\
-                     お手数ですが手動で起動し直してください。\n\n{e}"
-                ),
-                MB_OK | MB_ICONERROR,
-            );
+            let summary = "更新は完了しましたが、自動で再起動できませんでした。\n\
+                            お手数ですが手動で起動し直してください。";
+            message_box(&with_detail(summary, &e.to_string()), MB_OK | MB_ICONERROR);
             let _ = tx.send(TrayMessage::UpdateFinished);
         }
     }
@@ -462,8 +608,20 @@ fn open_in_browser(url: &str) {
     }
 }
 
+/// 平易な一文（`summary`）の下に、元のエラーメッセージ（`detail`）を添えた
+/// ダイアログ本文を作る。
+///
+/// serde や WinHTTP が返す英語まじりのメッセージをそのまま出すと利用者には
+/// 意味が伝わらないため、まず日本語で状況を説明し、詳細はその下に残す
+/// （原因の切り分けに役立つため、詳細自体を消しはしない）。
+fn with_detail(summary: &str, detail: &str) -> String {
+    format!("{summary}\n\n詳細: {detail}")
+}
+
 /// メッセージボックスを表示し、押されたボタンの ID を返す。
-fn message_box(text: &str, style: MESSAGEBOX_STYLE) -> i32 {
+///
+/// `main.rs` からも（初期化失敗時の通知に）呼べるよう `pub(crate)` にしている。
+pub(crate) fn message_box(text: &str, style: MESSAGEBOX_STYLE) -> i32 {
     let text_w: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     let title_w: Vec<u16> = DIALOG_TITLE
         .encode_utf16()
@@ -482,7 +640,11 @@ fn message_box(text: &str, style: MESSAGEBOX_STYLE) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_temp_update_file, Version};
+    use super::{
+        has_mz_signature, is_temp_update_file, needs_exe_restore, release, try_acquire,
+        with_detail, Version,
+    };
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn recognizes_own_temp_files() {
@@ -528,5 +690,40 @@ mod tests {
         let a = Version::parse("v1.1.0").unwrap();
         let b = Version::parse("1.1.0").unwrap();
         assert!(a <= b);
+    }
+
+    #[test]
+    fn try_acquire_blocks_concurrent_run() {
+        // 実際の UPDATE_RUNNING は他のテストと共有される static なので、
+        // ロジックの検証にはテスト専用のフラグを使う。
+        let flag = AtomicBool::new(false);
+        assert!(try_acquire(&flag), "1 回目は取得できる");
+        assert!(!try_acquire(&flag), "実行中は 2 回目を取得できない");
+        release(&flag);
+        assert!(try_acquire(&flag), "release 後は再取得できる");
+    }
+
+    #[test]
+    fn needs_exe_restore_only_when_exe_missing_and_old_present() {
+        // install() の 2 と 3 の間で中断された状態だけを復元対象とする。
+        assert!(needs_exe_restore(false, true));
+        assert!(!needs_exe_restore(true, true));
+        assert!(!needs_exe_restore(true, false));
+        assert!(!needs_exe_restore(false, false));
+    }
+
+    #[test]
+    fn mz_signature_detects_pe_executables() {
+        assert!(has_mz_signature(b"MZ\x90\x00\x03"));
+        assert!(!has_mz_signature(b"PK\x03\x04")); // ZIP など別形式
+        assert!(!has_mz_signature(b"M")); // 1 バイトしかない
+        assert!(!has_mz_signature(b""));
+    }
+
+    #[test]
+    fn with_detail_keeps_both_summary_and_detail() {
+        let text = with_detail("要約です。", "detail message");
+        assert!(text.contains("要約です。"));
+        assert!(text.contains("詳細: detail message"));
     }
 }

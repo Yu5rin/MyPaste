@@ -67,22 +67,39 @@ struct UpdateState {
 }
 
 impl Settings {
-    /// 設定を読み込む。ファイルが無い・壊れている場合は既定値を返す。
+    /// 設定を読み込む。ファイルが無い場合は既定値を書き出して返す。
+    /// ファイルはあるが読み込み・解析に失敗した場合は、利用者の編集内容を
+    /// 破棄しないよう、既定値の**上書き保存はせず**その場限りの既定値を返す。
     pub fn load() -> Self {
         let Some(path) = settings_path() else {
             return Self::default();
         };
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            // 初回起動時などファイルが無い場合。既定値で書き出しておくと
-            // 利用者が確認先 URL を編集できる。失敗しても無視する。
-            let settings = Self::default();
-            settings.save_default(&path);
-            return settings;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 初回起動時などファイルが無い場合。既定値で書き出しておくと
+                // 利用者が確認先 URL を編集できる。失敗しても無視する。
+                let settings = Self::default();
+                settings.save_default(&path);
+                return settings;
+            }
+            Err(e) => {
+                // ファイルはあるが読めない（例: UTF-16 で保存されている等）。
+                // ここで既定値を書き戻すと利用者の編集内容を消してしまうため、
+                // 上書き保存はせず、今回だけ既定値で動作する。
+                log::warn!("settings.json を読み込めなかったため既定値で動作します: {e}");
+                return Self::default();
+            }
         };
-        match serde_json::from_str(&text) {
+
+        // メモ帳などで保存すると UTF-8 の BOM (U+FEFF) が先頭に付くことがある。
+        // 付いたままだと serde_json が解析に失敗するため取り除く。
+        let text = strip_bom(&text);
+
+        match serde_json::from_str(text) {
             Ok(s) => s,
             Err(e) => {
-                log::warn!("settings.json の読み込みに失敗したため既定値を使います: {e}");
+                log::warn!("settings.json の解析に失敗したため既定値を使います: {e}");
                 Self::default()
             }
         }
@@ -94,6 +111,11 @@ impl Settings {
             let _ = std::fs::write(path, text);
         }
     }
+}
+
+/// 文字列の先頭に UTF-8 の BOM (`\u{feff}`) が付いていれば取り除く。
+fn strip_bom(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
 }
 
 /// 起動時チェックを実行してよいか。
@@ -180,9 +202,28 @@ pub fn is_writable(dir: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_due;
+    use super::{is_due, strip_bom};
 
     const HOUR: u64 = 3600;
+
+    #[test]
+    fn strip_bom_removes_leading_marker() {
+        let with_bom = "\u{feff}{\"update\":{}}";
+        assert_eq!(strip_bom(with_bom), "{\"update\":{}}");
+    }
+
+    #[test]
+    fn strip_bom_leaves_normal_text_untouched() {
+        let text = "{\"update\":{}}";
+        assert_eq!(strip_bom(text), text);
+    }
+
+    #[test]
+    fn strip_bom_only_strips_leading_occurrence() {
+        // 途中に現れる U+FEFF はそのまま残す（BOM は先頭にのみ意味を持つ）。
+        let text = "a\u{feff}b";
+        assert_eq!(strip_bom(text), text);
+    }
 
     #[test]
     fn interval_zero_always_checks() {

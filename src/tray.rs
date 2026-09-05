@@ -31,8 +31,16 @@ const LABEL_STARTUP: &str = "自動起動";
 /// 更新確認のメニュー文言。
 const LABEL_CHECK_UPDATE: &str = "更新を確認";
 
+/// アプリ名（ツールチップの先頭に使う）。
+const APP_NAME: &str = "アタイの貼り付け";
+
 /// 通常時のツールチップ（トレイアイコンにカーソルを合わせたときの表示）。
-const TOOLTIP_IDLE: &str = "アタイの貼り付け";
+///
+/// バージョンを含めることで、更新の確認をしなくても現在のバージョンが
+/// トレイアイコンにカーソルを合わせるだけで分かるようにしている。
+fn tooltip_idle() -> String {
+    format!("{APP_NAME} v{}", env!("CARGO_PKG_VERSION"))
+}
 
 /// 構築したメニュー項目のハンドル。ラベル更新に使う ID を保持する。
 pub struct Menu {
@@ -68,12 +76,12 @@ impl Menu {
     pub fn set_progress(&mut self, percent: u64) -> Result<(), tray_item::TIError> {
         self.tray
             .inner_mut()
-            .set_tooltip(&format!("{TOOLTIP_IDLE} — 更新を取得中 {percent}%"))
+            .set_tooltip(&format!("{} — 更新を取得中 {percent}%", tooltip_idle()))
     }
 
     /// ツールチップを通常の表示に戻す。
     pub fn clear_progress(&mut self) -> Result<(), tray_item::TIError> {
-        self.tray.inner_mut().set_tooltip(TOOLTIP_IDLE)
+        self.tray.inner_mut().set_tooltip(&tooltip_idle())
     }
 }
 
@@ -96,7 +104,7 @@ pub fn build(
     startup: bool,
 ) -> Result<Menu, tray_item::TIError> {
     let icon = if enabled { ICON_ON } else { ICON_OFF };
-    let mut tray = TrayItem::new("アタイの貼り付け", IconSource::Resource(icon))?;
+    let mut tray = TrayItem::new(&tooltip_idle(), IconSource::Resource(icon))?;
 
     // キーリマップの有効／無効
     let tx_toggle = tx.clone();

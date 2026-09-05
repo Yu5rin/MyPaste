@@ -8,9 +8,12 @@
 //! - **メインスレッド**: タスクトレイ（tray-item）を保持し、メニュー操作を
 //!   チャネル経由で受け取ってアイコン切替・自動起動切替・終了処理を行う。
 //!   tray-item は内部で独自のメッセージループを持つため、メインスレッドは
-//!   チャネル受信に専念できる。
+//!   チャネル受信に専念できる。終了要求を受けたときは、更新の入れ替えが
+//!   実行中であれば（上限付きで）完了を待ってから終了する
+//!   （[`wait_for_update_to_finish`]）。
 //! - **更新スレッド**: 更新の確認・ダウンロード・適用を行う。通信が起動や
-//!   キー操作を妨げないよう、必ず別スレッドで実行する。
+//!   キー操作を妨げないよう、必ず別スレッドで実行する。多重実行の防止は
+//!   `update::run` 内部で行う。
 
 // 本番（release）ビルドではコンソールウィンドウを出さない。
 // デバッグビルドではパニック出力などを確認できるよう残す。
@@ -32,8 +35,10 @@ mod logging;
 
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{LPARAM, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK};
 
 /// タスクトレイのメニュー操作をメインスレッドへ伝えるメッセージ。
 pub enum TrayMessage {
@@ -60,15 +65,37 @@ fn main() {
     let settings = config::Settings::load();
 
     // --- フックスレッドを起動し、そのスレッド ID を受け取る ---
-    let (id_tx, id_rx) = mpsc::channel::<u32>();
+    // 設置に失敗した場合は Err(エラー内容) が届く。詳細をダイアログに出せるよう
+    // スレッド ID だけでなくエラーメッセージも受け渡せる型にしている。
+    let (id_tx, id_rx) = mpsc::channel::<Result<u32, String>>();
     let hook_thread = thread::spawn(move || hook_thread_main(id_tx));
-    // フック設置後に送られてくるスレッド ID を待つ（終了時の WM_QUIT 送信に使う）。
-    let hook_tid = id_rx.recv().unwrap_or(0);
-    if hook_tid == 0 {
-        log::error!("フックスレッドの初期化に失敗したため終了します");
-        let _ = hook_thread.join();
-        return;
-    }
+    let hook_tid = match id_rx.recv() {
+        Ok(Ok(tid)) => tid,
+        Ok(Err(e)) => {
+            log::error!("フックスレッドの初期化に失敗したため終了します: {e}");
+            // 本番ビルドはロガーを初期化しないため、これを出さないと利用者には
+            // 「起動しても何も起きない」ようにしか見えない。
+            update::message_box(
+                &format!(
+                    "キーボードフックの設置に失敗したため、アプリを起動できません。\n\n\
+                     他のキーボード関連ソフトと競合している可能性があります。\n\n詳細: {e}"
+                ),
+                MB_OK | MB_ICONERROR,
+            );
+            let _ = hook_thread.join();
+            return;
+        }
+        Err(_) => {
+            // フックスレッドが応答を送らずに終了した（パニックなど）。
+            log::error!("フックスレッドから応答がなかったため終了します");
+            update::message_box(
+                "キーボードフックの初期化中に問題が発生したため、アプリを起動できません。",
+                MB_OK | MB_ICONERROR,
+            );
+            let _ = hook_thread.join();
+            return;
+        }
+    };
 
     // --- タスクトレイを構築 ---
     // 起動時の状態（キーリマップは ON、自動起動は現在の設定）をメニューに反映する。
@@ -77,6 +104,14 @@ fn main() {
         Ok(t) => t,
         Err(e) => {
             log::error!("トレイ初期化失敗: {e}");
+            // フック設置失敗の場合と同様、本番ビルドではログが出ないため
+            // MessageBox で知らせる（さもないと無言で終了してしまう）。
+            update::message_box(
+                &format!(
+                    "タスクトレイの初期化に失敗したため、アプリを起動できません。\n\n詳細: {e}"
+                ),
+                MB_OK | MB_ICONERROR,
+            );
             post_quit(hook_tid);
             let _ = hook_thread.join();
             return;
@@ -131,6 +166,10 @@ fn main() {
             }
             TrayMessage::Quit => {
                 log::info!("終了要求を受信");
+                // 更新の入れ替え（exe ↔ .old ↔ .new のリネーム）が進行中に
+                // プロセスを終了させると実行ファイルが壊れる恐れがあるため、
+                // 完了を待ってから終了する（通信詰まりなどに備え上限を設ける）。
+                wait_for_update_to_finish();
                 break;
             }
         }
@@ -143,19 +182,19 @@ fn main() {
 }
 
 /// フックスレッド本体。フックを設置し、メッセージループを回す。
-fn hook_thread_main(id_tx: mpsc::Sender<u32>) {
+fn hook_thread_main(id_tx: mpsc::Sender<Result<u32, String>>) {
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW, TranslateMessage, MSG};
 
     unsafe {
         if let Err(e) = keyboard::install() {
             log::error!("キーボードフック設置失敗: {e}");
-            let _ = id_tx.send(0);
+            let _ = id_tx.send(Err(format!("{e}")));
             return;
         }
 
         // このスレッドがメッセージループを持つので、スレッド ID を通知する。
-        let _ = id_tx.send(GetCurrentThreadId());
+        let _ = id_tx.send(Ok(GetCurrentThreadId()));
         log::info!("キーボードフック設置完了");
 
         // LL フックのコールバック配信のためにメッセージループを回す。
@@ -173,6 +212,34 @@ fn hook_thread_main(id_tx: mpsc::Sender<u32>) {
         // フック解除（リソースリーク防止）。
         keyboard::uninstall();
         log::info!("キーボードフック解除完了");
+    }
+}
+
+/// 更新処理が実行中なら、完了するまで待ってから終了する。
+///
+/// [`update::install`] は実行ファイルをリネームで入れ替えている最中があるため、
+/// その途中でプロセスを終了させると実行ファイルが壊れた状態になりかねない。
+/// ただし通信が詰まるなどして戻ってこない場合に備え、上限（60 秒）を設けて
+/// 無限に待ち続けることは避ける。
+fn wait_for_update_to_finish() {
+    const MAX_WAIT: Duration = Duration::from_secs(60);
+    const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+    if !update::is_running() {
+        return;
+    }
+    log::info!("更新処理が実行中のため、完了を待ってから終了します");
+
+    let start = Instant::now();
+    while update::is_running() && start.elapsed() < MAX_WAIT {
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    if update::is_running() {
+        log::warn!(
+            "更新処理の完了を待てなかったため（{}秒経過）、終了処理を続行します",
+            MAX_WAIT.as_secs()
+        );
     }
 }
 

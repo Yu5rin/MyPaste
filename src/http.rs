@@ -255,6 +255,18 @@ pub fn get(
             progress(body.len() as u64, total);
         }
 
+        // Content-Length が判っている場合、受信し終えたバイト数と一致するか確かめる。
+        // 応答が途中で切れても WinHttpQueryDataAvailable が 0 を返して
+        // ループを抜けてしまうため、ここで突き合わせないと切断を見逃す。
+        if let Some(t) = total {
+            let received = body.len() as u64;
+            if received != t {
+                return Err(format!(
+                    "応答が途中で切断されました（期待 {t} バイト / 受信 {received} バイト）"
+                ));
+            }
+        }
+
         Ok(body)
     }
 }
