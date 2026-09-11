@@ -34,11 +34,14 @@ const LABEL_CHECK_UPDATE: &str = "更新を確認";
 /// アプリ名（ツールチップの先頭に使う）。
 const APP_NAME: &str = "アタイの貼り付け";
 
-/// 通常時のツールチップ（トレイアイコンにカーソルを合わせたときの表示）。
+/// アプリ名とバージョンの表示（例: `アタイの貼り付け v1.2.2`）。
 ///
-/// バージョンを含めることで、更新の確認をしなくても現在のバージョンが
-/// トレイアイコンにカーソルを合わせるだけで分かるようにしている。
-fn tooltip_idle() -> String {
+/// ツールチップとメニュー先頭の見出しの両方に使う。
+///
+/// ツールチップだけではカーソルを合わせないと見えず、Windows 11 では
+/// トレイアイコン自体がオーバーフロー（「^」の中）に隠れるため、実質的に
+/// 確認できない。メニューを開けば必ず目に入るよう、見出しとしても表示する。
+fn app_title() -> String {
     format!("{APP_NAME} v{}", env!("CARGO_PKG_VERSION"))
 }
 
@@ -76,12 +79,12 @@ impl Menu {
     pub fn set_progress(&mut self, percent: u64) -> Result<(), tray_item::TIError> {
         self.tray
             .inner_mut()
-            .set_tooltip(&format!("{} — 更新を取得中 {percent}%", tooltip_idle()))
+            .set_tooltip(&format!("{} — 更新を取得中 {percent}%", app_title()))
     }
 
     /// ツールチップを通常の表示に戻す。
     pub fn clear_progress(&mut self) -> Result<(), tray_item::TIError> {
-        self.tray.inner_mut().set_tooltip(&tooltip_idle())
+        self.tray.inner_mut().set_tooltip(&app_title())
     }
 }
 
@@ -104,7 +107,12 @@ pub fn build(
     startup: bool,
 ) -> Result<Menu, tray_item::TIError> {
     let icon = if enabled { ICON_ON } else { ICON_OFF };
-    let mut tray = TrayItem::new(&tooltip_idle(), IconSource::Resource(icon))?;
+    let mut tray = TrayItem::new(&app_title(), IconSource::Resource(icon))?;
+
+    // 先頭にアプリ名とバージョンを見出しとして置く。add_label は選択できない
+    // 項目（MFS_DISABLED）になるので、誤って押される心配がない。
+    tray.add_label(&app_title())?;
+    tray.inner_mut().add_separator()?;
 
     // キーリマップの有効／無効
     let tx_toggle = tx.clone();
