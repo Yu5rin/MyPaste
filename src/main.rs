@@ -27,6 +27,7 @@ mod sendinput;
 mod startup;
 mod tray;
 mod update;
+mod update_logic;
 
 // 仕様上のファイル名 log.rs を保ちつつ、`log` クレートと名前が衝突しないよう
 // モジュール名は logging とする。

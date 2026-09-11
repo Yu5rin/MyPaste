@@ -41,6 +41,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::{self, Settings};
+use crate::update_logic::{self, Version};
 use crate::{http, TrayMessage};
 
 /// ダイアログのタイトル。
@@ -52,6 +53,16 @@ const TEMP_PREFIX: &str = "Atai-paste-";
 /// 一時ファイルを残骸とみなすまでの時間（秒）。
 /// 更新処理は数秒で終わるため、これより古いものは中断された残骸と判断する。
 const TEMP_STALE_SECS: u64 = 60 * 60;
+
+/// 更新確認（Atom / API とも）1 回ぶんのタイムアウト。
+///
+/// `WinHttpSetTimeouts` を呼ばずに既定値まかせにしていると、応答が無い場合に
+/// 環境によっては最大 90 秒ほど無反応になり得る。確認は起動のたびに行うため
+/// 短めに設定する。
+const CHECK_TIMEOUT_MS: i32 = 15_000;
+/// 更新ファイル（数十 MB）のダウンロードのタイムアウト。
+/// 確認より緩やかな回線でも完了できるよう長めに取る。
+const DOWNLOAD_TIMEOUT_MS: i32 = 10 * 60_000;
 
 /// 更新処理（[`run`]）が現在実行中かどうか。多重実行の防止に使う。
 ///
@@ -98,53 +109,6 @@ pub fn is_running() -> bool {
     UPDATE_RUNNING.load(Ordering::SeqCst)
 }
 
-/// 三つ組みのバージョン番号。
-///
-/// 比較は必ず**数値として**行う。文字列比較では `1.0.10` < `1.0.9` と
-/// 誤判定してしまうため。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Version {
-    major: u32,
-    minor: u32,
-    patch: u32,
-}
-
-impl Version {
-    /// `v1.2.3` / `1.2.3` / `1.2` などを解析する。
-    /// `1.2.3-beta` のような接尾辞は無視して数値部分だけを見る。
-    pub fn parse(text: &str) -> Option<Self> {
-        let t = text.trim();
-        let t = t.strip_prefix('v').or_else(|| t.strip_prefix('V')).unwrap_or(t);
-        // ハイフン以降（プレリリース識別子）とビルドメタデータは切り捨てる。
-        let t = t.split(['-', '+']).next()?;
-
-        let mut parts = t.split('.');
-        let major = parts.next()?.parse().ok()?;
-        let minor = parts.next().unwrap_or("0").parse().ok()?;
-        let patch = parts.next().unwrap_or("0").parse().ok()?;
-        Some(Self {
-            major,
-            minor,
-            patch,
-        })
-    }
-
-    /// このビルドのバージョン。
-    pub fn current() -> Self {
-        Self::parse(env!("CARGO_PKG_VERSION")).unwrap_or(Self {
-            major: 0,
-            minor: 0,
-            patch: 0,
-        })
-    }
-}
-
-impl std::fmt::Display for Version {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
-    }
-}
-
 /// GitHub Releases API のレスポンス（必要な項目のみ）。
 #[derive(Debug, Deserialize)]
 struct Release {
@@ -174,48 +138,164 @@ pub struct Available {
     pub page_url: String,
 }
 
+/// 更新確認の失敗理由。
+///
+/// HTTP 403（GitHub API の未認証レート制限。1 時間 60 回・IP アドレス単位）は
+/// 利用者の操作が原因ではないため、それ以外の失敗と案内文を変える。
+#[derive(Debug)]
+pub enum CheckError {
+    /// 問い合わせ回数の上限（HTTP 403）に達していた。
+    RateLimited,
+    /// それ以外の失敗（通信不可・応答の解析失敗など）。
+    Other(String),
+}
+
+impl std::fmt::Display for CheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckError::RateLimited => write!(f, "サーバーが HTTP 403 を返しました"),
+            CheckError::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl From<http::HttpError> for CheckError {
+    fn from(e: http::HttpError) -> Self {
+        if e.is_forbidden() {
+            CheckError::RateLimited
+        } else {
+            CheckError::Other(e.to_string())
+        }
+    }
+}
+
 /// 最新リリースを問い合わせ、現在より新しければ返す。
-pub fn check(settings: &Settings) -> Result<Option<Available>, String> {
-    let body = http::get(&settings.update.api_url, Some(GITHUB_ACCEPT), |_, _| {})?;
-    let release: Release =
-        serde_json::from_slice(&body).map_err(|e| format!("応答の解析に失敗: {e}"))?;
-
-    let latest = Version::parse(&release.tag_name)
-        .ok_or_else(|| format!("バージョンを解釈できません: {}", release.tag_name))?;
+///
+/// ## 確認の流れ（GitHub API のレート制限対策）
+///
+/// GitHub の Releases API には未認証の場合 **1 時間 60 回**という上限があり、
+/// これは端末ごとではなく **IP アドレスごと**に数えられる。会社などの共有回線
+/// では他の通信で先に使い切られ、確認のたびに HTTP 403 が返ることがある。
+///
+/// `https://github.com/{owner}/{repo}/releases.atom`（Atom フィード）はこの
+/// 上限とは別枠のため、まずこちらで「新しい版があるか」だけを確認する
+/// （[`update_logic::atom_url_from_api_url`]）。
+///
+/// - Atom で読み取れた最新タグが現在のバージョン以下なら、その時点で
+///   「最新」と確定でき、API を呼ぶ必要が無い（レート制限を消費しない）。
+/// - Atom で新しい版が見つかった場合だけ、添付ファイルの詳細（ダウンロード
+///   URL・SHA256）を取りに API を呼ぶ。呼ぶ頻度が「更新があったとき」だけに
+///   なるので、上限に当たる見込みはほぼ無くなる。
+/// - その API が失敗しても（403 を含む）、Atom で新しい版があると分かって
+///   いれば、ダウンロード URL は規則から組み立てて続行する
+///   （[`update_logic::build_download_url`]）。引き換えに SHA256 は分からない
+///   （API からしか取れない）ため検証を省略する。HTTPS で取得している以上、
+///   それで防げるのは転送中の破損までであり、改ざんそのものへの防御ではない。
+///
+/// Atom フィードが読めない・配布元が GitHub 以外に差し替えられているなどの
+/// 場合は、従来どおり API だけで確認する。
+pub fn check(settings: &Settings) -> Result<Option<Available>, CheckError> {
     let current = Version::current();
+    let atom_url = update_logic::atom_url_from_api_url(&settings.update.api_url);
 
-    log::info!("更新確認: 現在 {current} / 最新 {latest}");
-    if latest <= current {
-        return Ok(None);
+    // Atom で「新しい版がある」と分かった場合の控え。このあと API へ詳細を
+    // 取りに行くが、そちらが上限や障害で失敗しても、ここで分かったところまでは
+    // 使ってダウンロード URL を組み立てる。
+    let mut known_newer: Option<(Version, String)> = None;
+
+    if let Some(atom_url) = &atom_url {
+        match http::get(atom_url, None, CHECK_TIMEOUT_MS, |_, _| {}) {
+            Ok(body) => match String::from_utf8(body) {
+                Ok(xml) => match update_logic::extract_latest_tag_from_atom(&xml) {
+                    Some(tag) => match Version::parse(&tag) {
+                        Some(version) => {
+                            log::info!("Atom での確認: 現在 {current} / 最新 {version}（タグ {tag}）");
+                            if version <= current {
+                                // Atom の時点で最新と確定できたので、API は呼ばない。
+                                return Ok(None);
+                            }
+                            known_newer = Some((version, tag));
+                        }
+                        None => log::warn!("Atom フィードのタグを解釈できません: {tag}"),
+                    },
+                    None => log::warn!("Atom フィードからタグを取り出せませんでした"),
+                },
+                Err(_) => log::warn!("Atom フィードの応答が UTF-8 として解釈できませんでした"),
+            },
+            Err(e) => {
+                // Atom が読めなくても致命的ではない。API での確認へ進む。
+                log::warn!("Atom フィードの取得に失敗しました（API での確認を続けます）: {e}");
+            }
+        }
     }
 
-    // 目的の実行ファイルが添付されているか探す。
-    let asset = release
-        .assets
-        .iter()
-        .find(|a| a.name.eq_ignore_ascii_case(&settings.update.asset_name));
-    let Some(asset) = asset else {
-        return Err(format!(
-            "リリース {} に {} が添付されていません",
-            release.tag_name, settings.update.asset_name
-        ));
-    };
+    // API を呼び、添付ファイルの詳細（ダウンロード URL・SHA256）を取得する。
+    // Atom の時点で「最新」と確定していれば、ここへは来ない（上で return 済み）。
+    match http::get(&settings.update.api_url, Some(GITHUB_ACCEPT), CHECK_TIMEOUT_MS, |_, _| {}) {
+        Ok(body) => {
+            let release: Release = serde_json::from_slice(&body)
+                .map_err(|e| CheckError::Other(format!("応答の解析に失敗: {e}")))?;
 
-    let sha256 = asset.digest.as_ref().and_then(|d| {
-        d.strip_prefix("sha256:")
-            .map(|h| h.trim().to_ascii_lowercase())
-    });
+            let latest = Version::parse(&release.tag_name).ok_or_else(|| {
+                CheckError::Other(format!("バージョンを解釈できません: {}", release.tag_name))
+            })?;
+            log::info!("API での確認: 現在 {current} / 最新 {latest}");
+            if latest <= current {
+                return Ok(None);
+            }
 
-    Ok(Some(Available {
-        version: latest,
-        download_url: asset.browser_download_url.clone(),
-        sha256,
-        page_url: if release.html_url.is_empty() {
-            settings.update.releases_page.clone()
-        } else {
-            release.html_url.clone()
-        },
-    }))
+            // 目的の実行ファイルが添付されているか探す。
+            let asset = release
+                .assets
+                .iter()
+                .find(|a| a.name.eq_ignore_ascii_case(&settings.update.asset_name));
+            let Some(asset) = asset else {
+                return Err(CheckError::Other(format!(
+                    "リリース {} に {} が添付されていません",
+                    release.tag_name, settings.update.asset_name
+                )));
+            };
+
+            let sha256 = asset.digest.as_ref().and_then(|d| {
+                d.strip_prefix("sha256:")
+                    .map(|h| h.trim().to_ascii_lowercase())
+            });
+
+            Ok(Some(Available {
+                version: latest,
+                download_url: asset.browser_download_url.clone(),
+                sha256,
+                page_url: if release.html_url.is_empty() {
+                    settings.update.releases_page.clone()
+                } else {
+                    release.html_url.clone()
+                },
+            }))
+        }
+        Err(e) => {
+            // API が使えなかった。Atom で新しい版が分かっていれば、規則から
+            // ダウンロード URL を組み立てて続行する（SHA256 の照合は省く）。
+            if let (Some((version, tag)), Some(atom_url)) = (&known_newer, &atom_url) {
+                if let Some(download_url) =
+                    update_logic::build_download_url(atom_url, tag, &settings.update.asset_name)
+                {
+                    log::warn!(
+                        "更新確認 API に失敗しましたが（{e}）、Atom で判明した新しい版 {tag} の \
+                         ダウンロード URL を組み立てて続行します（SHA256 の照合は省略されます）"
+                    );
+                    let page_url = update_logic::build_release_page_url(atom_url, tag)
+                        .unwrap_or_else(|| settings.update.releases_page.clone());
+                    return Ok(Some(Available {
+                        version: *version,
+                        download_url,
+                        sha256: None,
+                        page_url,
+                    }));
+                }
+            }
+            Err(CheckError::from(e))
+        }
+    }
 }
 
 /// 更新ファイルをダウンロードし、SHA256 が判っていれば検証する。
@@ -225,8 +305,18 @@ fn download_and_verify(
     info: &Available,
     tx: &Sender<TrayMessage>,
 ) -> Result<PathBuf, String> {
+    // EXE を取得してそのまま実行する処理のため、応答（API の JSON や、Atom から
+    // 組み立てた URL）に書かれたホストをそのまま信用しない。HTTPS かつ GitHub の
+    // リリース配信ホストに限る。
+    if !update_logic::is_allowed_download_url(&info.download_url) {
+        return Err(format!(
+            "許可されていないダウンロード元のため中止しました: {}",
+            info.download_url
+        ));
+    }
+
     let mut last_percent = u64::MAX;
-    let bytes = http::get(&info.download_url, None, |done, total| {
+    let bytes = http::get(&info.download_url, None, DOWNLOAD_TIMEOUT_MS, |done, total| {
         // 進捗はトレイのツールチップに出す。更新のたびに送ると煩いので
         // パーセントが変わったときだけ通知する。
         let percent = match total {
@@ -237,7 +327,8 @@ fn download_and_verify(
             last_percent = percent;
             let _ = tx.send(TrayMessage::UpdateProgress(percent));
         }
-    })?;
+    })
+    .map_err(|e| e.to_string())?;
 
     // 最低限の妥当性検査: PE 実行ファイルの署名（先頭 2 バイトが `MZ`）を確認する。
     // GitHub がリリース資産に `digest`（SHA256）を付与していない場合でも、
@@ -495,13 +586,26 @@ pub fn run(settings: Settings, tx: Sender<TrayMessage>, manual: bool) {
             // 通信の失敗は起動を妨げない。手動確認のときだけ知らせる。
             log::warn!("更新の確認に失敗しました: {e}");
             if manual {
-                let summary = format!(
-                    "更新を確認できませんでした。インターネットに接続できないか、\
-                     GitHub が混み合っている可能性があります。\n\n\
-                     このページから最新版を確認することもできます。\n{}",
-                    settings.update.releases_page
-                );
-                message_box(&with_detail(&summary, &e), MB_OK | MB_ICONERROR);
+                // 403（問い合わせ回数の上限）は利用者の操作が原因ではないため、
+                // それ以外の失敗と案内文を分ける。「403」とだけ出しても、
+                // 自分が何度も押したせいだと誤解させてしまう。
+                let summary = match &e {
+                    CheckError::RateLimited => {
+                        "配布元への問い合わせが、回数の上限に達していました。この上限は同じ\
+                         ネットワークを使う人たちで共有されるため、自分が何度も押していなくても\
+                         起こります。しばらく時間をおくか、リリースページから直接ご確認ください。\n\n\
+                         リリースページ:\n"
+                            .to_string()
+                            + &settings.update.releases_page
+                    }
+                    CheckError::Other(_) => format!(
+                        "更新を確認できませんでした。インターネットに接続できないか、\
+                         GitHub が混み合っている可能性があります。\n\n\
+                         このページから最新版を確認することもできます。\n{}",
+                        settings.update.releases_page
+                    ),
+                };
+                message_box(&with_detail(&summary, &e.to_string()), MB_OK | MB_ICONERROR);
             }
             return;
         }
@@ -642,9 +746,13 @@ pub(crate) fn message_box(text: &str, style: MESSAGEBOX_STYLE) -> i32 {
 mod tests {
     use super::{
         has_mz_signature, is_temp_update_file, needs_exe_restore, release, try_acquire,
-        with_detail, Version,
+        with_detail,
     };
     use std::sync::atomic::AtomicBool;
+
+    // Version の解析・比較のテストは src/update_logic.rs に移した
+    // （Win32 API に依存しない純粋なロジックとして、Linux ネイティブでも
+    // `cargo test` で検証できるようにするため）。
 
     #[test]
     fn recognizes_own_temp_files() {
@@ -663,33 +771,6 @@ mod tests {
         assert!(!is_temp_update_file("Atai-paste-メモ.exe"));
         assert!(!is_temp_update_file("XAtai-paste-1.0.0.exe"));
         assert!(!is_temp_update_file(""));
-    }
-
-    #[test]
-    fn parses_common_forms() {
-        assert_eq!(Version::parse("v1.2.3"), Version::parse("1.2.3"));
-        assert!(Version::parse("1.2").is_some());
-        assert!(Version::parse("1.2.3-beta").is_some());
-        assert!(Version::parse("なし").is_none());
-    }
-
-    #[test]
-    fn compares_numerically_not_lexically() {
-        // 文字列比較では "1.0.10" < "1.0.9" と誤判定してしまう組み合わせ。
-        let a = Version::parse("1.0.10").unwrap();
-        let b = Version::parse("1.0.9").unwrap();
-        assert!(a > b);
-
-        let c = Version::parse("1.10.0").unwrap();
-        let d = Version::parse("1.9.0").unwrap();
-        assert!(c > d);
-    }
-
-    #[test]
-    fn equal_versions_are_not_newer() {
-        let a = Version::parse("v1.1.0").unwrap();
-        let b = Version::parse("1.1.0").unwrap();
-        assert!(a <= b);
     }
 
     #[test]

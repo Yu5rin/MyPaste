@@ -15,9 +15,38 @@ use windows::core::PCWSTR;
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpCrackUrl, WinHttpOpen, WinHttpOpenRequest,
     WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
-    WinHttpSendRequest, URL_COMPONENTS, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
-    WINHTTP_OPEN_REQUEST_FLAGS,
+    WinHttpSendRequest, WinHttpSetTimeouts, URL_COMPONENTS, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+    WINHTTP_FLAG_SECURE, WINHTTP_OPEN_REQUEST_FLAGS,
 };
+
+/// `get()` の失敗理由。
+///
+/// サーバーがエラーステータスを返した場合は、呼び出し側がステータスコードごとに
+/// 文言を変えられるよう数値のまま保持する（特に HTTP 403 はレート制限の可能性が
+/// 高く、他の失敗と案内文を変える必要がある）。
+#[derive(Debug)]
+pub enum HttpError {
+    /// サーバーが 200 以外のステータスコードを返した。
+    Status(u32),
+    /// それ以外（URL の解析失敗・接続不可・応答の切断など）。
+    Other(String),
+}
+
+impl HttpError {
+    /// HTTP 403（多くの場合レート制限）かどうか。
+    pub fn is_forbidden(&self) -> bool {
+        matches!(self, HttpError::Status(403))
+    }
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HttpError::Status(code) => write!(f, "サーバーが HTTP {code} を返しました"),
+            HttpError::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
 
 /// User-Agent（GitHub API は User-Agent が無いと 403 を返す）。
 const USER_AGENT: &str = "Atai-paste-updater";
@@ -61,7 +90,7 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 /// URL を分解する。
-fn crack_url(url: &str) -> Result<CrackedUrl, String> {
+fn crack_url(url: &str) -> Result<CrackedUrl, HttpError> {
     // WinHttpCrackUrl はヌル終端を含めない長さを期待するため、終端なしで渡す。
     let url_w: Vec<u16> = url.encode_utf16().collect();
 
@@ -76,11 +105,12 @@ fn crack_url(url: &str) -> Result<CrackedUrl, String> {
     comp.dwExtraInfoLength = u32::MAX;
 
     unsafe {
-        WinHttpCrackUrl(&url_w, 0, &mut comp).map_err(|e| format!("URL の解析に失敗: {e}"))?;
+        WinHttpCrackUrl(&url_w, 0, &mut comp)
+            .map_err(|e| HttpError::Other(format!("URL の解析に失敗: {e}")))?;
     }
 
     if comp.lpszHostName.is_null() || comp.dwHostNameLength == 0 {
-        return Err("URL にホスト名がありません".to_string());
+        return Err(HttpError::Other("URL にホスト名がありません".to_string()));
     }
 
     // 返されたポインタは url_w の内部を指すので、ここでコピーしておく。
@@ -110,7 +140,9 @@ fn crack_url(url: &str) -> Result<CrackedUrl, String> {
     // nScheme が INTERNET_SCHEME_HTTPS(2) なら TLS。ポート 443 も同様に扱う。
     let secure = comp.nScheme.0 == 2 || comp.nPort == 443;
     if !secure {
-        return Err("HTTPS 以外の URL は許可していません".to_string());
+        return Err(HttpError::Other(
+            "HTTPS 以外の URL は許可していません".to_string(),
+        ));
     }
 
     Ok(CrackedUrl {
@@ -125,12 +157,17 @@ fn crack_url(url: &str) -> Result<CrackedUrl, String> {
 ///
 /// - `accept`: `Accept` ヘッダに入れる値（GitHub API では
 ///   `application/vnd.github+json` を指定する）
+/// - `timeout_ms`: 名前解決・接続・送信・受信の各段階に適用するタイムアウト（ミリ秒）。
+///   [`WinHttpSetTimeouts`] に 4 つとも同じ値で渡す。これを呼ばないと既定値
+///   （環境によっては最大 90 秒程度）まかせになり、応答が無いときに長時間
+///   無反応になる。確認用には短め、ダウンロード用には長めの値を呼び出し側が渡す。
 /// - `progress`: 受信バイト数と全体サイズ（判れば）を受け取るコールバック
 pub fn get(
     url: &str,
     accept: Option<&str>,
+    timeout_ms: i32,
     mut progress: impl FnMut(u64, Option<u64>),
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, HttpError> {
     let parts = crack_url(url)?;
 
     unsafe {
@@ -143,7 +180,13 @@ pub fn get(
             0,
         ));
         if session.0.is_null() {
-            return Err("WinHttpOpen に失敗しました".to_string());
+            return Err(HttpError::Other("WinHttpOpen に失敗しました".to_string()));
+        }
+
+        // タイムアウトを明示する。失敗しても致命的ではない（既定値のまま続行する）。
+        if let Err(e) = WinHttpSetTimeouts(session.0, timeout_ms, timeout_ms, timeout_ms, timeout_ms)
+        {
+            log::warn!("タイムアウトの設定に失敗しました（既定値のまま続行します）: {e}");
         }
 
         // --- 接続 ---
@@ -154,7 +197,7 @@ pub fn get(
             0,
         ));
         if connect.0.is_null() {
-            return Err("接続に失敗しました".to_string());
+            return Err(HttpError::Other("接続に失敗しました".to_string()));
         }
 
         // --- リクエスト ---
@@ -173,7 +216,7 @@ pub fn get(
             flags,
         ));
         if request.0.is_null() {
-            return Err("リクエストの作成に失敗しました".to_string());
+            return Err(HttpError::Other("リクエストの作成に失敗しました".to_string()));
         }
 
         // --- 送信 ---
@@ -183,9 +226,9 @@ pub fn get(
         let header_slice = headers.as_deref();
 
         WinHttpSendRequest(request.0, header_slice, None, 0, 0, 0)
-            .map_err(|e| format!("送信に失敗: {e}"))?;
+            .map_err(|e| HttpError::Other(format!("送信に失敗: {e}")))?;
         WinHttpReceiveResponse(request.0, std::ptr::null_mut())
-            .map_err(|e| format!("応答の受信に失敗: {e}"))?;
+            .map_err(|e| HttpError::Other(format!("応答の受信に失敗: {e}")))?;
 
         // --- ステータスコード ---
         let mut status: u32 = 0;
@@ -198,10 +241,10 @@ pub fn get(
             &mut size,
             std::ptr::null_mut(),
         )
-        .map_err(|e| format!("ステータスコードの取得に失敗: {e}"))?;
+        .map_err(|e| HttpError::Other(format!("ステータスコードの取得に失敗: {e}")))?;
 
         if status != 200 {
-            return Err(format!("サーバーが HTTP {status} を返しました"));
+            return Err(HttpError::Status(status));
         }
 
         // --- Content-Length（進捗表示に使う。無くてもよい） ---
@@ -220,7 +263,7 @@ pub fn get(
 
         if let Some(t) = total {
             if t > MAX_BODY_BYTES {
-                return Err(format!("応答が大きすぎます（{t} バイト）"));
+                return Err(HttpError::Other(format!("応答が大きすぎます（{t} バイト）")));
             }
         }
 
@@ -229,7 +272,7 @@ pub fn get(
         loop {
             let mut available: u32 = 0;
             WinHttpQueryDataAvailable(request.0, &mut available)
-                .map_err(|e| format!("受信サイズの取得に失敗: {e}"))?;
+                .map_err(|e| HttpError::Other(format!("受信サイズの取得に失敗: {e}")))?;
             if available == 0 {
                 break;
             }
@@ -242,7 +285,7 @@ pub fn get(
                 available,
                 &mut read,
             )
-            .map_err(|e| format!("受信に失敗: {e}"))?;
+            .map_err(|e| HttpError::Other(format!("受信に失敗: {e}")))?;
             if read == 0 {
                 break;
             }
@@ -250,7 +293,7 @@ pub fn get(
             body.extend_from_slice(&chunk);
 
             if body.len() as u64 > MAX_BODY_BYTES {
-                return Err("応答が大きすぎます".to_string());
+                return Err(HttpError::Other("応答が大きすぎます".to_string()));
             }
             progress(body.len() as u64, total);
         }
@@ -261,9 +304,9 @@ pub fn get(
         if let Some(t) = total {
             let received = body.len() as u64;
             if received != t {
-                return Err(format!(
+                return Err(HttpError::Other(format!(
                     "応答が途中で切断されました（期待 {t} バイト / 受信 {received} バイト）"
-                ));
+                )));
             }
         }
 
