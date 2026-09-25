@@ -33,12 +33,38 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target/release/Atai-paste.exe dist/Atai-paste.exe
 
+      # リリース本文は「## 変更点」と「## ダウンロード」の 2 つだけにし、アプリの説明・
+      # 導入や更新の方法・動作環境などは README に置く（CLAUDE.md「リリース手順」）。
+      # RELEASE_NOTES.md には「## 変更点」だけを書き、ダウンロードの表と README への
+      # 案内はここで足す。自動更新は本文を読まず、SHA256 は GitHub が添付ファイルごとに
+      # 持つ digest から取っている（src/update.rs）ので、本文の表は人が確かめるためのもの。
+      - name: Compose release notes
+        shell: pwsh
+        run: |
+          $exe = Get-Item dist/Atai-paste.exe
+          $sha = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
+          $kb = [math]::Round($exe.Length / 1KB, 1).ToString("0.0", [Globalization.CultureInfo]::InvariantCulture)
+          $notes = (Get-Content RELEASE_NOTES.md -Raw -Encoding utf8).TrimEnd()
+          $readme = "${{ github.server_url }}/${{ github.repository }}#インストール"
+          $body = @(
+            $notes
+            ""
+            "## ダウンロード"
+            ""
+            "| ファイル | サイズ | SHA256 |"
+            "| --- | --- | --- |"
+            "| $($exe.Name) | $kb KB | ``$sha`` |"
+            ""
+            "インストールと更新の方法は [README]($readme) をご覧ください。"
+          ) -join "`n"
+          Set-Content -Path dist/release-body.md -Value $body -Encoding utf8
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag }}
-          name: アタイの貼り付け ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
           files: dist/Atai-paste.exe
-          body_path: RELEASE_NOTES.md
+          body_path: dist/release-body.md
           draft: false
           prerelease: false
