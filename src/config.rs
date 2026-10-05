@@ -25,6 +25,30 @@ const STATE_FILE: &str = "update_state.json";
 #[serde(default)]
 pub struct Settings {
     pub update: UpdateSettings,
+    /// IME 入力モードの画面中央表示（[`crate::ime_indicator`]）。
+    pub ime_indicator: ImeIndicatorSettings,
+}
+
+/// IME 入力モードの画面中央表示に関する設定。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImeIndicatorSettings {
+    /// 表示するか（トレイメニュー「入力モードを画面中央に表示」からも切り替えられる）。
+    pub enabled: bool,
+    /// 表示を保持する時間（ミリ秒）。このあと 0.25 秒でフェードアウトする。
+    pub hold_ms: u64,
+    /// 表示する四角の一辺（96 DPI 基準のピクセル。実際の DPI に合わせて拡大する）。
+    pub size: u32,
+}
+
+impl Default for ImeIndicatorSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hold_ms: 400,
+            size: 120,
+        }
+    }
 }
 
 /// 更新確認に関する設定。
@@ -111,6 +135,36 @@ impl Settings {
             let _ = std::fs::write(path, text);
         }
     }
+}
+
+/// IME 入力モード表示の ON/OFF だけを `settings.json` に書き込む。
+///
+/// ファイル全体を [`Settings`] で書き直すと、利用者が書いた未知の項目や
+/// 書式が失われるため、JSON として読んでこの 1 項目だけを差し替える。
+/// ファイルが読めない・JSON として解釈できない場合は、利用者の編集内容を
+/// 壊さないよう**書き込まずに** `Err` を返す（今回の切り替えはメモリ上だけ有効）。
+pub fn save_ime_indicator_enabled(enabled: bool) -> Result<(), String> {
+    let path = settings_path().ok_or("設定ファイルの場所を決められません")?;
+    let mut root: serde_json::Value = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(strip_bom(&text))
+            .map_err(|e| format!("settings.json を解釈できないため保存しませんでした: {e}"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::to_value(Settings::default()).map_err(|e| e.to_string())?
+        }
+        Err(e) => return Err(format!("settings.json を読めないため保存しませんでした: {e}")),
+    };
+    let obj = root
+        .as_object_mut()
+        .ok_or("settings.json の形が想定と違うため保存しませんでした")?;
+    let section = obj
+        .entry("ime_indicator")
+        .or_insert_with(|| serde_json::json!({}));
+    let section = section
+        .as_object_mut()
+        .ok_or("settings.json の ime_indicator の形が想定と違うため保存しませんでした")?;
+    section.insert("enabled".into(), serde_json::Value::Bool(enabled));
+    let text = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    std::fs::write(&path, text).map_err(|e| format!("settings.json に書き込めませんでした: {e}"))
 }
 
 /// 文字列の先頭に UTF-8 の BOM (`\u{feff}`) が付いていれば取り除く。

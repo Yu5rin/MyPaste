@@ -28,6 +28,8 @@ const MARK_OFF: &str = "　 ";
 const LABEL_REMAP: &str = "Ctrl+B で値貼り付け";
 /// 自動起動のメニュー文言。
 const LABEL_STARTUP: &str = "自動起動";
+/// 入力モード表示のメニュー文言。
+const LABEL_IME_INDICATOR: &str = "入力モードを画面中央に表示";
 /// 更新確認のメニュー文言。
 const LABEL_CHECK_UPDATE: &str = "更新を確認";
 
@@ -50,6 +52,7 @@ pub struct Menu {
     tray: TrayItem,
     remap_id: u32,
     startup_id: u32,
+    ime_indicator_id: u32,
 }
 
 impl Menu {
@@ -73,6 +76,14 @@ impl Menu {
         self.tray
             .inner_mut()
             .set_menu_item_label(&label, self.startup_id)
+    }
+
+    /// 入力モード表示項目のチェック状態を更新する。
+    pub fn set_ime_indicator_checked(&mut self, checked: bool) -> Result<(), tray_item::TIError> {
+        let label = labeled(LABEL_IME_INDICATOR, checked);
+        self.tray
+            .inner_mut()
+            .set_menu_item_label(&label, self.ime_indicator_id)
     }
 
     /// ダウンロードの進捗をツールチップに表示する。
@@ -101,10 +112,12 @@ fn labeled(text: &str, checked: bool) -> String {
 ///
 /// - `enabled`: 起動時のキーリマップ有効状態
 /// - `startup`: 起動時の自動起動設定状態
+/// - `ime_indicator`: 起動時の入力モード表示の有効状態
 pub fn build(
     tx: Sender<TrayMessage>,
     enabled: bool,
     startup: bool,
+    ime_indicator: bool,
 ) -> Result<Menu, tray_item::TIError> {
     let icon = if enabled { ICON_ON } else { ICON_OFF };
     let mut tray = TrayItem::new(&app_title(), IconSource::Resource(icon))?;
@@ -130,6 +143,15 @@ pub fn build(
             let _ = tx_startup.send(TrayMessage::ToggleStartup);
         })?;
 
+    // 入力モード表示の有効／無効
+    let tx_ime = tx.clone();
+    let ime_indicator_id = tray.inner_mut().add_menu_item_with_id(
+        &labeled(LABEL_IME_INDICATOR, ime_indicator),
+        move || {
+            let _ = tx_ime.send(TrayMessage::ToggleImeIndicator);
+        },
+    )?;
+
     // 設定項目と操作項目を区切る。
     tray.inner_mut().add_separator()?;
 
@@ -152,5 +174,6 @@ pub fn build(
         tray,
         remap_id,
         startup_id,
+        ime_indicator_id,
     })
 }
