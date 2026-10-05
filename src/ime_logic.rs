@@ -25,6 +25,118 @@ pub const DEFAULT_FADE_MS: u64 = 250;
 pub const SIZE_MIN: u32 = 40;
 pub const SIZE_MAX: u32 = 600;
 
+/// 不透明度（%）として設定できる範囲。低すぎると見えなくなるため 30% からにする。
+pub const OPACITY_MIN: u32 = 30;
+pub const OPACITY_MAX: u32 = 100;
+/// 不透明度の既定（%）。少しだけ透かして背後を感じさせる。
+pub const DEFAULT_OPACITY: u32 = 90;
+
+/// 表示する位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Position {
+    /// 前面ウィンドウのあるモニターの中央（既定）
+    Center,
+    /// マウスカーソルの近く
+    Mouse,
+    /// 文字の入力位置（キャレット）の近く。取れないアプリでは画面中央
+    Caret,
+}
+
+impl Position {
+    /// 設定画面の一覧の順（設定値, 表示名）。
+    pub const ALL: [(Position, &'static str, &'static str); 3] = [
+        (Position::Center, "center", "画面中央"),
+        (Position::Mouse, "mouse", "マウスの近く"),
+        (Position::Caret, "caret", "入力位置の近く"),
+    ];
+
+    /// settings.json の値から読む。知らない値は画面中央（設定ファイル全体を無効にしない）。
+    pub fn from_setting(text: &str) -> Position {
+        Self::ALL
+            .iter()
+            .find(|(_, key, _)| key.eq_ignore_ascii_case(text.trim()))
+            .map(|(p, _, _)| *p)
+            .unwrap_or(Position::Center)
+    }
+
+    /// settings.json に書く値。
+    pub fn as_setting(self) -> &'static str {
+        Self::ALL.iter().find(|(p, _, _)| *p == self).map(|(_, k, _)| *k).unwrap_or("center")
+    }
+}
+
+/// 表示の色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Theme {
+    /// 濃いグレーに白い文字（既定）
+    Dark,
+    /// 明るいグレーに濃い文字
+    Light,
+}
+
+impl Theme {
+    /// 設定画面の一覧の順（設定値, 設定値の名前, 表示名）。
+    pub const ALL: [(Theme, &'static str, &'static str); 2] =
+        [(Theme::Dark, "dark", "濃い色"), (Theme::Light, "light", "明るい色")];
+
+    /// settings.json の値から読む。知らない値は濃い色。
+    pub fn from_setting(text: &str) -> Theme {
+        Self::ALL
+            .iter()
+            .find(|(_, key, _)| key.eq_ignore_ascii_case(text.trim()))
+            .map(|(t, _, _)| *t)
+            .unwrap_or(Theme::Dark)
+    }
+
+    /// settings.json に書く値。
+    pub fn as_setting(self) -> &'static str {
+        Self::ALL.iter().find(|(t, _, _)| *t == self).map(|(_, k, _)| *k).unwrap_or("dark")
+    }
+
+    /// 背景色と文字色（`0x00BBGGRR`。Win32 の COLORREF の並び）。
+    pub fn colors(self) -> (u32, u32) {
+        match self {
+            Theme::Dark => (0x0020_2020, 0x00FF_FFFF),
+            Theme::Light => (0x00F3_F3F3, 0x0020_2020),
+        }
+    }
+}
+
+/// 不透明度（%）を、レイヤードウィンドウの不透明度（0〜255）にする。範囲外は丸める。
+pub fn opacity_to_alpha(percent: u32) -> u8 {
+    let percent = percent.clamp(OPACITY_MIN, OPACITY_MAX);
+    ((percent * 255 + 50) / 100) as u8
+}
+
+/// 点（マウスカーソルや入力位置）の近くに、一辺 `size` の正方形を置いたときの左上座標。
+///
+/// 点の右下に `gap` だけ離して置く。作業領域（`left, top, right, bottom`）からはみ出す
+/// 場合は、下に収まらなければ点の上側へ、右に収まらなければ左へずらし、最後に
+/// 作業領域の中へ収める。`below` には点の下端（入力位置なら文字の下端）を渡す。
+#[allow(clippy::too_many_arguments)]
+pub fn origin_near_point(
+    x: i32,
+    y_top: i32,
+    y_below: i32,
+    work: (i32, i32, i32, i32),
+    size: i32,
+    gap: i32,
+) -> (i32, i32) {
+    let (left, top, right, bottom) = work;
+    let mut ox = x + gap;
+    if ox + size > right {
+        ox = x - gap - size;
+    }
+    let mut oy = y_below + gap;
+    if oy + size > bottom {
+        oy = y_top - gap - size;
+    }
+    // 作業領域が表示より小さい極端な場合でも、左上は作業領域の中に置く。
+    ox = ox.min(right - size).max(left);
+    oy = oy.min(bottom - size).max(top);
+    (ox, oy)
+}
+
 /// 画面に出す入力モード。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImeMode {
@@ -299,6 +411,55 @@ mod tests {
         for ms in [0, 1, 100, 250, 400, 999, 1000, 1500, 5000] {
             assert_eq!(parse_seconds(&format_seconds(ms), 0, 5000), Some(ms));
         }
+    }
+
+    #[test]
+    fn position_and_theme_settings() {
+        assert_eq!(Position::from_setting("mouse"), Position::Mouse);
+        assert_eq!(Position::from_setting(" Caret "), Position::Caret);
+        assert_eq!(Position::from_setting("どこか"), Position::Center);
+        for (p, key, _) in Position::ALL {
+            assert_eq!(Position::from_setting(p.as_setting()), p);
+            assert_eq!(p.as_setting(), key);
+        }
+        assert_eq!(Theme::from_setting("LIGHT"), Theme::Light);
+        assert_eq!(Theme::from_setting(""), Theme::Dark);
+        for (t, _, _) in Theme::ALL {
+            assert_eq!(Theme::from_setting(t.as_setting()), t);
+        }
+    }
+
+    #[test]
+    fn opacity_maps_to_alpha() {
+        assert_eq!(opacity_to_alpha(100), 255);
+        assert_eq!(opacity_to_alpha(90), 230); // これまでの見た目と同じ
+        assert_eq!(opacity_to_alpha(30), 77);
+        assert_eq!(opacity_to_alpha(0), 77); // 下限に丸める
+        assert_eq!(opacity_to_alpha(500), 255);
+    }
+
+    #[test]
+    fn near_point_prefers_below_right() {
+        let work = (0, 0, 1920, 1040);
+        assert_eq!(origin_near_point(500, 500, 520, work, 120, 16), (516, 536));
+    }
+
+    #[test]
+    fn near_point_flips_at_edges() {
+        let work = (0, 0, 1920, 1040);
+        // 右端の近く → 左側へ
+        assert_eq!(origin_near_point(1900, 500, 520, work, 120, 16), (1764, 536));
+        // 下端の近く（タスクバーの上）→ 上側へ。入力位置なら文字の上端より上に置く
+        assert_eq!(origin_near_point(500, 1000, 1020, work, 120, 16), (516, 864));
+    }
+
+    #[test]
+    fn near_point_stays_inside_secondary_monitor() {
+        // 主モニターの左にあるモニター（座標が負）
+        let work = (-1920, 0, 0, 1040);
+        assert_eq!(origin_near_point(-10, 10, 30, work, 120, 16), (-146, 46));
+        // 作業領域より大きい表示でも左上は領域内
+        assert_eq!(origin_near_point(-10, 10, 30, (-100, 0, 0, 50), 120, 16), (-100, 0));
     }
 
     #[test]

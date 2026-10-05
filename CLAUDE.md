@@ -74,7 +74,7 @@ src/
  ├ startup.rs       // 自動起動設定（スタートアップの .lnk 作成／削除）
  ├ ime_indicator.rs // 入力モードの画面中央表示（IME 状態の監視・表示ウィンドウ）
  ├ ime_logic.rs     // 入力モード表示の判断ロジック（Win32 非依存）
- ├ log.rs           // 開発時ログ出力
+ ├ log.rs           // 動作の記録（log.txt。トラブル調査用・開発時）
  └ icons/           // ON/OFF アイコン素材
 ```
 

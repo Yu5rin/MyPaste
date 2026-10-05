@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 
 /// 設定ファイル名。
 const SETTINGS_FILE: &str = "settings.json";
+/// 動作の記録のファイル名。
+const LOG_FILE: &str = "log.txt";
 /// 状態ファイル名。
 const STATE_FILE: &str = "update_state.json";
 
@@ -31,6 +33,16 @@ pub struct Settings {
     pub update: UpdateSettings,
     /// IME 入力モードの画面中央表示（[`crate::ime_indicator`]）。
     pub ime_indicator: ImeIndicatorSettings,
+    /// トラブル調査用の動作の記録（[`crate::logging`]）。
+    pub log: LogSettings,
+}
+
+/// トラブル調査用の動作の記録に関する設定。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LogSettings {
+    /// `log.txt` に動作を記録するか（既定は記録しない）。
+    pub enabled: bool,
 }
 
 /// キーリマップに関する設定。
@@ -65,6 +77,14 @@ pub struct ImeIndicatorSettings {
     pub fade_ms: u64,
     /// 表示する四角の一辺（96 DPI 基準のピクセル。実際の DPI に合わせて拡大する）。
     pub size: u32,
+    /// 表示する位置（`"center"` / `"mouse"` / `"caret"`）。知らない値は画面中央。
+    pub position: String,
+    /// 色（`"dark"` / `"light"`）。知らない値は濃い色。
+    pub theme: String,
+    /// 不透明度（%。30〜100）。
+    pub opacity: u32,
+    /// 全画面のアプリ（ゲーム・動画・プレゼンテーションなど）の間は表示しないか。
+    pub hide_in_fullscreen: bool,
 }
 
 impl Default for ImeIndicatorSettings {
@@ -74,6 +94,10 @@ impl Default for ImeIndicatorSettings {
             hold_ms: 400,
             fade_ms: crate::ime_logic::DEFAULT_FADE_MS,
             size: 120,
+            position: "center".to_string(),
+            theme: "dark".to_string(),
+            opacity: crate::ime_logic::DEFAULT_OPACITY,
+            hide_in_fullscreen: false,
         }
     }
 }
@@ -183,6 +207,13 @@ pub fn save_from_settings_window(settings: &Settings) -> Result<(), String> {
             "hold_ms": settings.ime_indicator.hold_ms,
             "fade_ms": settings.ime_indicator.fade_ms,
             "size": settings.ime_indicator.size,
+            "position": settings.ime_indicator.position,
+            "theme": settings.ime_indicator.theme,
+            "opacity": settings.ime_indicator.opacity,
+            "hide_in_fullscreen": settings.ime_indicator.hide_in_fullscreen,
+        },
+        "log": {
+            "enabled": settings.log.enabled,
         },
         "update": {
             "check_on_startup": settings.update.check_on_startup,
@@ -242,6 +273,11 @@ fn merge_json(base: &mut serde_json::Value, patch: &serde_json::Value) {
 /// 設定ファイルのパス（設定画面の「設定ファイルの場所を開く」で使う）。
 pub fn settings_file() -> Option<PathBuf> {
     settings_path()
+}
+
+/// 動作の記録（`log.txt`）のパス。設定ファイルと同じフォルダに置く。
+pub fn log_file() -> Option<PathBuf> {
+    data_dir().map(|d| d.join(LOG_FILE))
 }
 
 /// 文字列の先頭に UTF-8 の BOM (`\u{feff}`) が付いていれば取り除く。
@@ -405,6 +441,12 @@ mod tests {
             serde_json::from_str(r#"{ "ime_indicator": { "hold_ms": 800 } }"#).unwrap();
         assert_eq!(s.ime_indicator.hold_ms, 800);
         assert_eq!(s.ime_indicator.fade_ms, 250);
+        // v1.4.1 以前には表示の出し方と記録の設定も無い。これまでの見た目と同じになること。
+        assert_eq!(s.ime_indicator.position, "center");
+        assert_eq!(s.ime_indicator.theme, "dark");
+        assert_eq!(s.ime_indicator.opacity, 90);
+        assert!(!s.ime_indicator.hide_in_fullscreen);
+        assert!(!s.log.enabled);
     }
 
     #[test]

@@ -23,11 +23,12 @@ pub fn is_target_foreground(apps: &[String]) -> bool {
     if apps.is_empty() {
         return false;
     }
-    foreground_image_name().is_some_and(|name| remap_logic::is_target_app(&name, apps))
+    foreground_process_name().is_some_and(|name| remap_logic::is_target_app(&name, apps))
 }
 
 /// 最前面のウィンドウのプロセスのファイル名（例 `EXCEL.EXE`）。取れなければ `None`。
-fn foreground_image_name() -> Option<String> {
+/// （管理者権限で動いているプロセスなどは取れないことがある。動作の記録にも使う）
+pub fn foreground_process_name() -> Option<String> {
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.is_invalid() {

@@ -148,15 +148,27 @@ unsafe extern "system" fn low_level_keyboard_proc(
                         return LRESULT(1);
                     }
                     // 対象アプリかつ ON かつ修飾キーが一致するときだけリマップする。
-                    if kb.vkCode == hotkey.vk
-                        && modifiers_match(&hotkey)
-                        && is_enabled()
-                        && is_target_foreground()
-                    {
-                        ACTIVE_VK.store(kb.vkCode, Ordering::SeqCst);
-                        sendinput::send_paste_values(&hotkey);
-                        log::debug!("{} -> Ctrl+Shift+V", hotkey.format());
-                        return LRESULT(1);
+                    if kb.vkCode == hotkey.vk && modifiers_match(&hotkey) {
+                        if is_enabled() && is_target_foreground() {
+                            ACTIVE_VK.store(kb.vkCode, Ordering::SeqCst);
+                            sendinput::send_paste_values(&hotkey);
+                            log::debug!("{} -> Ctrl+Shift+V を送りました", hotkey.format());
+                            return LRESULT(1);
+                        }
+                        // リマップしなかった理由を記録に残す（「効かない」ときの調査用）。
+                        // 記録が OFF のときはプロセス名を調べる手間もかけない。
+                        if log::log_enabled!(log::Level::Debug) {
+                            if is_enabled() {
+                                log::debug!(
+                                    "{} はそのまま通しました（前面のアプリ {} は対象外）",
+                                    hotkey.format(),
+                                    excel_check::foreground_process_name()
+                                        .unwrap_or_else(|| "不明".into())
+                                );
+                            } else {
+                                log::debug!("{} はそのまま通しました（OFF のため）", hotkey.format());
+                            }
+                        }
                     }
                 }
                 // 押下を握りつぶしていた場合は、対応する解放も握りつぶす。

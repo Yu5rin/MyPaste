@@ -6,8 +6,10 @@
 //!
 //! - キーリマップ: 値貼り付けを起動するキーの組み合わせ（Ctrl / Shift / Alt + キー）と、
 //!   対象アプリ（プロセス名）
-//! - 入力モードの画面中央表示: ON/OFF、表示時間とフェードアウトの時間（秒）、大きさ
+//! - 入力モードの表示: ON/OFF、表示位置（画面中央・マウスの近く・入力位置の近く）、色、
+//!   表示時間とフェードアウトの時間（秒）、大きさ、不透明度、全画面のアプリでは出さない
 //!   （プレビュー付き）
+//! - トラブル調査用の動作の記録（`log.txt`）の ON/OFF と「記録を開く」
 //! - 自動起動、起動時の更新確認
 //!
 //! 外部のクレートを足さず、Win32 の標準コントロール（ボタン・エディット・コンボボックス）
@@ -53,12 +55,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::{self, Settings};
-use crate::ime_indicator::Timing;
+use crate::ime_indicator::{Params, Timing};
 use crate::ime_logic::{
-    self, FADE_MS_MAX, FADE_MS_MIN, HOLD_MS_MAX, HOLD_MS_MIN, SIZE_MAX, SIZE_MIN,
+    self, Position, Theme, FADE_MS_MAX, FADE_MS_MIN, HOLD_MS_MAX, HOLD_MS_MIN, OPACITY_MAX,
+    OPACITY_MIN, SIZE_MAX, SIZE_MIN,
 };
 use crate::remap_logic::{self, Hotkey, KEYS};
-use crate::{ime_indicator, startup, TrayMessage};
+use crate::{ime_indicator, logging, startup, TrayMessage};
 
 // --- コントロールの ID ---
 // 「保存」「キャンセル」は IDOK / IDCANCEL と同じ値にして、Enter / Esc で押せるようにする
@@ -74,6 +77,12 @@ const ID_IME_ENABLED: i32 = 110;
 const ID_HOLD: i32 = 111;
 const ID_SIZE: i32 = 112;
 const ID_FADE: i32 = 114;
+const ID_POSITION: i32 = 115;
+const ID_THEME: i32 = 116;
+const ID_OPACITY: i32 = 117;
+const ID_FULLSCREEN: i32 = 118;
+const ID_LOG: i32 = 122;
+const ID_OPEN_LOG: i32 = 123;
 const ID_PREVIEW: i32 = 113;
 const ID_STARTUP: i32 = 120;
 const ID_UPDATE: i32 = 121;
@@ -87,7 +96,7 @@ const BN_CLICKED: u32 = 0;
 
 /// 画面の中身の大きさ（96 DPI 基準）。
 const CLIENT_W: i32 = 480;
-const CLIENT_H: i32 = 457;
+const CLIENT_H: i32 = 569;
 
 /// コントロールの種類。
 #[derive(Clone, Copy)]
@@ -131,28 +140,38 @@ const ITEMS: &[Item] = &[
     item(ID_KEY, Kind::Combo, "", 342, 30, 110, 300),
     item(203, Kind::Label, "対象アプリ（プロセス名を 1 行に 1 つ。例: EXCEL.EXE）", 24, 60, 428, 22),
     item(ID_APPS, Kind::MultiEdit, "", 24, 84, 428, 58),
-    // 入力モードの画面中央表示
-    item(210, Kind::Group, "入力モードの画面中央表示", 12, 163, 456, 152),
-    item(ID_IME_ENABLED, Kind::Check, "IME の入力モードを切り替えたら画面中央に表示する", 24, 185, 428, 22),
-    item(211, Kind::Label, "表示時間", 24, 214, 112, 24),
-    item(ID_HOLD, Kind::Edit, "", 140, 214, 70, 24),
-    item(212, Kind::Label, "秒（0.1〜5）", 216, 214, 160, 24),
-    item(215, Kind::Label, "フェードアウト", 24, 246, 112, 24),
-    item(ID_FADE, Kind::Edit, "", 140, 246, 70, 24),
-    item(216, Kind::Label, "秒（0〜2。0 ですぐ消す）", 216, 246, 200, 24),
-    item(213, Kind::Label, "大きさ", 24, 278, 112, 24),
-    item(ID_SIZE, Kind::NumberEdit, "", 140, 278, 70, 24),
-    item(214, Kind::Label, "px（40〜600）", 216, 278, 130, 24),
-    item(ID_PREVIEW, Kind::Button, "プレビュー", 362, 276, 90, 28),
-    // 起動と更新
-    item(220, Kind::Group, "起動と更新", 12, 323, 456, 80),
-    item(ID_STARTUP, Kind::Check, "Windows にサインインしたら自動で起動する", 24, 345, 428, 22),
-    item(ID_UPDATE, Kind::Check, "起動時に新しいバージョンを確認する", 24, 372, 428, 22),
+    // 入力モードの表示
+    item(210, Kind::Group, "入力モードの表示", 12, 163, 456, 238),
+    item(ID_IME_ENABLED, Kind::Check, "IME の入力モードを切り替えたら大きく表示する", 24, 185, 428, 22),
+    item(217, Kind::Label, "表示位置", 24, 214, 112, 24),
+    item(ID_POSITION, Kind::Combo, "", 140, 214, 150, 200),
+    item(218, Kind::Label, "色", 306, 214, 40, 24),
+    item(ID_THEME, Kind::Combo, "", 350, 214, 102, 200),
+    item(211, Kind::Label, "表示時間", 24, 246, 112, 24),
+    item(ID_HOLD, Kind::Edit, "", 140, 246, 70, 24),
+    item(212, Kind::Label, "秒（0.1〜5）", 216, 246, 160, 24),
+    item(215, Kind::Label, "フェードアウト", 24, 278, 112, 24),
+    item(ID_FADE, Kind::Edit, "", 140, 278, 70, 24),
+    item(216, Kind::Label, "秒（0〜2。0 ですぐ消す）", 216, 278, 200, 24),
+    item(213, Kind::Label, "大きさ", 24, 310, 112, 24),
+    item(ID_SIZE, Kind::NumberEdit, "", 140, 310, 70, 24),
+    item(214, Kind::Label, "px（40〜600）", 216, 310, 130, 24),
+    item(ID_PREVIEW, Kind::Button, "プレビュー", 362, 308, 90, 28),
+    item(219, Kind::Label, "不透明度", 24, 342, 112, 24),
+    item(ID_OPACITY, Kind::NumberEdit, "", 140, 342, 70, 24),
+    item(221, Kind::Label, "%（30〜100）", 216, 342, 130, 24),
+    item(ID_FULLSCREEN, Kind::Check, "全画面のアプリ（ゲーム・動画・発表など）の間は表示しない", 24, 371, 428, 22),
+    // 起動・更新・記録
+    item(220, Kind::Group, "起動・更新・記録", 12, 409, 456, 106),
+    item(ID_STARTUP, Kind::Check, "Windows にサインインしたら自動で起動する", 24, 431, 428, 22),
+    item(ID_UPDATE, Kind::Check, "起動時に新しいバージョンを確認する", 24, 458, 428, 22),
+    item(ID_LOG, Kind::Check, "トラブル調査用に動作を記録する（log.txt）", 24, 485, 330, 22),
+    item(ID_OPEN_LOG, Kind::Button, "記録を開く", 362, 482, 90, 28),
     // 操作ボタン
-    item(ID_OPEN_FOLDER, Kind::Button, "設定ファイルの場所を開く", 12, 417, 178, 28),
-    item(ID_DEFAULTS, Kind::Button, "既定に戻す", 198, 417, 86, 28),
-    item(ID_SAVE, Kind::DefaultButton, "保存", 290, 417, 86, 28),
-    item(ID_CANCEL, Kind::Button, "キャンセル", 382, 417, 86, 28),
+    item(ID_OPEN_FOLDER, Kind::Button, "設定ファイルの場所を開く", 12, 529, 178, 28),
+    item(ID_DEFAULTS, Kind::Button, "既定に戻す", 198, 529, 86, 28),
+    item(ID_SAVE, Kind::DefaultButton, "保存", 290, 529, 86, 28),
+    item(ID_CANCEL, Kind::Button, "キャンセル", 382, 529, 86, 28),
 ];
 
 /// 画面に表示する値。
@@ -160,10 +179,10 @@ struct Form {
     hotkey: Hotkey,
     target_apps: Vec<String>,
     ime_enabled: bool,
-    timing: Timing,
-    size: u32,
+    ime: Params,
     startup: bool,
     check_update: bool,
+    log: bool,
 }
 
 impl Form {
@@ -173,13 +192,10 @@ impl Form {
             hotkey,
             target_apps: remap_logic::effective_target_apps(&settings.remap.target_apps),
             ime_enabled: settings.ime_indicator.enabled,
-            timing: Timing {
-                hold_ms: settings.ime_indicator.hold_ms,
-                fade_ms: settings.ime_indicator.fade_ms,
-            },
-            size: settings.ime_indicator.size,
+            ime: Params::from_settings(&settings.ime_indicator),
             startup,
             check_update: settings.update.check_on_startup,
+            log: settings.log.enabled,
         }
     }
 }
@@ -470,13 +486,33 @@ unsafe fn create_controls(hwnd: HWND, font: HFONT) {
         }
     }
 
-    // キーの一覧を入れる。
-    if let Ok(combo) = GetDlgItem(hwnd, ID_KEY) {
-        for (name, _) in KEYS {
+    // 一覧を入れる。
+    add_combo_items(hwnd, ID_KEY, KEYS.iter().map(|(name, _)| *name));
+    add_combo_items(hwnd, ID_POSITION, Position::ALL.iter().map(|(_, _, name)| *name));
+    add_combo_items(hwnd, ID_THEME, Theme::ALL.iter().map(|(_, _, name)| *name));
+}
+
+unsafe fn add_combo_items<'a>(hwnd: HWND, id: i32, items: impl Iterator<Item = &'a str>) {
+    if let Ok(combo) = GetDlgItem(hwnd, id) {
+        for name in items {
             let text = wide(name);
             SendMessageW(combo, CB_ADDSTRING, WPARAM(0), LPARAM(text.as_ptr() as isize));
         }
     }
+}
+
+unsafe fn set_combo_index(hwnd: HWND, id: i32, index: usize) {
+    if let Ok(combo) = GetDlgItem(hwnd, id) {
+        SendMessageW(combo, CB_SETCURSEL, WPARAM(index), LPARAM(0));
+    }
+}
+
+/// 選ばれている項目の番号。選ばれていなければ `None`。
+unsafe fn combo_index(hwnd: HWND, id: i32) -> Option<usize> {
+    let index = GetDlgItem(hwnd, id)
+        .map(|combo| SendMessageW(combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0)
+        .unwrap_or(-1);
+    usize::try_from(index).ok()
 }
 
 /// コントロールを DPI に合わせた位置と大きさに置く。
@@ -510,26 +546,28 @@ unsafe fn fill_form(hwnd: HWND, form: &Form) {
     set_checked(hwnd, ID_CTRL, form.hotkey.ctrl);
     set_checked(hwnd, ID_SHIFT, form.hotkey.shift);
     set_checked(hwnd, ID_ALT, form.hotkey.alt);
-    if let Ok(combo) = GetDlgItem(hwnd, ID_KEY) {
-        let index = KEYS.iter().position(|(_, vk)| *vk == form.hotkey.vk).unwrap_or(1);
-        SendMessageW(combo, CB_SETCURSEL, WPARAM(index), LPARAM(0));
-    }
+    let key_index = KEYS.iter().position(|(_, vk)| *vk == form.hotkey.vk).unwrap_or(1);
+    set_combo_index(hwnd, ID_KEY, key_index);
     set_text(hwnd, ID_APPS, &remap_logic::apps_to_text(&form.target_apps));
     set_checked(hwnd, ID_IME_ENABLED, form.ime_enabled);
-    set_text(hwnd, ID_HOLD, &ime_logic::format_seconds(form.timing.hold_ms));
-    set_text(hwnd, ID_FADE, &ime_logic::format_seconds(form.timing.fade_ms));
-    set_text(hwnd, ID_SIZE, &form.size.to_string());
+    let ime = &form.ime;
+    let position_index = Position::ALL.iter().position(|(p, _, _)| *p == ime.position).unwrap_or(0);
+    set_combo_index(hwnd, ID_POSITION, position_index);
+    let theme_index = Theme::ALL.iter().position(|(t, _, _)| *t == ime.theme).unwrap_or(0);
+    set_combo_index(hwnd, ID_THEME, theme_index);
+    set_text(hwnd, ID_HOLD, &ime_logic::format_seconds(ime.timing.hold_ms));
+    set_text(hwnd, ID_FADE, &ime_logic::format_seconds(ime.timing.fade_ms));
+    set_text(hwnd, ID_SIZE, &ime.size.to_string());
+    set_text(hwnd, ID_OPACITY, &ime.opacity.to_string());
+    set_checked(hwnd, ID_FULLSCREEN, ime.hide_in_fullscreen);
     set_checked(hwnd, ID_STARTUP, form.startup);
     set_checked(hwnd, ID_UPDATE, form.check_update);
+    set_checked(hwnd, ID_LOG, form.log);
 }
 
 /// 画面の値を読み、検証する。誤りがあれば、直すべきコントロールの ID と理由を返す。
 unsafe fn read_form(hwnd: HWND) -> Result<Form, (i32, String)> {
-    let index = GetDlgItem(hwnd, ID_KEY)
-        .map(|combo| SendMessageW(combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0)
-        .unwrap_or(-1);
-    let vk = usize::try_from(index)
-        .ok()
+    let vk = combo_index(hwnd, ID_KEY)
         .and_then(|i| KEYS.get(i))
         .map(|(_, vk)| *vk)
         .unwrap_or(0);
@@ -546,17 +584,49 @@ unsafe fn read_form(hwnd: HWND) -> Result<Form, (i32, String)> {
         return Err((ID_APPS, "対象アプリを 1 つ以上入力してください（例: EXCEL.EXE）。".into()));
     }
 
-    let timing = read_timing(hwnd)?;
-    let size = read_size(hwnd)?;
+    let ime = read_ime_params(hwnd)?;
 
     Ok(Form {
         hotkey,
         target_apps,
         ime_enabled: is_checked(hwnd, ID_IME_ENABLED),
-        timing,
-        size,
+        ime,
         startup: is_checked(hwnd, ID_STARTUP),
         check_update: is_checked(hwnd, ID_UPDATE),
+        log: is_checked(hwnd, ID_LOG),
+    })
+}
+
+/// 入力モード表示の出し方（位置・色・時間・大きさ・不透明度・全画面）を読む。
+unsafe fn read_ime_params(hwnd: HWND) -> Result<Params, (i32, String)> {
+    let timing = read_timing(hwnd)?;
+    let size = read_size(hwnd)?;
+    let opacity = parse_in_range(
+        &get_text(hwnd, ID_OPACITY),
+        u64::from(OPACITY_MIN),
+        u64::from(OPACITY_MAX),
+    )
+    .ok_or_else(|| {
+        (
+            ID_OPACITY,
+            format!("不透明度は {OPACITY_MIN}〜{OPACITY_MAX} の数で入力してください。"),
+        )
+    })? as u32;
+    let position = combo_index(hwnd, ID_POSITION)
+        .and_then(|i| Position::ALL.get(i))
+        .map(|(p, _, _)| *p)
+        .unwrap_or(Position::Center);
+    let theme = combo_index(hwnd, ID_THEME)
+        .and_then(|i| Theme::ALL.get(i))
+        .map(|(t, _, _)| *t)
+        .unwrap_or(Theme::Dark);
+    Ok(Params {
+        timing,
+        size,
+        position,
+        theme,
+        opacity,
+        hide_in_fullscreen: is_checked(hwnd, ID_FULLSCREEN),
     })
 }
 
@@ -626,6 +696,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     ID_PREVIEW => on_preview(hwnd),
                     ID_DEFAULTS => on_defaults(hwnd),
                     ID_OPEN_FOLDER => on_open_folder(hwnd),
+                    ID_OPEN_LOG => on_open_log(hwnd),
                     _ => {}
                 }
             }
@@ -686,9 +757,15 @@ unsafe fn on_save(hwnd: HWND) {
     settings.remap.hotkey = form.hotkey.format();
     settings.remap.target_apps = form.target_apps;
     settings.ime_indicator.enabled = form.ime_enabled;
-    settings.ime_indicator.hold_ms = form.timing.hold_ms;
-    settings.ime_indicator.fade_ms = form.timing.fade_ms;
-    settings.ime_indicator.size = form.size;
+    let ime = &form.ime;
+    settings.ime_indicator.hold_ms = ime.timing.hold_ms;
+    settings.ime_indicator.fade_ms = ime.timing.fade_ms;
+    settings.ime_indicator.size = ime.size;
+    settings.ime_indicator.position = ime.position.as_setting().to_string();
+    settings.ime_indicator.theme = ime.theme.as_setting().to_string();
+    settings.ime_indicator.opacity = ime.opacity;
+    settings.ime_indicator.hide_in_fullscreen = ime.hide_in_fullscreen;
+    settings.log.enabled = form.log;
     settings.update.check_on_startup = form.check_update;
 
     if let Err(e) = config::save_from_settings_window(&settings) {
@@ -726,15 +803,14 @@ unsafe fn on_save(hwnd: HWND) {
 
 /// 「プレビュー」: 入力中の表示時間・フェードアウト・大きさで、入力モードを試しに表示する。
 unsafe fn on_preview(hwnd: HWND) {
-    let values = read_timing(hwnd).and_then(|timing| Ok((timing, read_size(hwnd)?)));
-    let (timing, size) = match values {
-        Ok(values) => values,
+    let params = match read_ime_params(hwnd) {
+        Ok(params) => params,
         Err((id, message)) => {
             report_invalid(hwnd, id, &message);
             return;
         }
     };
-    if !ime_indicator::preview(timing, size) {
+    if !ime_indicator::preview(params) {
         show_message(
             hwnd,
             "入力モード表示が動いていないため、プレビューできません。アプリを起動し直してください。",
@@ -748,6 +824,40 @@ unsafe fn on_preview(hwnd: HWND) {
 unsafe fn on_defaults(hwnd: HWND) {
     let startup = is_checked(hwnd, ID_STARTUP);
     fill_form(hwnd, &Form::from_settings(&Settings::default(), startup));
+}
+
+/// 「記録を開く」: log.txt を既定のアプリ（メモ帳など）で開く。
+unsafe fn on_open_log(hwnd: HWND) {
+    let Some(path) = logging::log_file() else {
+        show_message(hwnd, "記録の場所を決められませんでした。", MB_ICONERROR);
+        return;
+    };
+    if !path.exists() {
+        show_message(
+            hwnd,
+            "まだ記録はありません。\n\n「トラブル調査用に動作を記録する」を ON にして保存すると、記録を始めます。",
+            MB_ICONINFORMATION,
+        );
+        return;
+    }
+    log::logger().flush();
+    let file = wide(&path.display().to_string());
+    let result = ShellExecuteW(
+        hwnd,
+        w!("open"),
+        PCWSTR(file.as_ptr()),
+        PCWSTR::null(),
+        PCWSTR::null(),
+        SW_SHOWNORMAL,
+    );
+    // 32 以下は失敗（ShellExecuteW の仕様）。
+    if result.0 as isize <= 32 {
+        show_message(
+            hwnd,
+            &format!("記録を開けませんでした。\n\n{}", path.display()),
+            MB_ICONERROR,
+        );
+    }
 }
 
 /// 「設定ファイルの場所を開く」: エクスプローラーで settings.json を選んだ状態で開く。

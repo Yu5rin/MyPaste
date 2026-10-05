@@ -75,11 +75,13 @@ pub enum TrayMessage {
 
 fn main() {
     logging::init();
-    log::info!("アタイの貼り付け 起動 (v{})", env!("CARGO_PKG_VERSION"));
+    let mut settings = config::Settings::load();
+    // 動作の記録は設定で ON にしたときだけ残す（開発用のビルドでは常に残す）。
+    logging::set_enabled(settings.log.enabled);
+    log_startup(&settings);
 
     // 前回の更新で残った .old があれば削除する。
     update::cleanup_old();
-    let mut settings = config::Settings::load();
 
     // キーリマップのキーと対象アプリを、フックを設置する前に決めておく。
     let hotkey = configure_remap(&settings);
@@ -218,13 +220,15 @@ fn main() {
             TrayMessage::SettingsSaved(saved) => {
                 settings = *saved;
                 let hotkey = configure_remap(&settings);
-                ime_indicator::set_params(
-                    ime_indicator::Timing {
-                        hold_ms: settings.ime_indicator.hold_ms,
-                        fade_ms: settings.ime_indicator.fade_ms,
-                    },
-                    settings.ime_indicator.size,
-                );
+                let was_logging = logging::is_enabled();
+                logging::set_enabled(settings.log.enabled);
+                if logging::is_enabled() && !was_logging {
+                    // 記録を始めたので、調査に要る情報（版・設定）を最初に残す。
+                    log_startup(&settings);
+                }
+                ime_indicator::set_params(ime_indicator::Params::from_settings(
+                    &settings.ime_indicator,
+                ));
                 if ime_indicator.is_some() {
                     ime_indicator::set_enabled(settings.ime_indicator.enabled);
                 }
@@ -276,6 +280,24 @@ fn main() {
     post_quit(hook_tid);
     let _ = hook_thread.join();
     log::info!("アタイの貼り付け 終了");
+}
+
+/// 動作の記録の最初に、調査に要る情報（版・場所・設定）を残す。
+fn log_startup(settings: &config::Settings) {
+    log::info!("アタイの貼り付け v{} 起動", env!("CARGO_PKG_VERSION"));
+    if let Ok(exe) = std::env::current_exe() {
+        log::info!("実行ファイル: {}", exe.display());
+    }
+    if let Some(path) = config::settings_file() {
+        log::info!("設定ファイル: {}", path.display());
+    }
+    log::info!(
+        "設定: キー {} / 対象アプリ {:?} / 入力モード表示 {} / 起動時の更新確認 {}",
+        settings.remap.hotkey,
+        settings.remap.target_apps,
+        if settings.ime_indicator.enabled { "ON" } else { "OFF" },
+        if settings.update.check_on_startup { "ON" } else { "OFF" },
+    );
 }
 
 /// 設定からキーリマップのキーと対象アプリを決めてフックへ渡し、使うキーを返す。
