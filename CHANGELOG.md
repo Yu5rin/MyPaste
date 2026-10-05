@@ -2,7 +2,7 @@
 
 本プロジェクトの主な変更点をまとめます。バージョンは [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
-## [Unreleased]
+## [1.4.0] - 2026-10-05
 
 ### 追加
 - **設定画面**。トレイメニューの「設定...」から開き、保存するとその場で反映する
@@ -216,6 +216,7 @@ UX と品質の総点検で見つかった問題への対応。
 - ON/OFF 切替は右クリックメニューから行う（左クリックによるトグルは `tray-item` の制約により非対応）。
 - 他ソフトとのキー競合は対象外。
 
+[1.4.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.4.0
 [1.3.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.3.0
 [1.2.3]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.2.3
 [1.2.2]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.2.2
