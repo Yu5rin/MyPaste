@@ -2,6 +2,19 @@
 
 本プロジェクトの主な変更点をまとめます。バージョンは [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
+## [1.4.1] - 2026-10-05
+
+### 変更
+- 設定画面の入力モード表示の**表示時間を秒で入力する**ようにした（以前はミリ秒）。
+  `0.4`、`1.5` のような小数も使える。全角の数字や末尾の「秒」も受け付ける。
+  `settings.json` にはこれまでどおりミリ秒（`hold_ms`）で保存する。
+
+### 追加
+- **フェードアウトの時間**も設定できるようにした（0〜2 秒。0 ですぐ消す）。
+  これまでは 0.25 秒で固定だった。`settings.json` の `ime_indicator.fade_ms`
+  （ミリ秒）に保存する。以前の `settings.json` では 0.25 秒のまま動く。
+- 「プレビュー」も、入力中のフェードアウトの時間で表示する。
+
 ## [1.4.0] - 2026-10-05
 
 ### 追加
@@ -216,6 +229,7 @@ UX と品質の総点検で見つかった問題への対応。
 - ON/OFF 切替は右クリックメニューから行う（左クリックによるトグルは `tray-item` の制約により非対応）。
 - 他ソフトとのキー競合は対象外。
 
+[1.4.1]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.4.1
 [1.4.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.4.0
 [1.3.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.3.0
 [1.2.3]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.2.3

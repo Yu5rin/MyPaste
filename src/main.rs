@@ -218,7 +218,13 @@ fn main() {
             TrayMessage::SettingsSaved(saved) => {
                 settings = *saved;
                 let hotkey = configure_remap(&settings);
-                ime_indicator::set_params(settings.ime_indicator.hold_ms, settings.ime_indicator.size);
+                ime_indicator::set_params(
+                    ime_indicator::Timing {
+                        hold_ms: settings.ime_indicator.hold_ms,
+                        fade_ms: settings.ime_indicator.fade_ms,
+                    },
+                    settings.ime_indicator.size,
+                );
                 if ime_indicator.is_some() {
                     ime_indicator::set_enabled(settings.ime_indicator.enabled);
                 }

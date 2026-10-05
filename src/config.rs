@@ -59,8 +59,10 @@ impl Default for RemapSettings {
 pub struct ImeIndicatorSettings {
     /// 表示するか（トレイメニュー「入力モードを画面中央に表示」からも切り替えられる）。
     pub enabled: bool,
-    /// 表示を保持する時間（ミリ秒）。このあと 0.25 秒でフェードアウトする。
+    /// 表示を保持する時間（ミリ秒）。設定画面では秒で入力する。
     pub hold_ms: u64,
+    /// 続いてフェードアウトにかける時間（ミリ秒）。0 はすぐ消す。設定画面では秒で入力する。
+    pub fade_ms: u64,
     /// 表示する四角の一辺（96 DPI 基準のピクセル。実際の DPI に合わせて拡大する）。
     pub size: u32,
 }
@@ -70,6 +72,7 @@ impl Default for ImeIndicatorSettings {
         Self {
             enabled: true,
             hold_ms: 400,
+            fade_ms: crate::ime_logic::DEFAULT_FADE_MS,
             size: 120,
         }
     }
@@ -178,6 +181,7 @@ pub fn save_from_settings_window(settings: &Settings) -> Result<(), String> {
         "ime_indicator": {
             "enabled": settings.ime_indicator.enabled,
             "hold_ms": settings.ime_indicator.hold_ms,
+            "fade_ms": settings.ime_indicator.fade_ms,
             "size": settings.ime_indicator.size,
         },
         "update": {
@@ -392,6 +396,15 @@ mod tests {
         assert_eq!(s.remap.hotkey, "Ctrl+B");
         assert_eq!(s.remap.target_apps, ["EXCEL.EXE"]);
         assert!(!s.update.check_on_startup);
+    }
+
+    #[test]
+    fn old_settings_file_gets_fade_default() {
+        // v1.4.0 以前の settings.json には fade_ms が無い。これまでどおり 0.25 秒になること。
+        let s: Settings =
+            serde_json::from_str(r#"{ "ime_indicator": { "hold_ms": 800 } }"#).unwrap();
+        assert_eq!(s.ime_indicator.hold_ms, 800);
+        assert_eq!(s.ime_indicator.fade_ms, 250);
     }
 
     #[test]

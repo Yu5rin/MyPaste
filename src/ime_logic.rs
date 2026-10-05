@@ -16,6 +16,11 @@ pub const CMODE_FULLSHAPE: u32 = 0x0008;
 /// 表示時間（ミリ秒）として設定できる範囲。
 pub const HOLD_MS_MIN: u64 = 100;
 pub const HOLD_MS_MAX: u64 = 5000;
+/// フェードアウトにかける時間（ミリ秒）として設定できる範囲。0 はすぐ消す。
+pub const FADE_MS_MIN: u64 = 0;
+pub const FADE_MS_MAX: u64 = 2000;
+/// フェードアウトにかける時間の既定（ミリ秒）。
+pub const DEFAULT_FADE_MS: u64 = 250;
 /// 表示の一辺（96 DPI 基準のピクセル）として設定できる範囲。
 pub const SIZE_MIN: u32 = 40;
 pub const SIZE_MAX: u32 = 600;
@@ -116,6 +121,45 @@ pub fn alpha_at(elapsed_ms: u64, hold_ms: u64, fade_ms: u64, max_alpha: u8) -> O
     }
     let remaining = fade_ms - into_fade;
     Some((u64::from(max_alpha) * remaining / fade_ms) as u8)
+}
+
+/// 秒で書かれた文字列（例 `"0.4"`、`"1.5秒"`、全角の `"１．５"`）をミリ秒にする。
+///
+/// 小数第 3 位（1 ミリ秒）まで受け付け、それより細かい桁は四捨五入する。
+/// 数として読めない・負の数・範囲外は `None`。
+pub fn parse_seconds(text: &str, min_ms: u64, max_ms: u64) -> Option<u64> {
+    let text: String = text
+        .trim()
+        .trim_end_matches('秒')
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '０'..='９' => char::from(b'0' + (c as u32 - '０' as u32) as u8),
+            '．' => '.',
+            c => c,
+        })
+        .collect();
+    // 数字と小数点だけを受け付ける（"1e3" や "-1"、"inf" などは不可）。
+    if text.is_empty()
+        || !text.chars().all(|c| c.is_ascii_digit() || c == '.')
+        || text.matches('.').count() > 1
+        || text == "."
+    {
+        return None;
+    }
+    let seconds: f64 = text.parse().ok()?;
+    let ms = (seconds * 1000.0).round();
+    if !(0.0..=u64::MAX as f64).contains(&ms) {
+        return None;
+    }
+    let ms = ms as u64;
+    (min_ms..=max_ms).contains(&ms).then_some(ms)
+}
+
+/// ミリ秒を、設定画面に出す秒の文字列にする（例 400 → `"0.4"`、1500 → `"1.5"`、2000 → `"2"`）。
+pub fn format_seconds(ms: u64) -> String {
+    let text = format!("{}.{:03}", ms / 1000, ms % 1000);
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// 96 DPI 基準の長さを、実際の DPI に合わせて拡大縮小する。
@@ -219,6 +263,42 @@ mod tests {
     fn zero_fade_ends_right_after_hold() {
         assert_eq!(alpha_at(399, 400, 0, 230), Some(230));
         assert_eq!(alpha_at(400, 400, 0, 230), None);
+    }
+
+    #[test]
+    fn parses_seconds() {
+        assert_eq!(parse_seconds("0.4", 100, 5000), Some(400));
+        assert_eq!(parse_seconds(" 1.5 ", 100, 5000), Some(1500));
+        assert_eq!(parse_seconds("2", 100, 5000), Some(2000));
+        assert_eq!(parse_seconds(".5", 100, 5000), Some(500));
+        assert_eq!(parse_seconds("1.", 100, 5000), Some(1000));
+        assert_eq!(parse_seconds("1.5秒", 100, 5000), Some(1500));
+        assert_eq!(parse_seconds("１．５", 100, 5000), Some(1500));
+        assert_eq!(parse_seconds("0.1234", 100, 5000), Some(123));
+        assert_eq!(parse_seconds("0", 0, 2000), Some(0));
+    }
+
+    #[test]
+    fn rejects_bad_seconds() {
+        for text in ["", ".", "abc", "-1", "1e3", "inf", "1.2.3", "1,5", "0.05"] {
+            assert_eq!(parse_seconds(text, 100, 5000), None, "{text}");
+        }
+        assert_eq!(parse_seconds("5.1", 100, 5000), None);
+        assert_eq!(parse_seconds("99999999999999999999999", 0, 5000), None);
+    }
+
+    #[test]
+    fn formats_seconds() {
+        assert_eq!(format_seconds(400), "0.4");
+        assert_eq!(format_seconds(1500), "1.5");
+        assert_eq!(format_seconds(2000), "2");
+        assert_eq!(format_seconds(250), "0.25");
+        assert_eq!(format_seconds(0), "0");
+        assert_eq!(format_seconds(1234), "1.234");
+        // 表示した文字列を読み戻すと同じ値になる
+        for ms in [0, 1, 100, 250, 400, 999, 1000, 1500, 5000] {
+            assert_eq!(parse_seconds(&format_seconds(ms), 0, 5000), Some(ms));
+        }
     }
 
     #[test]

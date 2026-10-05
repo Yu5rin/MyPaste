@@ -20,7 +20,7 @@
 //! キーボードフック（[`crate::keyboard`]）とは別スレッドで動くため、Ctrl+B の
 //! リマップには影響しない。
 //!
-//! 表示時間と大きさは [`set_params`] で起動中にも変えられ、設定画面からは
+//! 表示時間・フェードアウトの時間・大きさは [`set_params`] で起動中にも変えられ、設定画面からは
 //! [`preview`] で試しに表示できる。
 
 use std::cell::RefCell;
@@ -61,8 +61,6 @@ use crate::ime_logic::{self, ImeMode, ModeTracker};
 const POLL_INTERVAL_MS: u32 = 100;
 /// フェード中の再描画の間隔（ミリ秒）。
 const ANIM_INTERVAL_MS: u32 = 16;
-/// フェードアウトにかける時間（ミリ秒）。
-const FADE_MS: u64 = 250;
 /// 表示中の最大の不透明度（0〜255）。少しだけ透かして背後を感じさせる。
 const MAX_ALPHA: u8 = 230;
 /// IME への問い合わせのタイムアウト（ミリ秒）。相手が固まっていても待たない。
@@ -85,46 +83,79 @@ const TIMER_POLL: usize = 1;
 /// タイマーの識別子: フェード。
 const TIMER_ANIM: usize = 2;
 
-/// 試しに表示する（設定画面のプレビュー）。WPARAM = 表示時間、LPARAM = 大きさ。
+/// 試しに表示する（設定画面のプレビュー）。WPARAM = 表示時間とフェードアウトの時間
+/// （[`pack_timing`]）、LPARAM = 大きさ。
 const WM_APP_PREVIEW: u32 = WM_APP + 1;
 
 /// 機能の ON/OFF。トレイメニューから切り替えられ、監視スレッドが毎回見る。
 static ENABLED: AtomicBool = AtomicBool::new(true);
 /// 表示を保持する時間（ミリ秒）。
 static HOLD_MS: AtomicU64 = AtomicU64::new(400);
+/// フェードアウトにかける時間（ミリ秒）。
+static FADE_MS: AtomicU64 = AtomicU64::new(ime_logic::DEFAULT_FADE_MS);
 /// 表示の一辺（96 DPI 基準のピクセル）。
 static BASE_SIZE: AtomicU32 = AtomicU32::new(120);
 /// 表示ウィンドウ（プレビューの依頼先）。0 は未作成。
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
 
-/// 表示時間と大きさを設定する（起動時と、設定画面で保存したとき）。範囲外は丸める。
-pub fn set_params(hold_ms: u64, size: u32) {
-    let (hold_ms, size) = clamp_params(hold_ms, size);
-    HOLD_MS.store(hold_ms, Ordering::SeqCst);
-    BASE_SIZE.store(size, Ordering::SeqCst);
+/// 表示の時間（ミリ秒）。
+#[derive(Clone, Copy)]
+pub struct Timing {
+    /// 消え始めるまでの表示時間。
+    pub hold_ms: u64,
+    /// フェードアウトにかける時間。
+    pub fade_ms: u64,
 }
 
-fn clamp_params(hold_ms: u64, size: u32) -> (u64, u32) {
-    (
-        hold_ms.clamp(ime_logic::HOLD_MS_MIN, ime_logic::HOLD_MS_MAX),
-        size.clamp(ime_logic::SIZE_MIN, ime_logic::SIZE_MAX),
-    )
+impl Timing {
+    /// 設定できる範囲に丸める。
+    fn clamped(self) -> Timing {
+        Timing {
+            hold_ms: self.hold_ms.clamp(ime_logic::HOLD_MS_MIN, ime_logic::HOLD_MS_MAX),
+            fade_ms: self.fade_ms.clamp(ime_logic::FADE_MS_MIN, ime_logic::FADE_MS_MAX),
+        }
+    }
 }
 
-/// 指定した表示時間と大きさで、試しに「あ」を表示する（機能が OFF でも表示する）。
+/// 範囲に丸めた [`Timing`] を 1 つの WPARAM に詰める（どちらも 16 ビットに収まる）。
+fn pack_timing(timing: Timing) -> usize {
+    let t = timing.clamped();
+    (t.hold_ms as usize) | ((t.fade_ms as usize) << 16)
+}
+
+fn unpack_timing(value: usize) -> Timing {
+    Timing {
+        hold_ms: (value & 0xFFFF) as u64,
+        fade_ms: ((value >> 16) & 0xFFFF) as u64,
+    }
+}
+
+/// 表示時間・フェードアウトの時間・大きさを設定する（起動時と、設定画面で保存したとき）。
+/// 範囲外は丸める。
+pub fn set_params(timing: Timing, size: u32) {
+    let timing = timing.clamped();
+    HOLD_MS.store(timing.hold_ms, Ordering::SeqCst);
+    FADE_MS.store(timing.fade_ms, Ordering::SeqCst);
+    BASE_SIZE.store(clamp_size(size), Ordering::SeqCst);
+}
+
+fn clamp_size(size: u32) -> u32 {
+    size.clamp(ime_logic::SIZE_MIN, ime_logic::SIZE_MAX)
+}
+
+/// 指定した時間と大きさで、試しに「あ」を表示する（機能が OFF でも表示する）。
 /// 監視スレッドが動いていなければ何もせず `false` を返す。
-pub fn preview(hold_ms: u64, size: u32) -> bool {
+pub fn preview(timing: Timing, size: u32) -> bool {
     let window = WINDOW.load(Ordering::SeqCst);
     if window == 0 {
         return false;
     }
-    let (hold_ms, size) = clamp_params(hold_ms, size);
     unsafe {
         PostMessageW(
             HWND(window as *mut core::ffi::c_void),
             WM_APP_PREVIEW,
-            WPARAM(hold_ms as usize),
-            LPARAM(size as isize),
+            WPARAM(pack_timing(timing)),
+            LPARAM(clamp_size(size) as isize),
         )
         .is_ok()
     }
@@ -176,7 +207,13 @@ impl Drop for Indicator {
 pub fn start(settings: &ImeIndicatorSettings) -> Option<Indicator> {
     set_enabled(settings.enabled);
     // 極端な値で画面を覆ったり、見えなくなったりしないよう幅を持たせて制限する。
-    set_params(settings.hold_ms, settings.size);
+    set_params(
+        Timing {
+            hold_ms: settings.hold_ms,
+            fade_ms: settings.fade_ms,
+        },
+        settings.size,
+    );
 
     let (tx, rx) = mpsc::channel::<u32>();
     let thread = std::thread::spawn(move || thread_main(tx));
@@ -210,7 +247,7 @@ struct State {
 struct Showing {
     mode: ImeMode,
     started: Instant,
-    hold_ms: u64,
+    timing: Timing,
     /// 設定画面のプレビューか（機能が OFF でも消さない）。
     preview: bool,
 }
@@ -317,7 +354,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_APP_PREVIEW => {
             let size = i32::try_from(lparam.0).unwrap_or(0);
-            show(ImeMode::Hiragana, GetForegroundWindow(), wparam.0 as u64, size, true);
+            show(ImeMode::Hiragana, GetForegroundWindow(), unpack_timing(wparam.0), size, true);
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -356,7 +393,10 @@ unsafe fn on_poll() {
         show(
             mode,
             fg,
-            HOLD_MS.load(Ordering::SeqCst),
+            Timing {
+                hold_ms: HOLD_MS.load(Ordering::SeqCst),
+                fade_ms: FADE_MS.load(Ordering::SeqCst),
+            },
             BASE_SIZE.load(Ordering::SeqCst) as i32,
             false,
         );
@@ -421,7 +461,7 @@ unsafe fn send_ime_control(ime_window: HWND, command: usize) -> Option<usize> {
 /// 前面ウィンドウのあるモニターの中央にモードを表示する。
 ///
 /// `base_size` は 96 DPI 基準の一辺。`preview` は設定画面からの試し表示か。
-unsafe fn show(mode: ImeMode, focus: HWND, hold_ms: u64, base_size: i32, preview: bool) {
+unsafe fn show(mode: ImeMode, focus: HWND, timing: Timing, base_size: i32, preview: bool) {
     // 位置とサイズは前面（最上位）ウィンドウを基準にする。フォーカス先が子ウィンドウでも、
     // 前面ウィンドウと同じモニター・同じ DPI になる。
     let foreground = GetForegroundWindow();
@@ -476,7 +516,7 @@ unsafe fn show(mode: ImeMode, focus: HWND, hold_ms: u64, base_size: i32, preview
         state.showing = Some(Showing {
             mode,
             started: Instant::now(),
-            hold_ms,
+            timing,
             preview,
         });
         let hwnd = state.hwnd;
@@ -507,7 +547,8 @@ unsafe fn on_anim() {
         let state = s.as_ref()?;
         let showing = state.showing?;
         let elapsed = showing.started.elapsed().as_millis() as u64;
-        Some((state.hwnd, ime_logic::alpha_at(elapsed, showing.hold_ms, FADE_MS, MAX_ALPHA)))
+        let Timing { hold_ms, fade_ms } = showing.timing;
+        Some((state.hwnd, ime_logic::alpha_at(elapsed, hold_ms, fade_ms, MAX_ALPHA)))
     }) {
         Some(v) => v,
         None => return,

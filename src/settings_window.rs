@@ -6,7 +6,8 @@
 //!
 //! - キーリマップ: 値貼り付けを起動するキーの組み合わせ（Ctrl / Shift / Alt + キー）と、
 //!   対象アプリ（プロセス名）
-//! - 入力モードの画面中央表示: ON/OFF、表示時間、大きさ（プレビュー付き）
+//! - 入力モードの画面中央表示: ON/OFF、表示時間とフェードアウトの時間（秒）、大きさ
+//!   （プレビュー付き）
 //! - 自動起動、起動時の更新確認
 //!
 //! 外部のクレートを足さず、Win32 の標準コントロール（ボタン・エディット・コンボボックス）
@@ -52,7 +53,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::{self, Settings};
-use crate::ime_logic::{self, HOLD_MS_MAX, HOLD_MS_MIN, SIZE_MAX, SIZE_MIN};
+use crate::ime_indicator::Timing;
+use crate::ime_logic::{
+    self, FADE_MS_MAX, FADE_MS_MIN, HOLD_MS_MAX, HOLD_MS_MIN, SIZE_MAX, SIZE_MIN,
+};
 use crate::remap_logic::{self, Hotkey, KEYS};
 use crate::{ime_indicator, startup, TrayMessage};
 
@@ -69,6 +73,7 @@ const ID_APPS: i32 = 105;
 const ID_IME_ENABLED: i32 = 110;
 const ID_HOLD: i32 = 111;
 const ID_SIZE: i32 = 112;
+const ID_FADE: i32 = 114;
 const ID_PREVIEW: i32 = 113;
 const ID_STARTUP: i32 = 120;
 const ID_UPDATE: i32 = 121;
@@ -82,7 +87,7 @@ const BN_CLICKED: u32 = 0;
 
 /// 画面の中身の大きさ（96 DPI 基準）。
 const CLIENT_W: i32 = 480;
-const CLIENT_H: i32 = 425;
+const CLIENT_H: i32 = 457;
 
 /// コントロールの種類。
 #[derive(Clone, Copy)]
@@ -91,6 +96,7 @@ enum Kind {
     Label,
     Check,
     Combo,
+    Edit,
     NumberEdit,
     MultiEdit,
     Button,
@@ -126,24 +132,27 @@ const ITEMS: &[Item] = &[
     item(203, Kind::Label, "対象アプリ（プロセス名を 1 行に 1 つ。例: EXCEL.EXE）", 24, 60, 428, 22),
     item(ID_APPS, Kind::MultiEdit, "", 24, 84, 428, 58),
     // 入力モードの画面中央表示
-    item(210, Kind::Group, "入力モードの画面中央表示", 12, 163, 456, 120),
+    item(210, Kind::Group, "入力モードの画面中央表示", 12, 163, 456, 152),
     item(ID_IME_ENABLED, Kind::Check, "IME の入力モードを切り替えたら画面中央に表示する", 24, 185, 428, 22),
     item(211, Kind::Label, "表示時間", 24, 214, 112, 24),
-    item(ID_HOLD, Kind::NumberEdit, "", 140, 214, 70, 24),
-    item(212, Kind::Label, "ミリ秒（100〜5000）", 216, 214, 160, 24),
-    item(213, Kind::Label, "大きさ", 24, 246, 112, 24),
-    item(ID_SIZE, Kind::NumberEdit, "", 140, 246, 70, 24),
-    item(214, Kind::Label, "px（40〜600）", 216, 246, 130, 24),
-    item(ID_PREVIEW, Kind::Button, "プレビュー", 362, 244, 90, 28),
+    item(ID_HOLD, Kind::Edit, "", 140, 214, 70, 24),
+    item(212, Kind::Label, "秒（0.1〜5）", 216, 214, 160, 24),
+    item(215, Kind::Label, "フェードアウト", 24, 246, 112, 24),
+    item(ID_FADE, Kind::Edit, "", 140, 246, 70, 24),
+    item(216, Kind::Label, "秒（0〜2。0 ですぐ消す）", 216, 246, 200, 24),
+    item(213, Kind::Label, "大きさ", 24, 278, 112, 24),
+    item(ID_SIZE, Kind::NumberEdit, "", 140, 278, 70, 24),
+    item(214, Kind::Label, "px（40〜600）", 216, 278, 130, 24),
+    item(ID_PREVIEW, Kind::Button, "プレビュー", 362, 276, 90, 28),
     // 起動と更新
-    item(220, Kind::Group, "起動と更新", 12, 291, 456, 80),
-    item(ID_STARTUP, Kind::Check, "Windows にサインインしたら自動で起動する", 24, 313, 428, 22),
-    item(ID_UPDATE, Kind::Check, "起動時に新しいバージョンを確認する", 24, 340, 428, 22),
+    item(220, Kind::Group, "起動と更新", 12, 323, 456, 80),
+    item(ID_STARTUP, Kind::Check, "Windows にサインインしたら自動で起動する", 24, 345, 428, 22),
+    item(ID_UPDATE, Kind::Check, "起動時に新しいバージョンを確認する", 24, 372, 428, 22),
     // 操作ボタン
-    item(ID_OPEN_FOLDER, Kind::Button, "設定ファイルの場所を開く", 12, 385, 178, 28),
-    item(ID_DEFAULTS, Kind::Button, "既定に戻す", 198, 385, 86, 28),
-    item(ID_SAVE, Kind::DefaultButton, "保存", 290, 385, 86, 28),
-    item(ID_CANCEL, Kind::Button, "キャンセル", 382, 385, 86, 28),
+    item(ID_OPEN_FOLDER, Kind::Button, "設定ファイルの場所を開く", 12, 417, 178, 28),
+    item(ID_DEFAULTS, Kind::Button, "既定に戻す", 198, 417, 86, 28),
+    item(ID_SAVE, Kind::DefaultButton, "保存", 290, 417, 86, 28),
+    item(ID_CANCEL, Kind::Button, "キャンセル", 382, 417, 86, 28),
 ];
 
 /// 画面に表示する値。
@@ -151,7 +160,7 @@ struct Form {
     hotkey: Hotkey,
     target_apps: Vec<String>,
     ime_enabled: bool,
-    hold_ms: u64,
+    timing: Timing,
     size: u32,
     startup: bool,
     check_update: bool,
@@ -164,7 +173,10 @@ impl Form {
             hotkey,
             target_apps: remap_logic::effective_target_apps(&settings.remap.target_apps),
             ime_enabled: settings.ime_indicator.enabled,
-            hold_ms: settings.ime_indicator.hold_ms,
+            timing: Timing {
+                hold_ms: settings.ime_indicator.hold_ms,
+                fade_ms: settings.ime_indicator.fade_ms,
+            },
             size: settings.ime_indicator.size,
             startup,
             check_update: settings.update.check_on_startup,
@@ -414,6 +426,11 @@ unsafe fn create_controls(hwnd: HWND, font: HFONT) {
                 CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0 | WS_TABSTOP.0,
                 0,
             ),
+            Kind::Edit => (
+                w!("EDIT"),
+                ES_AUTOHSCROLL as u32 | WS_TABSTOP.0,
+                WS_EX_CLIENTEDGE.0,
+            ),
             Kind::NumberEdit => (
                 w!("EDIT"),
                 ES_AUTOHSCROLL as u32 | ES_NUMBER as u32 | WS_TABSTOP.0,
@@ -499,7 +516,8 @@ unsafe fn fill_form(hwnd: HWND, form: &Form) {
     }
     set_text(hwnd, ID_APPS, &remap_logic::apps_to_text(&form.target_apps));
     set_checked(hwnd, ID_IME_ENABLED, form.ime_enabled);
-    set_text(hwnd, ID_HOLD, &form.hold_ms.to_string());
+    set_text(hwnd, ID_HOLD, &ime_logic::format_seconds(form.timing.hold_ms));
+    set_text(hwnd, ID_FADE, &ime_logic::format_seconds(form.timing.fade_ms));
     set_text(hwnd, ID_SIZE, &form.size.to_string());
     set_checked(hwnd, ID_STARTUP, form.startup);
     set_checked(hwnd, ID_UPDATE, form.check_update);
@@ -528,30 +546,65 @@ unsafe fn read_form(hwnd: HWND) -> Result<Form, (i32, String)> {
         return Err((ID_APPS, "対象アプリを 1 つ以上入力してください（例: EXCEL.EXE）。".into()));
     }
 
-    let hold_ms = parse_in_range(&get_text(hwnd, ID_HOLD), HOLD_MS_MIN, HOLD_MS_MAX)
-        .ok_or_else(|| {
-            (
-                ID_HOLD,
-                format!("表示時間は {HOLD_MS_MIN}〜{HOLD_MS_MAX} の数で入力してください。"),
-            )
-        })?;
-    let size = parse_in_range(&get_text(hwnd, ID_SIZE), u64::from(SIZE_MIN), u64::from(SIZE_MAX))
-        .ok_or_else(|| {
-            (
-                ID_SIZE,
-                format!("大きさは {SIZE_MIN}〜{SIZE_MAX} の数で入力してください。"),
-            )
-        })? as u32;
+    let timing = read_timing(hwnd)?;
+    let size = read_size(hwnd)?;
 
     Ok(Form {
         hotkey,
         target_apps,
         ime_enabled: is_checked(hwnd, ID_IME_ENABLED),
-        hold_ms,
+        timing,
         size,
         startup: is_checked(hwnd, ID_STARTUP),
         check_update: is_checked(hwnd, ID_UPDATE),
     })
+}
+
+/// 表示時間とフェードアウトの時間（秒で入力）を読む。
+unsafe fn read_timing(hwnd: HWND) -> Result<Timing, (i32, String)> {
+    let hold_ms = ime_logic::parse_seconds(&get_text(hwnd, ID_HOLD), HOLD_MS_MIN, HOLD_MS_MAX)
+        .ok_or_else(|| {
+            (
+                ID_HOLD,
+                format!(
+                    "表示時間は {}〜{} 秒の数で入力してください（例: 0.4、1.5）。",
+                    ime_logic::format_seconds(HOLD_MS_MIN),
+                    ime_logic::format_seconds(HOLD_MS_MAX)
+                ),
+            )
+        })?;
+    let fade_ms = ime_logic::parse_seconds(&get_text(hwnd, ID_FADE), FADE_MS_MIN, FADE_MS_MAX)
+        .ok_or_else(|| {
+            (
+                ID_FADE,
+                format!(
+                    "フェードアウトは {}〜{} 秒の数で入力してください（例: 0.25）。",
+                    ime_logic::format_seconds(FADE_MS_MIN),
+                    ime_logic::format_seconds(FADE_MS_MAX)
+                ),
+            )
+        })?;
+    Ok(Timing { hold_ms, fade_ms })
+}
+
+/// 表示の大きさを読む。
+unsafe fn read_size(hwnd: HWND) -> Result<u32, (i32, String)> {
+    parse_in_range(&get_text(hwnd, ID_SIZE), u64::from(SIZE_MIN), u64::from(SIZE_MAX))
+        .map(|v| v as u32)
+        .ok_or_else(|| {
+            (
+                ID_SIZE,
+                format!("大きさは {SIZE_MIN}〜{SIZE_MAX} の数で入力してください。"),
+            )
+        })
+}
+
+/// 誤りを知らせ、直すべきコントロールへ移る。
+unsafe fn report_invalid(hwnd: HWND, id: i32, message: &str) {
+    show_message(hwnd, message, MB_ICONWARNING);
+    if let Ok(control) = GetDlgItem(hwnd, id) {
+        let _ = SetFocus(control);
+    }
 }
 
 /// 数を読み、範囲内なら返す。
@@ -618,10 +671,7 @@ unsafe fn on_save(hwnd: HWND) {
     let form = match read_form(hwnd) {
         Ok(form) => form,
         Err((id, message)) => {
-            show_message(hwnd, &message, MB_ICONWARNING);
-            if let Ok(control) = GetDlgItem(hwnd, id) {
-                let _ = SetFocus(control);
-            }
+            report_invalid(hwnd, id, &message);
             return;
         }
     };
@@ -636,7 +686,8 @@ unsafe fn on_save(hwnd: HWND) {
     settings.remap.hotkey = form.hotkey.format();
     settings.remap.target_apps = form.target_apps;
     settings.ime_indicator.enabled = form.ime_enabled;
-    settings.ime_indicator.hold_ms = form.hold_ms;
+    settings.ime_indicator.hold_ms = form.timing.hold_ms;
+    settings.ime_indicator.fade_ms = form.timing.fade_ms;
     settings.ime_indicator.size = form.size;
     settings.update.check_on_startup = form.check_update;
 
@@ -673,21 +724,17 @@ unsafe fn on_save(hwnd: HWND) {
     let _ = DestroyWindow(hwnd);
 }
 
-/// 「プレビュー」: 入力中の表示時間と大きさで、入力モードを試しに表示する。
+/// 「プレビュー」: 入力中の表示時間・フェードアウト・大きさで、入力モードを試しに表示する。
 unsafe fn on_preview(hwnd: HWND) {
-    let hold_ms = parse_in_range(&get_text(hwnd, ID_HOLD), HOLD_MS_MIN, HOLD_MS_MAX);
-    let size = parse_in_range(&get_text(hwnd, ID_SIZE), u64::from(SIZE_MIN), u64::from(SIZE_MAX));
-    let (Some(hold_ms), Some(size)) = (hold_ms, size) else {
-        show_message(
-            hwnd,
-            &format!(
-                "表示時間は {HOLD_MS_MIN}〜{HOLD_MS_MAX}、大きさは {SIZE_MIN}〜{SIZE_MAX} の数で入力してください。"
-            ),
-            MB_ICONWARNING,
-        );
-        return;
+    let values = read_timing(hwnd).and_then(|timing| Ok((timing, read_size(hwnd)?)));
+    let (timing, size) = match values {
+        Ok(values) => values,
+        Err((id, message)) => {
+            report_invalid(hwnd, id, &message);
+            return;
+        }
     };
-    if !ime_indicator::preview(hold_ms, size as u32) {
+    if !ime_indicator::preview(timing, size) {
         show_message(
             hwnd,
             "入力モード表示が動いていないため、プレビューできません。アプリを起動し直してください。",
