@@ -35,6 +35,43 @@ pub struct Settings {
     pub ime_indicator: ImeIndicatorSettings,
     /// トラブル調査用の動作の記録（[`crate::logging`]）。
     pub log: LogSettings,
+    /// キー割り当て（[`crate::hotkey_rules`]）。上から順に調べる。
+    pub hotkeys: Vec<HotkeyRuleSetting>,
+}
+
+/// キー割り当て 1 つ分の設定（`settings.json` の書き方そのまま）。
+///
+/// 中身の解釈と検証は [`crate::hotkey_rules::Rule::from_setting`] で行う。読めない値でも
+/// 設定ファイル全体を無効にしないよう、ここでは文字列のまま持つ。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HotkeyRuleSetting {
+    /// 使うか（false なら一時的に止めておける）。
+    pub enabled: bool,
+    /// 起動するキーの組み合わせ（例 `"Ctrl+Alt+V"`）。
+    pub hotkey: String,
+    /// 動作の種類（`"send_keys"` / `"type_text"` / `"run"` / `"paste_plain"` /
+    /// `"toggle_topmost"` / `"block"`）。
+    pub action: String,
+    /// 動作の内容（送るキー・入力する文字・開くプログラムなど）。
+    pub value: String,
+    /// プログラムを開くときの引数。
+    pub args: String,
+    /// 効くアプリ（プロセス名）。空ならすべてのアプリ。
+    pub apps: Vec<String>,
+}
+
+impl Default for HotkeyRuleSetting {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hotkey: String::new(),
+            action: String::new(),
+            value: String::new(),
+            args: String::new(),
+            apps: Vec::new(),
+        }
+    }
 }
 
 /// トラブル調査用の動作の記録に関する設定。
@@ -219,6 +256,12 @@ pub fn save_from_settings_window(settings: &Settings) -> Result<(), String> {
             "check_on_startup": settings.update.check_on_startup,
         },
     }))
+}
+
+/// キー割り当ての一覧を `settings.json` に書き込む（キー割り当て画面から使う）。
+pub fn save_hotkeys(hotkeys: &[HotkeyRuleSetting]) -> Result<(), String> {
+    let value = serde_json::to_value(hotkeys).map_err(|e| e.to_string())?;
+    save_patch(&serde_json::json!({ "hotkeys": value }))
 }
 
 /// `patch` に書かれた項目だけを `settings.json` に上書きする。
@@ -447,6 +490,26 @@ mod tests {
         assert_eq!(s.ime_indicator.opacity, 90);
         assert!(!s.ime_indicator.hide_in_fullscreen);
         assert!(!s.log.enabled);
+        // キー割り当ては空
+        assert!(s.hotkeys.is_empty());
+    }
+
+    #[test]
+    fn hotkey_rules_read_leniently() {
+        let s: Settings = serde_json::from_str(
+            r#"{ "hotkeys": [
+                { "hotkey": "Ctrl+Alt+V", "action": "paste_plain" },
+                { "hotkey": "Win+N", "action": "run", "value": "notepad.exe", "enabled": false },
+                { "hotkey": "F9", "action": "そんな動作は無い" }
+            ] }"#,
+        )
+        .unwrap();
+        assert_eq!(s.hotkeys.len(), 3);
+        assert!(s.hotkeys[0].enabled); // 書かなければ使う
+        assert!(s.hotkeys[0].apps.is_empty());
+        assert!(!s.hotkeys[1].enabled);
+        // 知らない動作でも設定ファイル全体は読める（その割り当てだけ使わない）
+        assert_eq!(s.hotkeys[2].action, "そんな動作は無い");
     }
 
     #[test]

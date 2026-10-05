@@ -1,6 +1,6 @@
 //! キーリマップの設定に関する判断ロジック。
 //!
-//! 値貼り付けを起動するキーの組み合わせ（例 `Ctrl+B`）の解析・表示・検証と、
+//! 値貼り付けやキー割り当てを起動するキーの組み合わせ（例 `Ctrl+B`）の解析・表示・検証と、
 //! 対象アプリ（プロセス名）の一覧の整理を行う。Win32 API に触れないので、
 //! Linux 上でもテストを実行して確かめられる。
 //!
@@ -21,6 +21,8 @@ pub struct Hotkey {
     pub ctrl: bool,
     pub shift: bool,
     pub alt: bool,
+    /// Windows キー（左右どちらでもよい）。
+    pub win: bool,
     /// キー本体の仮想キーコード（[`KEYS`] のいずれか）。
     pub vk: u32,
 }
@@ -36,16 +38,34 @@ pub const KEYS: &[(&str, u32)] = &[
     ("5", 0x35), ("6", 0x36), ("7", 0x37), ("8", 0x38), ("9", 0x39),
     ("F1", 0x70), ("F2", 0x71), ("F3", 0x72), ("F4", 0x73), ("F5", 0x74), ("F6", 0x75),
     ("F7", 0x76), ("F8", 0x77), ("F9", 0x78), ("F10", 0x79), ("F11", 0x7A), ("F12", 0x7B),
+    ("F13", 0x7C), ("F14", 0x7D), ("F15", 0x7E), ("F16", 0x7F), ("F17", 0x80), ("F18", 0x81),
+    ("F19", 0x82), ("F20", 0x83), ("F21", 0x84), ("F22", 0x85), ("F23", 0x86), ("F24", 0x87),
+    ("Space", 0x20), ("Enter", 0x0D), ("Tab", 0x09), ("Esc", 0x1B), ("Backspace", 0x08),
+    ("Delete", 0x2E), ("Insert", 0x2D), ("Home", 0x24), ("End", 0x23),
+    ("PageUp", 0x21), ("PageDown", 0x22),
+    ("Left", 0x25), ("Up", 0x26), ("Right", 0x27), ("Down", 0x28),
 ];
+
+/// キーの別名（よく使われる書き方。表示は [`KEYS`] の名前に直す）。
+const KEY_ALIASES: &[(&str, u32)] = &[
+    ("Escape", 0x1B), ("Return", 0x0D), ("Del", 0x2E), ("Ins", 0x2D),
+    ("PgUp", 0x21), ("PgDn", 0x22), ("BS", 0x08),
+];
+
+/// 送るときに「拡張キー」の印（`KEYEVENTF_EXTENDEDKEY`）が要るキーか。
+/// 矢印や Home などは、印が無いとテンキー側のキーとして扱われることがある。
+pub fn is_extended_key(vk: u32) -> bool {
+    matches!(vk, 0x21..=0x28 | 0x2D | 0x2E)
+}
 
 /// 仮想キーコードからキーの表示名を引く。
 pub fn key_name(vk: u32) -> Option<&'static str> {
     KEYS.iter().find(|(_, v)| *v == vk).map(|(n, _)| *n)
 }
 
-/// ファンクションキー（F1〜F12）か。
+/// ファンクションキー（F1〜F24）か。
 fn is_function_key(vk: u32) -> bool {
-    (0x70..=0x7B).contains(&vk)
+    (0x70..=0x87).contains(&vk)
 }
 
 impl Default for Hotkey {
@@ -54,6 +74,7 @@ impl Default for Hotkey {
             ctrl: true,
             shift: false,
             alt: false,
+            win: false,
             vk: 0x42,
         }
     }
@@ -68,6 +89,7 @@ impl Hotkey {
             ctrl: false,
             shift: false,
             alt: false,
+            win: false,
             vk: 0,
         };
         let parts: Vec<&str> = text.split('+').map(str::trim).collect();
@@ -79,15 +101,22 @@ impl Hotkey {
                 "ctrl" | "control" => hotkey.ctrl = true,
                 "shift" => hotkey.shift = true,
                 "alt" => hotkey.alt = true,
+                "win" | "windows" => hotkey.win = true,
                 "" => return Err(format!("「{text}」の書き方が正しくありません")),
                 other => return Err(format!("修飾キー「{other}」には対応していません")),
             }
         }
         hotkey.vk = KEYS
             .iter()
+            .chain(KEY_ALIASES)
             .find(|(name, _)| name.eq_ignore_ascii_case(key))
             .map(|(_, vk)| *vk)
-            .ok_or_else(|| format!("キー「{key}」には対応していません（A〜Z、0〜9、F1〜F12）"))?;
+            .ok_or_else(|| {
+                format!(
+                    "キー「{key}」には対応していません（A〜Z、0〜9、F1〜F24、Space、Enter、Tab、Esc、\
+                     Backspace、Delete、Insert、Home、End、PageUp、PageDown、Left、Up、Right、Down）"
+                )
+            })?;
         Ok(hotkey)
     }
 
@@ -103,27 +132,38 @@ impl Hotkey {
         if self.alt {
             text.push_str("Alt+");
         }
+        if self.win {
+            text.push_str("Win+");
+        }
         text.push_str(key_name(self.vk).unwrap_or("?"));
         text
     }
 
-    /// 使ってよい組み合わせかを確かめる。
+    /// 起動するキーとして使ってよい組み合わせかを確かめる（キー割り当てにも使う）。
     ///
-    /// - 英数字のキーは Ctrl か Alt との組み合わせが必要（単独や Shift だけでは、
-    ///   普通の文字入力を奪ってしまう）。
+    /// - ファンクションキー以外は Ctrl・Alt・Win のどれかとの組み合わせが必要
+    ///   （単独や Shift だけでは、普通の文字入力や Enter などを奪ってしまう）。
     /// - ファンクションキーは単独でもよい。
-    /// - 送出する `Ctrl+Shift+V` そのものは登録できない（意味がない）。
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate_trigger(&self) -> Result<(), String> {
         if key_name(self.vk).is_none() {
             return Err("キーが選ばれていません".into());
         }
-        if !is_function_key(self.vk) && !self.ctrl && !self.alt {
+        if !is_function_key(self.vk) && !self.ctrl && !self.alt && !self.win {
             return Err(
-                "英字・数字のキーには Ctrl か Alt を組み合わせてください（単独や Shift だけでは、普段の文字入力ができなくなります）"
+                "F1〜F24 以外のキーには Ctrl・Alt・Win のどれかを組み合わせてください（単独や Shift だけでは、普段の文字入力ができなくなります）"
                     .into(),
             );
         }
-        if self.ctrl && self.shift && !self.alt && self.vk == VK_V {
+        Ok(())
+    }
+
+    /// 値貼り付けを起動するキーとして使ってよい組み合わせかを確かめる。
+    ///
+    /// [`Hotkey::validate_trigger`] に加え、送出する `Ctrl+Shift+V` そのものは
+    /// 登録できない（意味がない）。
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_trigger()?;
+        if self.ctrl && self.shift && !self.alt && !self.win && self.vk == VK_V {
             return Err("Ctrl+Shift+V は値貼り付けそのものなので、登録できません".into());
         }
         Ok(())
@@ -143,6 +183,7 @@ impl Hotkey {
             | (u32::from(self.ctrl) << 8)
             | (u32::from(self.shift) << 9)
             | (u32::from(self.alt) << 10)
+            | (u32::from(self.win) << 11)
     }
 
     /// [`Hotkey::pack`] の逆。
@@ -152,6 +193,7 @@ impl Hotkey {
             ctrl: value & (1 << 8) != 0,
             shift: value & (1 << 9) != 0,
             alt: value & (1 << 10) != 0,
+            win: value & (1 << 11) != 0,
         }
     }
 }
@@ -258,7 +300,13 @@ mod tests {
     use super::*;
 
     fn hk(ctrl: bool, shift: bool, alt: bool, vk: u32) -> Hotkey {
-        Hotkey { ctrl, shift, alt, vk }
+        Hotkey {
+            ctrl,
+            shift,
+            alt,
+            win: false,
+            vk,
+        }
     }
 
     #[test]
@@ -281,9 +329,37 @@ mod tests {
     fn parse_rejects_unknown() {
         assert!(Hotkey::parse("").is_err());
         assert!(Hotkey::parse("Ctrl+").is_err());
-        assert!(Hotkey::parse("Win+B").is_err());
-        assert!(Hotkey::parse("Ctrl+Enter").is_err());
+        assert!(Hotkey::parse("Super+B").is_err());
+        assert!(Hotkey::parse("Ctrl+NumLock").is_err());
         assert!(Hotkey::parse("Ctrl++B").is_err());
+    }
+
+    #[test]
+    fn parses_win_and_named_keys() {
+        let h = Hotkey::parse("Win+Shift+T").unwrap();
+        assert!(h.win && h.shift && !h.ctrl);
+        assert_eq!(h.format(), "Shift+Win+T");
+        assert_eq!(Hotkey::parse("ctrl+escape").unwrap().format(), "Ctrl+Esc");
+        assert_eq!(Hotkey::parse("Enter").unwrap().vk, 0x0D);
+        assert_eq!(Hotkey::parse("PgDn").unwrap().format(), "PageDown");
+        assert_eq!(Hotkey::parse("F24").unwrap().vk, 0x87);
+        let h = Hotkey::parse("Ctrl+Alt+Win+Delete").unwrap();
+        assert_eq!(Hotkey::unpack(h.pack()), h);
+        assert!(is_extended_key(0x25) && is_extended_key(0x2E) && !is_extended_key(0x0D));
+    }
+
+    #[test]
+    fn trigger_rules() {
+        // Win も修飾キーとして数える
+        assert!(Hotkey::parse("Win+T").unwrap().validate_trigger().is_ok());
+        // Enter や矢印を単独で奪うのは不可。F13〜F24 は単独でよい
+        assert!(Hotkey::parse("Enter").unwrap().validate_trigger().is_err());
+        assert!(Hotkey::parse("Shift+Left").unwrap().validate_trigger().is_err());
+        assert!(Hotkey::parse("F13").unwrap().validate_trigger().is_ok());
+        // Ctrl+Shift+V は値貼り付けでは不可だが、キー割り当てのきっかけには使える
+        let paste = Hotkey::parse("Ctrl+Shift+V").unwrap();
+        assert!(paste.validate().is_err());
+        assert!(paste.validate_trigger().is_ok());
     }
 
     #[test]

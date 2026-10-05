@@ -15,7 +15,11 @@
 //! - **入力モード表示スレッド**: IME の入力モードを監視し、切り替えた瞬間に
 //!   画面中央へ表示する（[`ime_indicator`]）。独自のメッセージループを持ち、
 //!   終了時に WM_QUIT を送って止める。
+//! - **キー割り当ての実行スレッド**: フックが捕まえたキー割り当ての動作（キーを送る・
+//!   プログラムを開く・書式なし貼り付けなど）を実行する（[`actions`]）。フックの中で
+//!   時間のかかることをしないため。
 //! - **設定画面スレッド**: 設定画面を開いている間だけ動く（[`settings_window`]）。
+//!   キー割り当て画面（[`hotkey_window`]）も同じ。
 //!   保存した内容はチャネルでメインスレッドへ送り、メインスレッドが反映する。
 //! - **更新スレッド**: 更新の確認・ダウンロード・適用を行う。通信が起動や
 //!   キー操作を妨げないよう、必ず別スレッドで実行する。多重実行の防止は
@@ -27,6 +31,9 @@
 
 mod config;
 mod excel_check;
+mod actions;
+mod hotkey_rules;
+mod hotkey_window;
 mod http;
 mod ime_indicator;
 mod ime_logic;
@@ -36,6 +43,7 @@ mod sendinput;
 mod settings_window;
 mod startup;
 mod tray;
+mod ui;
 mod update;
 mod update_logic;
 
@@ -63,6 +71,12 @@ pub enum TrayMessage {
     OpenSettings,
     /// 設定画面で保存された（settings.json への書き込みは済んでいる。反映だけ行う）
     SettingsSaved(Box<config::Settings>),
+    /// キー割り当て ON/OFF 切替
+    ToggleHotkeys,
+    /// キー割り当て画面を開く
+    OpenHotkeys,
+    /// キー割り当て画面で保存された（settings.json への書き込みは済んでいる。反映だけ行う）
+    HotkeysSaved(Vec<config::HotkeyRuleSetting>),
     /// 更新を確認（メニューからの手動操作）
     CheckUpdate,
     /// 更新ファイルのダウンロード進捗（パーセント）
@@ -85,6 +99,9 @@ fn main() {
 
     // キーリマップのキーと対象アプリを、フックを設置する前に決めておく。
     let hotkey = configure_remap(&settings);
+    configure_hotkeys(&settings.hotkeys);
+    // キー割り当ての動作を実行するスレッド。フックより先に始めておく。
+    let action_worker = actions::start();
 
     // --- フックスレッドを起動し、そのスレッド ID を受け取る ---
     // 設置に失敗した場合は Err(エラー内容) が届く。詳細をダイアログに出せるよう
@@ -129,6 +146,7 @@ fn main() {
         tx.clone(),
         &hotkey,
         keyboard::is_enabled(),
+        keyboard::rules_enabled(),
         startup::is_enabled(),
         ime_indicator.is_some() && ime_indicator::is_enabled(),
     ) {
@@ -218,7 +236,11 @@ fn main() {
                 settings_window::open(tx.clone(), current, startup::is_enabled());
             }
             TrayMessage::SettingsSaved(saved) => {
+                // キー割り当ては設定画面では扱わない。設定画面を開いた後にキー割り当て画面で
+                // 保存していても戻らないよう、今の割り当てを残す。
+                let hotkeys = std::mem::take(&mut settings.hotkeys);
                 settings = *saved;
+                settings.hotkeys = hotkeys;
                 let hotkey = configure_remap(&settings);
                 let was_logging = logging::is_enabled();
                 logging::set_enabled(settings.log.enabled);
@@ -244,6 +266,22 @@ fn main() {
                     log::warn!("メニュー更新失敗: {e}");
                 }
                 log::info!("設定を反映しました（キー: {}）", hotkey.format());
+            }
+            TrayMessage::ToggleHotkeys => {
+                let on = keyboard::toggle_rules();
+                if let Err(e) = tray.set_hotkeys_checked(on) {
+                    log::warn!("メニュー更新失敗: {e}");
+                }
+                log::info!("キー割り当て: {}", if on { "有効" } else { "無効" });
+            }
+            TrayMessage::OpenHotkeys => {
+                let (remap, _) = remap_logic::Hotkey::from_setting(&settings.remap.hotkey);
+                let remap_apps = remap_logic::effective_target_apps(&settings.remap.target_apps);
+                hotkey_window::open(tx.clone(), settings.hotkeys.clone(), (remap, remap_apps));
+            }
+            TrayMessage::HotkeysSaved(hotkeys) => {
+                settings.hotkeys = hotkeys;
+                configure_hotkeys(&settings.hotkeys);
             }
             TrayMessage::CheckUpdate => {
                 // 手動確認。結果（最新である／失敗した）もダイアログで知らせる。
@@ -272,13 +310,15 @@ fn main() {
         }
     }
 
-    // --- 後始末: 設定画面・入力モード表示・フックスレッドを終了させて待つ ---
+    // --- 後始末: 画面・入力モード表示・フックスレッド・キー割り当ての実行スレッドを終了させて待つ ---
     settings_window::close();
+    hotkey_window::close();
     if let Some(indicator) = ime_indicator {
         indicator.stop();
     }
     post_quit(hook_tid);
     let _ = hook_thread.join();
+    action_worker.stop();
     log::info!("アタイの貼り付け 終了");
 }
 
@@ -298,6 +338,16 @@ fn log_startup(settings: &config::Settings) {
         if settings.ime_indicator.enabled { "ON" } else { "OFF" },
         if settings.update.check_on_startup { "ON" } else { "OFF" },
     );
+}
+
+/// キー割り当てを読み取ってフックへ渡す。使えない割り当ては記録に残して飛ばす。
+fn configure_hotkeys(hotkeys: &[config::HotkeyRuleSetting]) {
+    let (rules, problems) = hotkey_rules::compile(hotkeys);
+    for problem in problems {
+        log::warn!("{problem}");
+    }
+    log::info!("キー割り当て: {} 件を使います", rules.len());
+    keyboard::set_rules(rules);
 }
 
 /// 設定からキーリマップのキーと対象アプリを決めてフックへ渡し、使うキーを返す。

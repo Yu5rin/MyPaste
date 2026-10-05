@@ -88,6 +88,8 @@ const TIMER_ANIM: usize = 2;
 
 /// 試しに表示する（設定画面のプレビュー）。表示の設定は [`PREVIEW`] に置いてから送る。
 const WM_APP_PREVIEW: u32 = WM_APP + 1;
+/// お知らせを表示する（キー割り当ての結果など）。文字は [`NOTICE`] に置いてから送る。
+const WM_APP_NOTICE: u32 = WM_APP + 2;
 
 /// 機能の ON/OFF。トレイメニューから切り替えられ、監視スレッドが毎回見る。
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -95,6 +97,8 @@ static ENABLED: AtomicBool = AtomicBool::new(true);
 static PARAMS: Mutex<Params> = Mutex::new(Params::DEFAULT);
 /// プレビューで使う表示の設定（[`preview`] が置き、監視スレッドが取り出す）。
 static PREVIEW: Mutex<Option<Params>> = Mutex::new(None);
+/// お知らせに出す文字（[`notify`] が置き、監視スレッドが取り出す）。
+static NOTICE: Mutex<Option<&'static str>> = Mutex::new(None);
 /// 表示ウィンドウ（プレビューの依頼先）。0 は未作成。
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
 
@@ -202,6 +206,25 @@ pub fn preview(params: Params) -> bool {
     }
 }
 
+/// 入力モードと同じ見た目で、短いお知らせ（例 `"固定"`）を表示する。キー割り当ての結果を
+/// 知らせるのに使う。入力モード表示が OFF でも表示する。監視スレッドが動いていなければ `false`。
+pub fn notify(label: &'static str) -> bool {
+    let window = WINDOW.load(Ordering::SeqCst);
+    if window == 0 {
+        return false;
+    }
+    *NOTICE.lock().unwrap_or_else(|p| p.into_inner()) = Some(label);
+    unsafe {
+        PostMessageW(
+            HWND(window as *mut core::ffi::c_void),
+            WM_APP_NOTICE,
+            WPARAM(0),
+            LPARAM(0),
+        )
+        .is_ok()
+    }
+}
+
 /// 機能の ON/OFF を切り替える（トレイメニューから呼ぶ）。
 pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::SeqCst);
@@ -281,14 +304,15 @@ struct State {
 /// 表示中の内容。
 #[derive(Clone, Copy)]
 struct Showing {
-    mode: ImeMode,
+    /// 表示する文字（入力モードの `あ` など。お知らせでは 2〜3 文字）。
+    label: &'static str,
     started: Instant,
     timing: Timing,
     /// 最大の不透明度（0〜255）。
     alpha: u8,
     theme: Theme,
-    /// 設定画面のプレビューか（機能が OFF でも消さない）。
-    preview: bool,
+    /// 設定画面のプレビューやお知らせか（機能が OFF でも消さない）。
+    forced: bool,
 }
 
 /// 前面ウィンドウから読み取った状態。
@@ -405,7 +429,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let params = PREVIEW.lock().unwrap_or_else(|p| p.into_inner()).take();
             if let Some(params) = params {
                 // 入力位置はプレビューでは取れない（前面は設定画面）ので、中央に出す。
-                show(ImeMode::Hiragana, None, &params, true);
+                show(ImeMode::Hiragana.label(), None, &params, true);
+            }
+            LRESULT(0)
+        }
+        WM_APP_NOTICE => {
+            let label = NOTICE.lock().unwrap_or_else(|p| p.into_inner()).take();
+            if let Some(label) = label {
+                show(label, None, &current_params(), true);
             }
             LRESULT(0)
         }
@@ -449,7 +480,7 @@ unsafe fn on_poll() {
             s.borrow()
                 .as_ref()
                 .and_then(|state| state.showing)
-                .is_some_and(|showing| showing.preview)
+                .is_some_and(|showing| showing.forced)
         });
         if !previewing {
             hide();
@@ -463,7 +494,7 @@ unsafe fn on_poll() {
             return;
         }
         log::debug!("入力モード: {} を表示します（位置: {}）", mode.label(), params.position.as_setting());
-        show(mode, observed.caret, &params, false);
+        show(mode.label(), observed.caret, &params, false);
     }
 }
 
@@ -639,8 +670,8 @@ unsafe fn placement(caret: Option<RECT>, params: &Params) -> Option<(i32, i32, i
     Some((x, y, size))
 }
 
-/// モードを表示する。`preview` は設定画面からの試し表示か。
-unsafe fn show(mode: ImeMode, caret: Option<RECT>, params: &Params, preview: bool) {
+/// 文字（入力モードやお知らせ）を表示する。`forced` は設定画面のプレビューやお知らせか。
+unsafe fn show(label: &'static str, caret: Option<RECT>, params: &Params, forced: bool) {
     let Some((x, y, size)) = placement(caret, params) else {
         return;
     };
@@ -650,8 +681,10 @@ unsafe fn show(mode: ImeMode, caret: Option<RECT>, params: &Params, preview: boo
         let mut s = s.borrow_mut();
         let Some(state) = s.as_mut() else { return };
 
-        // 文字の高さは一辺の 55%。大きさが変わったときだけフォントを作り直す。
-        let font_height = size * 55 / 100;
+        // 文字の高さは一辺の 55%。2 文字以上のお知らせは、横に収まるよう小さくする。
+        // 高さが変わったときだけフォントを作り直す。
+        let chars = label.chars().count().max(1) as i32;
+        let font_height = (size * 55 / 100).min(size * 80 / 100 / chars);
         if state.font.map(|(_, h)| h) != Some(font_height) {
             if let Some((old, _)) = state.font.take() {
                 let _ = DeleteObject(old);
@@ -679,12 +712,12 @@ unsafe fn show(mode: ImeMode, caret: Option<RECT>, params: &Params, preview: boo
 
         state.size = size;
         state.showing = Some(Showing {
-            mode,
+            label,
             started: Instant::now(),
             timing: params.timing,
             alpha,
             theme: params.theme,
-            preview,
+            forced,
         });
         let hwnd = state.hwnd;
 
@@ -771,7 +804,7 @@ unsafe fn on_paint(hwnd: HWND) {
             .unwrap_or(HGDIOBJ::default());
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, COLORREF(foreground));
-        let mut text: Vec<u16> = showing.mode.label().encode_utf16().collect();
+        let mut text: Vec<u16> = showing.label.encode_utf16().collect();
         DrawTextW(
             hdc,
             &mut text,

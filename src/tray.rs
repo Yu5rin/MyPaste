@@ -31,10 +31,14 @@ fn remap_label(hotkey: &Hotkey) -> String {
 }
 /// 自動起動のメニュー文言。
 const LABEL_STARTUP: &str = "自動起動";
-/// 入力モード表示のメニュー文言。
-const LABEL_IME_INDICATOR: &str = "入力モードを画面中央に表示";
+/// キー割り当ての有効／無効のメニュー文言。
+const LABEL_HOTKEYS: &str = "キー割り当てを使う";
+/// 入力モード表示のメニュー文言（表示位置は画面中央とは限らないため「表示」とだけ書く）。
+const LABEL_IME_INDICATOR: &str = "入力モードを表示";
 /// 設定画面のメニュー文言。
 const LABEL_SETTINGS: &str = "設定...";
+/// キー割り当て画面のメニュー文言。
+const LABEL_HOTKEY_WINDOW: &str = "キー割り当て...";
 /// 更新確認のメニュー文言。
 const LABEL_CHECK_UPDATE: &str = "更新を確認";
 
@@ -58,6 +62,7 @@ pub struct Menu {
     remap_id: u32,
     /// キーリマップ項目の文言（チェックの印を除く）。
     remap_text: String,
+    hotkeys_id: u32,
     startup_id: u32,
     ime_indicator_id: u32,
 }
@@ -75,6 +80,14 @@ impl Menu {
         self.tray
             .inner_mut()
             .set_menu_item_label(&label, self.remap_id)
+    }
+
+    /// キー割り当て項目のチェック状態を更新する。
+    pub fn set_hotkeys_checked(&mut self, checked: bool) -> Result<(), tray_item::TIError> {
+        let label = labeled(LABEL_HOTKEYS, checked);
+        self.tray
+            .inner_mut()
+            .set_menu_item_label(&label, self.hotkeys_id)
     }
 
     /// キーリマップ項目の文言を、設定したキーの組み合わせに合わせて更新する。
@@ -129,12 +142,14 @@ fn labeled(text: &str, checked: bool) -> String {
 ///
 /// - `hotkey`: 値貼り付けを起動するキーの組み合わせ（メニューの文言に使う）
 /// - `enabled`: 起動時のキーリマップ有効状態
+/// - `hotkeys`: 起動時のキー割り当て有効状態
 /// - `startup`: 起動時の自動起動設定状態
 /// - `ime_indicator`: 起動時の入力モード表示の有効状態
 pub fn build(
     tx: Sender<TrayMessage>,
     hotkey: &Hotkey,
     enabled: bool,
+    hotkeys: bool,
     startup: bool,
     ime_indicator: bool,
 ) -> Result<Menu, tray_item::TIError> {
@@ -153,6 +168,14 @@ pub fn build(
         .inner_mut()
         .add_menu_item_with_id(&labeled(&remap_text, enabled), move || {
             let _ = tx_toggle.send(TrayMessage::Toggle);
+        })?;
+
+    // キー割り当ての有効／無効
+    let tx_hotkeys = tx.clone();
+    let hotkeys_id = tray
+        .inner_mut()
+        .add_menu_item_with_id(&labeled(LABEL_HOTKEYS, hotkeys), move || {
+            let _ = tx_hotkeys.send(TrayMessage::ToggleHotkeys);
         })?;
 
     // 自動起動の有効／無効
@@ -181,6 +204,12 @@ pub fn build(
         let _ = tx_settings.send(TrayMessage::OpenSettings);
     })?;
 
+    // キー割り当て画面
+    let tx_hotkey_window = tx.clone();
+    tray.add_menu_item(LABEL_HOTKEY_WINDOW, move || {
+        let _ = tx_hotkey_window.send(TrayMessage::OpenHotkeys);
+    })?;
+
     // 更新の確認（押したときだけ通信する）
     let tx_update = tx.clone();
     tray.add_menu_item(LABEL_CHECK_UPDATE, move || {
@@ -200,6 +229,7 @@ pub fn build(
         tray,
         remap_id,
         remap_text,
+        hotkeys_id,
         startup_id,
         ime_indicator_id,
     })

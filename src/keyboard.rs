@@ -7,6 +7,10 @@
 //! キーの組み合わせと対象アプリは [`configure`] で起動中にも差し替えられる
 //! （設定画面で保存したとき）。
 //!
+//! さらに、キー割り当て（[`crate::hotkey_rules`]）で登録したキーを捕まえて、
+//! その動作の実行を [`crate::actions`] に頼む（[`set_rules`]）。値貼り付けのキーが
+//! 先に効き、キー割り当ては上から順に調べて最初に当てはまったものだけを使う。
+//!
 //! ON/OFF 状態はメモリ上（[`ENABLED`]）にのみ保持し、終了時にリセットされる。
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
@@ -22,8 +26,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
+use crate::hotkey_rules::{Action, Rule};
 use crate::remap_logic::Hotkey;
-use crate::{excel_check, sendinput};
+use crate::{actions, excel_check, sendinput};
 
 /// ON/OFF 状態（起動時 ON、メモリのみ・終了時リセット）。
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -41,6 +46,59 @@ static HOTKEY: AtomicU32 = AtomicU32::new(0x0142);
 
 /// 対象アプリのプロセス名（大文字）。
 static TARGET_APPS: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
+/// キー割り当て（有効で読めるものだけ）。
+static RULES: RwLock<Vec<Rule>> = RwLock::new(Vec::new());
+
+/// キー割り当てを使うか（トレイメニューで切り替える。起動時 ON、メモリのみ）。
+static RULES_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// キー割り当てを差し替える（起動時と、キー割り当て画面で保存したとき）。
+pub fn set_rules(rules: Vec<Rule>) {
+    match RULES.write() {
+        Ok(mut current) => *current = rules,
+        Err(poisoned) => *poisoned.into_inner() = rules,
+    }
+}
+
+/// キー割り当てを使うか。
+pub fn rules_enabled() -> bool {
+    RULES_ENABLED.load(Ordering::SeqCst)
+}
+
+/// キー割り当ての ON/OFF を反転し、反転後の状態を返す。
+pub fn toggle_rules() -> bool {
+    !RULES_ENABLED.fetch_xor(true, Ordering::SeqCst)
+}
+
+/// 押されたキーに当てはまるキー割り当てを探す（動作と、その割り当てのキーの組み合わせ）。
+fn find_rule(vk: u32) -> Option<(Action, Hotkey)> {
+    if !rules_enabled() {
+        return None;
+    }
+    let rules = match RULES.read() {
+        Ok(rules) => rules,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    // まずキー本体だけで絞る（ほとんどのキーはここで外れ、余計な問い合わせをしない）。
+    let mut candidates = rules
+        .iter()
+        .filter(|r| r.hotkey.vk == vk && modifiers_match(&r.hotkey))
+        .peekable();
+    candidates.peek()?;
+    // アプリを限った割り当てがあるときだけ、前面のプロセス名を調べる（1 回だけ）。
+    let mut process: Option<Option<String>> = None;
+    for rule in candidates {
+        if !rule.apps.is_empty() {
+            let name = process.get_or_insert_with(excel_check::foreground_process_name);
+            if !rule.applies_to(name.as_deref()) {
+                continue;
+            }
+        }
+        return Some((rule.action.clone(), rule.hotkey));
+    }
+    None
+}
 
 /// キーの組み合わせと対象アプリを設定する（起動時と、設定画面で保存したとき）。
 pub fn configure(hotkey: Hotkey, target_apps: Vec<String>) {
@@ -114,13 +172,12 @@ fn is_down(vk: VIRTUAL_KEY) -> bool {
     unsafe { (GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000) != 0 }
 }
 
-/// 押されている修飾キーが、設定した組み合わせとちょうど一致するか（Win キーは不可）。
+/// 押されている修飾キーが、設定した組み合わせとちょうど一致するか。
 fn modifiers_match(hotkey: &Hotkey) -> bool {
     is_down(VK_CONTROL) == hotkey.ctrl
         && is_down(VK_SHIFT) == hotkey.shift
         && is_down(VK_MENU) == hotkey.alt
-        && !is_down(VK_LWIN)
-        && !is_down(VK_RWIN)
+        && (is_down(VK_LWIN) || is_down(VK_RWIN)) == hotkey.win
 }
 
 /// 低レベルキーボードフックのコールバック。
@@ -169,6 +226,13 @@ unsafe extern "system" fn low_level_keyboard_proc(
                                 log::debug!("{} はそのまま通しました（OFF のため）", hotkey.format());
                             }
                         }
+                    }
+                    // キー割り当て。実行は別のスレッドに頼み、ここではすぐに戻る。
+                    if let Some((action, rule_hotkey)) = find_rule(kb.vkCode) {
+                        ACTIVE_VK.store(kb.vkCode, Ordering::SeqCst);
+                        log::debug!("キー割り当て: {} を捕まえました", rule_hotkey.format());
+                        actions::dispatch(action, rule_hotkey);
+                        return LRESULT(1);
                     }
                 }
                 // 押下を握りつぶしていた場合は、対応する解放も握りつぶす。

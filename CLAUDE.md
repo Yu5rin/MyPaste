@@ -57,7 +57,8 @@ git config user.name && git config user.email   # 確認
 ## プロジェクト概要
 
 Excel 使用時に `Ctrl+B` を `Ctrl+Shift+V`（値貼り付け）にリマップする Windows 常駐アプリです
-（キーと対象アプリは設定画面で変更可）。
+（キーと対象アプリは設定画面で変更可）。キー割り当て（AutoHotkey のような使い方）、
+入力モードの表示も備えます。
 Rust 製・単体 EXE（ポータブル）・管理者権限不要で動作します。
 
 ### モジュール構成
@@ -70,6 +71,10 @@ src/
  ├ excel_check.rs   // 対象アプリの判定（フォアグラウンドプロセス名）
  ├ remap_logic.rs   // キーの組み合わせ・対象アプリの解析と検証（Win32 非依存）
  ├ settings_window.rs // 設定画面（Win32 標準コントロール）
+ ├ hotkey_window.rs // キー割り当て画面
+ ├ hotkey_rules.rs  // キー割り当ての解釈と検証（Win32 非依存）
+ ├ actions.rs       // キー割り当ての動作の実行
+ ├ ui.rs            // 画面の共通部品
  ├ tray.rs          // タスクトレイ制御（tray-item）
  ├ startup.rs       // 自動起動設定（スタートアップの .lnk 作成／削除）
  ├ ime_indicator.rs // 入力モードの画面中央表示（IME 状態の監視・表示ウィンドウ）
