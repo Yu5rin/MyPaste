@@ -11,6 +11,9 @@
 //!   チャネル受信に専念できる。終了要求を受けたときは、更新の入れ替えが
 //!   実行中であれば（上限付きで）完了を待ってから終了する
 //!   （[`wait_for_update_to_finish`]）。
+//! - **入力モード表示スレッド**: IME の入力モードを監視し、切り替えた瞬間に
+//!   画面中央へ表示する（[`ime_indicator`]）。独自のメッセージループを持ち、
+//!   終了時に WM_QUIT を送って止める。
 //! - **更新スレッド**: 更新の確認・ダウンロード・適用を行う。通信が起動や
 //!   キー操作を妨げないよう、必ず別スレッドで実行する。多重実行の防止は
 //!   `update::run` 内部で行う。
@@ -22,6 +25,8 @@
 mod config;
 mod excel_check;
 mod http;
+mod ime_indicator;
+mod ime_logic;
 mod keyboard;
 mod sendinput;
 mod startup;
@@ -47,6 +52,8 @@ pub enum TrayMessage {
     Toggle,
     /// 自動起動 ON/OFF 切替
     ToggleStartup,
+    /// 入力モード表示 ON/OFF 切替
+    ToggleImeIndicator,
     /// 更新を確認（メニューからの手動操作）
     CheckUpdate,
     /// 更新ファイルのダウンロード進捗（パーセント）
@@ -101,7 +108,15 @@ fn main() {
     // --- タスクトレイを構築 ---
     // 起動時の状態（キーリマップは ON、自動起動は現在の設定）をメニューに反映する。
     let (tx, rx) = mpsc::channel::<TrayMessage>();
-    let mut tray = match tray::build(tx.clone(), keyboard::is_enabled(), startup::is_enabled()) {
+    // --- 入力モード表示を開始（失敗してもこの機能が動かないだけで、起動は続ける） ---
+    let ime_indicator = ime_indicator::start(&settings.ime_indicator);
+
+    let mut tray = match tray::build(
+        tx.clone(),
+        keyboard::is_enabled(),
+        startup::is_enabled(),
+        ime_indicator.is_some() && ime_indicator::is_enabled(),
+    ) {
         Ok(t) => t,
         Err(e) => {
             log::error!("トレイ初期化失敗: {e}");
@@ -113,6 +128,9 @@ fn main() {
                 ),
                 MB_OK | MB_ICONERROR,
             );
+            if let Some(indicator) = ime_indicator {
+                indicator.stop();
+            }
             post_quit(hook_tid);
             let _ = hook_thread.join();
             return;
@@ -149,6 +167,33 @@ fn main() {
                 }
                 Err(e) => log::error!("自動起動設定失敗: {e}"),
             },
+            TrayMessage::ToggleImeIndicator => {
+                if ime_indicator.is_none() {
+                    // 起動時に表示ウィンドウを作れなかった。切り替えても動かないので知らせる。
+                    update::message_box(
+                        "入力モード表示を開始できなかったため、切り替えられません。",
+                        MB_OK | MB_ICONERROR,
+                    );
+                    continue;
+                }
+                let on = !ime_indicator::is_enabled();
+                ime_indicator::set_enabled(on);
+                if let Err(e) = tray.set_ime_indicator_checked(on) {
+                    log::warn!("メニュー更新失敗: {e}");
+                }
+                // 次回の起動でも同じ状態になるよう settings.json に保存する。
+                if let Err(e) = config::save_ime_indicator_enabled(on) {
+                    log::error!("入力モード表示の設定を保存できませんでした: {e}");
+                    update::message_box(
+                        &format!(
+                            "入力モード表示の設定を保存できませんでした。\n\
+                             今回の起動中は切り替えた状態で動きますが、次回の起動では元に戻ります。\n\n詳細: {e}"
+                        ),
+                        MB_OK | MB_ICONERROR,
+                    );
+                }
+                log::info!("入力モード表示: {}", if on { "有効" } else { "無効" });
+            }
             TrayMessage::CheckUpdate => {
                 // 手動確認。結果（最新である／失敗した）もダイアログで知らせる。
                 let tx_update = tx.clone();
@@ -176,7 +221,10 @@ fn main() {
         }
     }
 
-    // --- 後始末: フックスレッドを終了させて待つ ---
+    // --- 後始末: 入力モード表示とフックスレッドを終了させて待つ ---
+    if let Some(indicator) = ime_indicator {
+        indicator.stop();
+    }
     post_quit(hook_tid);
     let _ = hook_thread.join();
     log::info!("アタイの貼り付け 終了");

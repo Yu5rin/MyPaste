@@ -48,6 +48,10 @@ features = [
     "Win32_UI_Shell",
     # 更新確認の HTTPS 通信（OS の証明書ストアで検証される）
     "Win32_Networking_WinHttp",
+    # IME 入力モードの画面中央表示（IME 状態の取得・描画・DPI）
+    "Win32_UI_Input_Ime",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
 ]
 
 # 開発時のログを完全に無効化したい本番ビルド向けの feature
