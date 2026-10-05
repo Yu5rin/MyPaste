@@ -19,9 +19,12 @@
 //!
 //! キーボードフック（[`crate::keyboard`]）とは別スレッドで動くため、Ctrl+B の
 //! リマップには影響しない。
+//!
+//! 表示時間と大きさは [`set_params`] で起動中にも変えられ、設定画面からは
+//! [`preview`] で試しに表示できる。
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -42,11 +45,12 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
-    GetGUIThreadInfo, GetMessageW, GetWindowThreadProcessId, KillTimer, PostThreadMessageW,
+    GetGUIThreadInfo, GetMessageW, GetWindowThreadProcessId, KillTimer, PostMessageW,
+    PostThreadMessageW,
     RegisterClassW, SendMessageTimeoutW, SetLayeredWindowAttributes, SetTimer, SetWindowPos,
     ShowWindow, TranslateMessage, GUITHREADINFO, HTTRANSPARENT, HWND_TOPMOST, LWA_ALPHA,
     MA_NOACTIVATE, MSG, SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE,
-    WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
+    WM_APP, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
@@ -81,8 +85,50 @@ const TIMER_POLL: usize = 1;
 /// タイマーの識別子: フェード。
 const TIMER_ANIM: usize = 2;
 
+/// 試しに表示する（設定画面のプレビュー）。WPARAM = 表示時間、LPARAM = 大きさ。
+const WM_APP_PREVIEW: u32 = WM_APP + 1;
+
 /// 機能の ON/OFF。トレイメニューから切り替えられ、監視スレッドが毎回見る。
 static ENABLED: AtomicBool = AtomicBool::new(true);
+/// 表示を保持する時間（ミリ秒）。
+static HOLD_MS: AtomicU64 = AtomicU64::new(400);
+/// 表示の一辺（96 DPI 基準のピクセル）。
+static BASE_SIZE: AtomicU32 = AtomicU32::new(120);
+/// 表示ウィンドウ（プレビューの依頼先）。0 は未作成。
+static WINDOW: AtomicIsize = AtomicIsize::new(0);
+
+/// 表示時間と大きさを設定する（起動時と、設定画面で保存したとき）。範囲外は丸める。
+pub fn set_params(hold_ms: u64, size: u32) {
+    let (hold_ms, size) = clamp_params(hold_ms, size);
+    HOLD_MS.store(hold_ms, Ordering::SeqCst);
+    BASE_SIZE.store(size, Ordering::SeqCst);
+}
+
+fn clamp_params(hold_ms: u64, size: u32) -> (u64, u32) {
+    (
+        hold_ms.clamp(ime_logic::HOLD_MS_MIN, ime_logic::HOLD_MS_MAX),
+        size.clamp(ime_logic::SIZE_MIN, ime_logic::SIZE_MAX),
+    )
+}
+
+/// 指定した表示時間と大きさで、試しに「あ」を表示する（機能が OFF でも表示する）。
+/// 監視スレッドが動いていなければ何もせず `false` を返す。
+pub fn preview(hold_ms: u64, size: u32) -> bool {
+    let window = WINDOW.load(Ordering::SeqCst);
+    if window == 0 {
+        return false;
+    }
+    let (hold_ms, size) = clamp_params(hold_ms, size);
+    unsafe {
+        PostMessageW(
+            HWND(window as *mut core::ffi::c_void),
+            WM_APP_PREVIEW,
+            WPARAM(hold_ms as usize),
+            LPARAM(size as isize),
+        )
+        .is_ok()
+    }
+}
 
 /// 機能の ON/OFF を切り替える（トレイメニューから呼ぶ）。
 pub fn set_enabled(enabled: bool) {
@@ -129,12 +175,11 @@ impl Drop for Indicator {
 /// アプリの他の機能には影響しない）。
 pub fn start(settings: &ImeIndicatorSettings) -> Option<Indicator> {
     set_enabled(settings.enabled);
-    let hold_ms = settings.hold_ms;
     // 極端な値で画面を覆ったり、見えなくなったりしないよう幅を持たせて制限する。
-    let size = settings.size.clamp(40, 600) as i32;
+    set_params(settings.hold_ms, settings.size);
 
     let (tx, rx) = mpsc::channel::<u32>();
-    let thread = std::thread::spawn(move || thread_main(hold_ms, size, tx));
+    let thread = std::thread::spawn(move || thread_main(tx));
     match rx.recv() {
         Ok(0) | Err(_) => {
             let _ = thread.join();
@@ -151,23 +196,30 @@ pub fn start(settings: &ImeIndicatorSettings) -> Option<Indicator> {
 /// 監視スレッドの状態。ウィンドウプロシージャからも触るため、スレッドローカルに置く。
 struct State {
     hwnd: HWND,
-    hold_ms: u64,
-    /// 96 DPI 基準の一辺。
-    base_size: i32,
     tracker: ModeTracker,
-    /// 表示中のモードと表示を始めた時刻。
-    showing: Option<(ImeMode, Instant)>,
+    /// 表示中の内容。
+    showing: Option<Showing>,
     /// 作成済みのフォントと、その文字の高さ（DPI が変わったら作り直す）。
     font: Option<(HFONT, i32)>,
     /// 現在の一辺（実際のピクセル）。描画に使う。
     size: i32,
 }
 
+/// 表示中の内容。
+#[derive(Clone, Copy)]
+struct Showing {
+    mode: ImeMode,
+    started: Instant,
+    hold_ms: u64,
+    /// 設定画面のプレビューか（機能が OFF でも消さない）。
+    preview: bool,
+}
+
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
 }
 
-fn thread_main(hold_ms: u64, base_size: i32, ready: mpsc::Sender<u32>) {
+fn thread_main(ready: mpsc::Sender<u32>) {
     unsafe {
         let Some(hwnd) = create_window() else {
             let _ = ready.send(0);
@@ -176,14 +228,13 @@ fn thread_main(hold_ms: u64, base_size: i32, ready: mpsc::Sender<u32>) {
         STATE.with(|s| {
             *s.borrow_mut() = Some(State {
                 hwnd,
-                hold_ms,
-                base_size,
                 tracker: ModeTracker::default(),
                 showing: None,
                 font: None,
-                size: base_size,
+                size: 0,
             })
         });
+        WINDOW.store(hwnd.0 as isize, Ordering::SeqCst);
 
         SetTimer(hwnd, TIMER_POLL, POLL_INTERVAL_MS, None);
         let _ = ready.send(GetCurrentThreadId());
@@ -200,6 +251,7 @@ fn thread_main(hold_ms: u64, base_size: i32, ready: mpsc::Sender<u32>) {
         }
 
         // 後始末。タイマー・フォント・ウィンドウを確実に破棄する。
+        WINDOW.store(0, Ordering::SeqCst);
         let _ = KillTimer(hwnd, TIMER_POLL);
         let _ = KillTimer(hwnd, TIMER_ANIM);
         STATE.with(|s| {
@@ -263,6 +315,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             on_paint(hwnd);
             LRESULT(0)
         }
+        WM_APP_PREVIEW => {
+            let size = i32::try_from(lparam.0).unwrap_or(0);
+            show(ImeMode::Hiragana, GetForegroundWindow(), wparam.0 as u64, size, true);
+            LRESULT(0)
+        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -283,11 +340,26 @@ unsafe fn on_poll() {
     });
 
     if !enabled {
-        hide();
+        // OFF にしたら表示中のものも消す。ただし設定画面のプレビューは残す。
+        let previewing = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .and_then(|state| state.showing)
+                .is_some_and(|showing| showing.preview)
+        });
+        if !previewing {
+            hide();
+        }
         return;
     }
     if let (Some(mode), Some((fg, _))) = (to_show, observed) {
-        show(mode, fg);
+        show(
+            mode,
+            fg,
+            HOLD_MS.load(Ordering::SeqCst),
+            BASE_SIZE.load(Ordering::SeqCst) as i32,
+            false,
+        );
     }
 }
 
@@ -347,7 +419,9 @@ unsafe fn send_ime_control(ime_window: HWND, command: usize) -> Option<usize> {
 }
 
 /// 前面ウィンドウのあるモニターの中央にモードを表示する。
-unsafe fn show(mode: ImeMode, focus: HWND) {
+///
+/// `base_size` は 96 DPI 基準の一辺。`preview` は設定画面からの試し表示か。
+unsafe fn show(mode: ImeMode, focus: HWND, hold_ms: u64, base_size: i32, preview: bool) {
     // 位置とサイズは前面（最上位）ウィンドウを基準にする。フォーカス先が子ウィンドウでも、
     // 前面ウィンドウと同じモニター・同じ DPI になる。
     let foreground = GetForegroundWindow();
@@ -367,7 +441,7 @@ unsafe fn show(mode: ImeMode, focus: HWND) {
         let mut s = s.borrow_mut();
         let Some(state) = s.as_mut() else { return };
 
-        let size = ime_logic::scale_for_dpi(state.base_size, dpi);
+        let size = ime_logic::scale_for_dpi(base_size, dpi);
         let work = info.rcWork;
         let (x, y) = ime_logic::centered_origin(work.left, work.top, work.right, work.bottom, size);
 
@@ -399,7 +473,12 @@ unsafe fn show(mode: ImeMode, focus: HWND) {
         }
 
         state.size = size;
-        state.showing = Some((mode, Instant::now()));
+        state.showing = Some(Showing {
+            mode,
+            started: Instant::now(),
+            hold_ms,
+            preview,
+        });
         let hwnd = state.hwnd;
 
         let radius = size / 4;
@@ -426,9 +505,9 @@ unsafe fn on_anim() {
     let (hwnd, alpha) = match STATE.with(|s| {
         let s = s.borrow();
         let state = s.as_ref()?;
-        let (_, started) = state.showing?;
-        let elapsed = started.elapsed().as_millis() as u64;
-        Some((state.hwnd, ime_logic::alpha_at(elapsed, state.hold_ms, FADE_MS, MAX_ALPHA)))
+        let showing = state.showing?;
+        let elapsed = showing.started.elapsed().as_millis() as u64;
+        Some((state.hwnd, ime_logic::alpha_at(elapsed, showing.hold_ms, FADE_MS, MAX_ALPHA)))
     }) {
         Some(v) => v,
         None => return,
@@ -473,7 +552,7 @@ unsafe fn on_paint(hwnd: HWND) {
         FillRect(hdc, &rect, brush);
         let _ = DeleteObject(brush);
 
-        if let Some((mode, _)) = state.showing {
+        if let Some(Showing { mode, .. }) = state.showing {
             let old_font = state
                 .font
                 .map(|(font, _)| SelectObject(hdc, font))

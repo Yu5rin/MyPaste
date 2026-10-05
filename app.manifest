@@ -17,6 +17,14 @@
     </application>
   </compatibility>
 
+  <!-- 設定画面のボタンなどを Windows のテーマで描く（Common Controls v6）。 -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0"
+                        processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*" />
+    </dependentAssembly>
+  </dependency>
+
   <!-- 高 DPI 対応。 -->
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>

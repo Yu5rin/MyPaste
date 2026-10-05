@@ -1,6 +1,7 @@
 //! アタイの貼り付け — エントリーポイント。
 //!
 //! Excel 使用時に `Ctrl+B` を `Ctrl+Shift+V` にリマップする常駐アプリ。
+//! キーの組み合わせと対象アプリは設定画面（[`settings_window`]）で変えられる。
 //!
 //! ## スレッド構成
 //! - **フックスレッド**: 低レベルキーボードフックを設置し、メッセージループを回して
@@ -14,6 +15,8 @@
 //! - **入力モード表示スレッド**: IME の入力モードを監視し、切り替えた瞬間に
 //!   画面中央へ表示する（[`ime_indicator`]）。独自のメッセージループを持ち、
 //!   終了時に WM_QUIT を送って止める。
+//! - **設定画面スレッド**: 設定画面を開いている間だけ動く（[`settings_window`]）。
+//!   保存した内容はチャネルでメインスレッドへ送り、メインスレッドが反映する。
 //! - **更新スレッド**: 更新の確認・ダウンロード・適用を行う。通信が起動や
 //!   キー操作を妨げないよう、必ず別スレッドで実行する。多重実行の防止は
 //!   `update::run` 内部で行う。
@@ -28,7 +31,9 @@ mod http;
 mod ime_indicator;
 mod ime_logic;
 mod keyboard;
+mod remap_logic;
 mod sendinput;
+mod settings_window;
 mod startup;
 mod tray;
 mod update;
@@ -54,6 +59,10 @@ pub enum TrayMessage {
     ToggleStartup,
     /// 入力モード表示 ON/OFF 切替
     ToggleImeIndicator,
+    /// 設定画面を開く
+    OpenSettings,
+    /// 設定画面で保存された（settings.json への書き込みは済んでいる。反映だけ行う）
+    SettingsSaved(Box<config::Settings>),
     /// 更新を確認（メニューからの手動操作）
     CheckUpdate,
     /// 更新ファイルのダウンロード進捗（パーセント）
@@ -70,7 +79,10 @@ fn main() {
 
     // 前回の更新で残った .old があれば削除する。
     update::cleanup_old();
-    let settings = config::Settings::load();
+    let mut settings = config::Settings::load();
+
+    // キーリマップのキーと対象アプリを、フックを設置する前に決めておく。
+    let hotkey = configure_remap(&settings);
 
     // --- フックスレッドを起動し、そのスレッド ID を受け取る ---
     // 設置に失敗した場合は Err(エラー内容) が届く。詳細をダイアログに出せるよう
@@ -113,6 +125,7 @@ fn main() {
 
     let mut tray = match tray::build(
         tx.clone(),
+        &hotkey,
         keyboard::is_enabled(),
         startup::is_enabled(),
         ime_indicator.is_some() && ime_indicator::is_enabled(),
@@ -178,6 +191,7 @@ fn main() {
                 }
                 let on = !ime_indicator::is_enabled();
                 ime_indicator::set_enabled(on);
+                settings.ime_indicator.enabled = on;
                 if let Err(e) = tray.set_ime_indicator_checked(on) {
                     log::warn!("メニュー更新失敗: {e}");
                 }
@@ -193,6 +207,33 @@ fn main() {
                     );
                 }
                 log::info!("入力モード表示: {}", if on { "有効" } else { "無効" });
+            }
+            TrayMessage::OpenSettings => {
+                // トレイで切り替えた入力モード表示の ON/OFF は settings にも入れてあるが、
+                // 念のため実際の状態を渡す。
+                let mut current = settings.clone();
+                current.ime_indicator.enabled = ime_indicator::is_enabled();
+                settings_window::open(tx.clone(), current, startup::is_enabled());
+            }
+            TrayMessage::SettingsSaved(saved) => {
+                settings = *saved;
+                let hotkey = configure_remap(&settings);
+                ime_indicator::set_params(settings.ime_indicator.hold_ms, settings.ime_indicator.size);
+                if ime_indicator.is_some() {
+                    ime_indicator::set_enabled(settings.ime_indicator.enabled);
+                }
+                if let Err(e) = tray.set_remap_hotkey(&hotkey, keyboard::is_enabled()) {
+                    log::warn!("メニュー更新失敗: {e}");
+                }
+                if let Err(e) = tray.set_ime_indicator_checked(
+                    ime_indicator.is_some() && ime_indicator::is_enabled(),
+                ) {
+                    log::warn!("メニュー更新失敗: {e}");
+                }
+                if let Err(e) = tray.set_startup_checked(startup::is_enabled()) {
+                    log::warn!("メニュー更新失敗: {e}");
+                }
+                log::info!("設定を反映しました（キー: {}）", hotkey.format());
             }
             TrayMessage::CheckUpdate => {
                 // 手動確認。結果（最新である／失敗した）もダイアログで知らせる。
@@ -221,13 +262,33 @@ fn main() {
         }
     }
 
-    // --- 後始末: 入力モード表示とフックスレッドを終了させて待つ ---
+    // --- 後始末: 設定画面・入力モード表示・フックスレッドを終了させて待つ ---
+    settings_window::close();
     if let Some(indicator) = ime_indicator {
         indicator.stop();
     }
     post_quit(hook_tid);
     let _ = hook_thread.join();
     log::info!("アタイの貼り付け 終了");
+}
+
+/// 設定からキーリマップのキーと対象アプリを決めてフックへ渡し、使うキーを返す。
+///
+/// settings.json に使えないキーが書かれていた場合は、既定の Ctrl+B で動く。
+fn configure_remap(settings: &config::Settings) -> remap_logic::Hotkey {
+    let (hotkey, invalid) = remap_logic::Hotkey::from_setting(&settings.remap.hotkey);
+    if let Some(why) = invalid {
+        log::warn!(
+            "settings.json のキー「{}」は使えないため {} で動きます: {why}",
+            settings.remap.hotkey,
+            hotkey.format()
+        );
+    }
+    keyboard::configure(
+        hotkey,
+        remap_logic::effective_target_apps(&settings.remap.target_apps),
+    );
+    hotkey
 }
 
 /// フックスレッド本体。フックを設置し、メッセージループを回す。

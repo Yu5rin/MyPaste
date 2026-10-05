@@ -1,6 +1,8 @@
-//! 更新確認の設定と状態。
+//! 設定と更新確認の状態。
 //!
-//! - **設定** (`settings.json`): 利用者が編集する項目。更新の確認先 URL などを保持する。
+//! - **設定** (`settings.json`): 利用者が編集する項目。キーリマップのキーや対象アプリ、
+//!   入力モード表示、更新の確認先 URL などを保持する。設定画面（[`crate::settings_window`]）
+//!   からも書き換えられる。
 //!   ファイルが無い場合や壊れている場合は既定値で動作する（起動を妨げない）。
 //! - **状態** (`update_state.json`): アプリが書き込む項目。前回の確認時刻を保持する。
 //!   既定では起動のたびに確認するため使わないが、`check_interval_hours` に
@@ -24,9 +26,31 @@ const STATE_FILE: &str = "update_state.json";
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// キーリマップ（[`crate::keyboard`]）。
+    pub remap: RemapSettings,
     pub update: UpdateSettings,
     /// IME 入力モードの画面中央表示（[`crate::ime_indicator`]）。
     pub ime_indicator: ImeIndicatorSettings,
+}
+
+/// キーリマップに関する設定。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RemapSettings {
+    /// 値貼り付けを起動するキーの組み合わせ（例 `"Ctrl+B"`）。
+    /// 書き方は [`crate::remap_logic::Hotkey::parse`] を参照。
+    pub hotkey: String,
+    /// リマップする対象アプリのプロセス名（例 `"EXCEL.EXE"`）。
+    pub target_apps: Vec<String>,
+}
+
+impl Default for RemapSettings {
+    fn default() -> Self {
+        Self {
+            hotkey: crate::remap_logic::DEFAULT_HOTKEY.to_string(),
+            target_apps: vec![crate::remap_logic::DEFAULT_TARGET_APP.to_string()],
+        }
+    }
 }
 
 /// IME 入力モードの画面中央表示に関する設定。
@@ -137,34 +161,83 @@ impl Settings {
     }
 }
 
-/// IME 入力モード表示の ON/OFF だけを `settings.json` に書き込む。
-///
-/// ファイル全体を [`Settings`] で書き直すと、利用者が書いた未知の項目や
-/// 書式が失われるため、JSON として読んでこの 1 項目だけを差し替える。
-/// ファイルが読めない・JSON として解釈できない場合は、利用者の編集内容を
-/// 壊さないよう**書き込まずに** `Err` を返す（今回の切り替えはメモリ上だけ有効）。
+/// IME 入力モード表示の ON/OFF だけを `settings.json` に書き込む（トレイメニューから使う）。
 pub fn save_ime_indicator_enabled(enabled: bool) -> Result<(), String> {
+    save_patch(&serde_json::json!({ "ime_indicator": { "enabled": enabled } }))
+}
+
+/// 設定画面で編集する項目だけを `settings.json` に書き込む。
+///
+/// 更新の確認先 URL など、設定画面に出していない項目には触れない。
+pub fn save_from_settings_window(settings: &Settings) -> Result<(), String> {
+    save_patch(&serde_json::json!({
+        "remap": {
+            "hotkey": settings.remap.hotkey,
+            "target_apps": settings.remap.target_apps,
+        },
+        "ime_indicator": {
+            "enabled": settings.ime_indicator.enabled,
+            "hold_ms": settings.ime_indicator.hold_ms,
+            "size": settings.ime_indicator.size,
+        },
+        "update": {
+            "check_on_startup": settings.update.check_on_startup,
+        },
+    }))
+}
+
+/// `patch` に書かれた項目だけを `settings.json` に上書きする。
+///
+/// ファイル全体を [`Settings`] で書き直すと、利用者が書いた未知の項目が
+/// 失われるため、JSON として読んで差分だけを重ねる（[`merge_json`]）。
+/// ファイルが読めない・JSON として解釈できない場合は、利用者の編集内容を
+/// 壊さないよう**書き込まずに** `Err` を返す。
+fn save_patch(patch: &serde_json::Value) -> Result<(), String> {
     let path = settings_path().ok_or("設定ファイルの場所を決められません")?;
     let mut root: serde_json::Value = match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(strip_bom(&text))
-            .map_err(|e| format!("settings.json を解釈できないため保存しませんでした: {e}"))?,
+        Ok(text) => serde_json::from_str(strip_bom(&text)).map_err(|e| {
+            format!(
+                "settings.json を解釈できないため保存しませんでした。\n\
+                 ファイルを直すか、削除してからもう一度保存してください。\n\n{}\n{e}",
+                path.display()
+            )
+        })?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             serde_json::to_value(Settings::default()).map_err(|e| e.to_string())?
         }
         Err(e) => return Err(format!("settings.json を読めないため保存しませんでした: {e}")),
     };
-    let obj = root
-        .as_object_mut()
-        .ok_or("settings.json の形が想定と違うため保存しませんでした")?;
-    let section = obj
-        .entry("ime_indicator")
-        .or_insert_with(|| serde_json::json!({}));
-    let section = section
-        .as_object_mut()
-        .ok_or("settings.json の ime_indicator の形が想定と違うため保存しませんでした")?;
-    section.insert("enabled".into(), serde_json::Value::Bool(enabled));
+    if !root.is_object() {
+        return Err("settings.json の形が想定と違うため保存しませんでした".into());
+    }
+    merge_json(&mut root, patch);
     let text = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
     std::fs::write(&path, text).map_err(|e| format!("settings.json に書き込めませんでした: {e}"))
+}
+
+/// `patch` を `base` に重ねる。オブジェクト同士は項目ごとに再帰的に重ね、
+/// それ以外（値・配列）は `patch` の値で置き換える。`patch` に無い項目は残す。
+fn merge_json(base: &mut serde_json::Value, patch: &serde_json::Value) {
+    match (base, patch) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(patch)) => {
+            for (key, value) in patch {
+                match base.get_mut(key) {
+                    Some(existing) if existing.is_object() && value.is_object() => {
+                        merge_json(existing, value)
+                    }
+                    _ => {
+                        base.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (base, patch) => *base = patch.clone(),
+    }
+}
+
+/// 設定ファイルのパス（設定画面の「設定ファイルの場所を開く」で使う）。
+pub fn settings_file() -> Option<PathBuf> {
+    settings_path()
 }
 
 /// 文字列の先頭に UTF-8 の BOM (`\u{feff}`) が付いていれば取り除く。
@@ -256,7 +329,7 @@ pub fn is_writable(dir: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_due, strip_bom};
+    use super::{is_due, merge_json, strip_bom, Settings};
 
     const HOUR: u64 = 3600;
 
@@ -277,6 +350,48 @@ mod tests {
         // 途中に現れる U+FEFF はそのまま残す（BOM は先頭にのみ意味を持つ）。
         let text = "a\u{feff}b";
         assert_eq!(strip_bom(text), text);
+    }
+
+    #[test]
+    fn merge_keeps_unknown_items_and_overwrites_given_ones() {
+        let mut base = serde_json::json!({
+            "update": { "api_url": "https://example.invalid/", "check_on_startup": true },
+            "ime_indicator": { "enabled": true, "hold_ms": 400 },
+            "my_note": "利用者が書いたメモ",
+        });
+        merge_json(
+            &mut base,
+            &serde_json::json!({
+                "update": { "check_on_startup": false },
+                "ime_indicator": { "enabled": false },
+                "remap": { "hotkey": "Ctrl+Q", "target_apps": ["EXCEL.EXE", "ET.EXE"] },
+            }),
+        );
+        assert_eq!(
+            base,
+            serde_json::json!({
+                "update": { "api_url": "https://example.invalid/", "check_on_startup": false },
+                "ime_indicator": { "enabled": false, "hold_ms": 400 },
+                "my_note": "利用者が書いたメモ",
+                "remap": { "hotkey": "Ctrl+Q", "target_apps": ["EXCEL.EXE", "ET.EXE"] },
+            })
+        );
+    }
+
+    #[test]
+    fn merge_replaces_arrays_instead_of_appending() {
+        let mut base = serde_json::json!({ "remap": { "target_apps": ["A.EXE", "B.EXE"] } });
+        merge_json(&mut base, &serde_json::json!({ "remap": { "target_apps": ["C.EXE"] } }));
+        assert_eq!(base, serde_json::json!({ "remap": { "target_apps": ["C.EXE"] } }));
+    }
+
+    #[test]
+    fn old_settings_file_gets_remap_defaults() {
+        // v1.3.0 以前の settings.json には remap が無い。既定の Ctrl+B / Excel になること。
+        let s: Settings = serde_json::from_str(r#"{ "update": { "check_on_startup": false } }"#).unwrap();
+        assert_eq!(s.remap.hotkey, "Ctrl+B");
+        assert_eq!(s.remap.target_apps, ["EXCEL.EXE"]);
+        assert!(!s.update.check_on_startup);
     }
 
     #[test]

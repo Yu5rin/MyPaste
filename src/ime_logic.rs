@@ -13,6 +13,13 @@ pub const CMODE_KATAKANA: u32 = 0x0002;
 /// 変換モードのビット（`IME_CMODE_FULLSHAPE`）。立っていれば全角。
 pub const CMODE_FULLSHAPE: u32 = 0x0008;
 
+/// 表示時間（ミリ秒）として設定できる範囲。
+pub const HOLD_MS_MIN: u64 = 100;
+pub const HOLD_MS_MAX: u64 = 5000;
+/// 表示の一辺（96 DPI 基準のピクセル）として設定できる範囲。
+pub const SIZE_MIN: u32 = 40;
+pub const SIZE_MAX: u32 = 600;
+
 /// 画面に出す入力モード。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImeMode {

@@ -12,6 +12,7 @@ use std::sync::mpsc::Sender;
 
 use tray_item::{IconSource, TrayItem};
 
+use crate::remap_logic::Hotkey;
 use crate::TrayMessage;
 
 /// ON 時のアイコン（app.rc で埋め込んだリソース名）。
@@ -24,12 +25,16 @@ const MARK_ON: &str = "✔ ";
 /// 無効時にラベル先頭へ付ける印（「✔」と同じ幅で字下げを揃える）。
 const MARK_OFF: &str = "　 ";
 
-/// キーリマップ機能のメニュー文言。
-const LABEL_REMAP: &str = "Ctrl+B で値貼り付け";
+/// キーリマップ機能のメニュー文言（先頭に設定したキーの組み合わせが付く）。
+fn remap_label(hotkey: &Hotkey) -> String {
+    format!("{} で値貼り付け", hotkey.format())
+}
 /// 自動起動のメニュー文言。
 const LABEL_STARTUP: &str = "自動起動";
 /// 入力モード表示のメニュー文言。
 const LABEL_IME_INDICATOR: &str = "入力モードを画面中央に表示";
+/// 設定画面のメニュー文言。
+const LABEL_SETTINGS: &str = "設定...";
 /// 更新確認のメニュー文言。
 const LABEL_CHECK_UPDATE: &str = "更新を確認";
 
@@ -51,6 +56,8 @@ fn app_title() -> String {
 pub struct Menu {
     tray: TrayItem,
     remap_id: u32,
+    /// キーリマップ項目の文言（チェックの印を除く）。
+    remap_text: String,
     startup_id: u32,
     ime_indicator_id: u32,
 }
@@ -64,10 +71,20 @@ impl Menu {
 
     /// キーリマップ項目のチェック状態を更新する。
     pub fn set_remap_checked(&mut self, checked: bool) -> Result<(), tray_item::TIError> {
-        let label = labeled(LABEL_REMAP, checked);
+        let label = labeled(&self.remap_text, checked);
         self.tray
             .inner_mut()
             .set_menu_item_label(&label, self.remap_id)
+    }
+
+    /// キーリマップ項目の文言を、設定したキーの組み合わせに合わせて更新する。
+    pub fn set_remap_hotkey(
+        &mut self,
+        hotkey: &Hotkey,
+        checked: bool,
+    ) -> Result<(), tray_item::TIError> {
+        self.remap_text = remap_label(hotkey);
+        self.set_remap_checked(checked)
     }
 
     /// 自動起動項目のチェック状態を更新する。
@@ -110,11 +127,13 @@ fn labeled(text: &str, checked: bool) -> String {
 /// 返した [`Menu`] は生存している間だけトレイに表示されるため、
 /// 呼び出し側で保持し続けること。
 ///
+/// - `hotkey`: 値貼り付けを起動するキーの組み合わせ（メニューの文言に使う）
 /// - `enabled`: 起動時のキーリマップ有効状態
 /// - `startup`: 起動時の自動起動設定状態
 /// - `ime_indicator`: 起動時の入力モード表示の有効状態
 pub fn build(
     tx: Sender<TrayMessage>,
+    hotkey: &Hotkey,
     enabled: bool,
     startup: bool,
     ime_indicator: bool,
@@ -129,9 +148,10 @@ pub fn build(
 
     // キーリマップの有効／無効
     let tx_toggle = tx.clone();
+    let remap_text = remap_label(hotkey);
     let remap_id = tray
         .inner_mut()
-        .add_menu_item_with_id(&labeled(LABEL_REMAP, enabled), move || {
+        .add_menu_item_with_id(&labeled(&remap_text, enabled), move || {
             let _ = tx_toggle.send(TrayMessage::Toggle);
         })?;
 
@@ -155,6 +175,12 @@ pub fn build(
     // 設定項目と操作項目を区切る。
     tray.inner_mut().add_separator()?;
 
+    // 設定画面
+    let tx_settings = tx.clone();
+    tray.add_menu_item(LABEL_SETTINGS, move || {
+        let _ = tx_settings.send(TrayMessage::OpenSettings);
+    })?;
+
     // 更新の確認（押したときだけ通信する）
     let tx_update = tx.clone();
     tray.add_menu_item(LABEL_CHECK_UPDATE, move || {
@@ -173,6 +199,7 @@ pub fn build(
     Ok(Menu {
         tray,
         remap_id,
+        remap_text,
         startup_id,
         ime_indicator_id,
     })

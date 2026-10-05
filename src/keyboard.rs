@@ -1,11 +1,16 @@
 //! 低レベルキーボードフック（WH_KEYBOARD_LL）。
 //!
-//! Excel が最前面かつ ON 状態のときに限り、`Ctrl+B` を握りつぶして
-//! `Ctrl+Shift+V` を送出する。それ以外のキーやアプリはそのまま通過させる。
+//! 対象アプリ（既定は Excel）が最前面かつ ON 状態のときに限り、設定したキーの
+//! 組み合わせ（既定は `Ctrl+B`）を握りつぶして `Ctrl+Shift+V` を送出する。
+//! それ以外のキーやアプリはそのまま通過させる。
+//!
+//! キーの組み合わせと対象アプリは [`configure`] で起動中にも差し替えられる
+//! （設定画面で保存したとき）。
 //!
 //! ON/OFF 状態はメモリ上（[`ENABLED`]）にのみ保持し、終了時にリセットされる。
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::RwLock;
 
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -17,6 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
+use crate::remap_logic::Hotkey;
 use crate::{excel_check, sendinput};
 
 /// ON/OFF 状態（起動時 ON、メモリのみ・終了時リセット）。
@@ -25,12 +31,39 @@ static ENABLED: AtomicBool = AtomicBool::new(true);
 /// 設置済みフックハンドルの生ポインタ値。0 は未設置。
 static HOOK_HANDLE: AtomicIsize = AtomicIsize::new(0);
 
-/// Ctrl+B のリマップ中フラグ。押しっぱなし（オートリピート）で
-/// 何度も貼り付けが走らないよう、最初の押下でのみ送出するために使う。
-static B_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// リマップ中のキー（仮想キーコード。0 はリマップしていない）。押しっぱなし
+/// （オートリピート）で何度も貼り付けが走らないよう、最初の押下でのみ送出し、
+/// 離すまでの押下と、対応する解放を握りつぶすために使う。
+static ACTIVE_VK: AtomicU32 = AtomicU32::new(0);
 
-/// 監視対象キー: 'B'
-const VK_B: u32 = 0x42;
+/// 起動するキーの組み合わせ（[`Hotkey::pack`] の値）。既定は Ctrl+B。
+static HOTKEY: AtomicU32 = AtomicU32::new(0x0142);
+
+/// 対象アプリのプロセス名（大文字）。
+static TARGET_APPS: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
+/// キーの組み合わせと対象アプリを設定する（起動時と、設定画面で保存したとき）。
+pub fn configure(hotkey: Hotkey, target_apps: Vec<String>) {
+    HOTKEY.store(hotkey.pack(), Ordering::SeqCst);
+    match TARGET_APPS.write() {
+        Ok(mut apps) => *apps = target_apps,
+        Err(poisoned) => *poisoned.into_inner() = target_apps,
+    }
+}
+
+/// 現在のキーの組み合わせ。
+pub fn hotkey() -> Hotkey {
+    Hotkey::unpack(HOTKEY.load(Ordering::SeqCst))
+}
+
+/// 最前面のウィンドウが対象アプリか。
+fn is_target_foreground() -> bool {
+    let apps = match TARGET_APPS.read() {
+        Ok(apps) => apps,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    excel_check::is_target_foreground(&apps)
+}
 
 /// 現在 ON かどうか。
 pub fn is_enabled() -> bool {
@@ -81,11 +114,11 @@ fn is_down(vk: VIRTUAL_KEY) -> bool {
     unsafe { (GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000) != 0 }
 }
 
-/// Ctrl のみが押されている（Shift/Alt/Win は押されていない）か。
-fn ctrl_only() -> bool {
-    is_down(VK_CONTROL)
-        && !is_down(VK_SHIFT)
-        && !is_down(VK_MENU)
+/// 押されている修飾キーが、設定した組み合わせとちょうど一致するか（Win キーは不可）。
+fn modifiers_match(hotkey: &Hotkey) -> bool {
+    is_down(VK_CONTROL) == hotkey.ctrl
+        && is_down(VK_SHIFT) == hotkey.shift
+        && is_down(VK_MENU) == hotkey.alt
         && !is_down(VK_LWIN)
         && !is_down(VK_RWIN)
 }
@@ -104,23 +137,35 @@ unsafe extern "system" fn low_level_keyboard_proc(
         let injected = (kb.flags.0 & LLKHF_INJECTED.0) != 0;
         let is_self = kb.dwExtraInfo == sendinput::EXTRA_INFO_SIGNATURE;
 
-        // 自分が送った入力・注入入力は対象外。対象キーは 'B' のみ。
-        if !injected && !is_self && kb.vkCode == VK_B {
+        // 自分が送った入力・注入入力は対象外。
+        if !injected && !is_self {
+            let hotkey = hotkey();
             match message {
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
-                    // Excel かつ ON かつ Ctrl 単独のときだけリマップする。
-                    if ctrl_only() && is_enabled() && excel_check::is_excel_foreground() {
-                        // 最初の押下でのみ送出（オートリピートでは再送しない）。
-                        if !B_ACTIVE.swap(true, Ordering::SeqCst) {
-                            sendinput::send_ctrl_shift_v();
-                            log::debug!("Ctrl+B -> Ctrl+Shift+V (Excel, ON)");
-                        }
-                        // 押下中はオリジナルの Ctrl+B を常に破棄する。
+                    // リマップ中のキーの押しっぱなし（オートリピート）は、修飾キーの
+                    // 状態にかかわらず離すまで握りつぶす（再送もしない）。
+                    if kb.vkCode == ACTIVE_VK.load(Ordering::SeqCst) {
+                        return LRESULT(1);
+                    }
+                    // 対象アプリかつ ON かつ修飾キーが一致するときだけリマップする。
+                    if kb.vkCode == hotkey.vk
+                        && modifiers_match(&hotkey)
+                        && is_enabled()
+                        && is_target_foreground()
+                    {
+                        ACTIVE_VK.store(kb.vkCode, Ordering::SeqCst);
+                        sendinput::send_paste_values(&hotkey);
+                        log::debug!("{} -> Ctrl+Shift+V", hotkey.format());
                         return LRESULT(1);
                     }
                 }
                 // 押下を握りつぶしていた場合は、対応する解放も握りつぶす。
-                WM_KEYUP | WM_SYSKEYUP if B_ACTIVE.swap(false, Ordering::SeqCst) => {
+                WM_KEYUP | WM_SYSKEYUP
+                    if kb.vkCode != 0
+                        && ACTIVE_VK
+                            .compare_exchange(kb.vkCode, 0, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok() =>
+                {
                     return LRESULT(1);
                 }
                 _ => {}

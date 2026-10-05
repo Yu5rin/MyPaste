@@ -1,7 +1,8 @@
-//! Excel 判定。
+//! 対象アプリの判定（既定は Excel）。
 //!
-//! フォアグラウンドウィンドウのプロセスイメージ名が `EXCEL.EXE` の場合にのみ
-//! `true` を返す。判定は以下の Win32 API を使う:
+//! フォアグラウンドウィンドウのプロセスイメージ名が、設定した対象アプリ
+//! （既定は `EXCEL.EXE`）のいずれかの場合にのみ `true` を返す。判定は以下の
+//! Win32 API を使う:
 //!
 //! - `GetForegroundWindow` … 最前面ウィンドウのハンドル
 //! - `GetWindowThreadProcessId` … そのウィンドウのプロセス ID
@@ -15,27 +16,34 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-/// 比較対象のイメージ名（大文字小文字は無視して比較する）。
-const EXCEL_IMAGE_NAME: &str = "EXCEL.EXE";
+use crate::remap_logic;
 
-/// 最前面のウィンドウが Excel（EXCEL.EXE）かどうかを返す。
-pub fn is_excel_foreground() -> bool {
+/// 最前面のウィンドウが対象アプリのいずれかかを返す（大文字小文字は区別しない）。
+pub fn is_target_foreground(apps: &[String]) -> bool {
+    if apps.is_empty() {
+        return false;
+    }
+    foreground_image_name().is_some_and(|name| remap_logic::is_target_app(&name, apps))
+}
+
+/// 最前面のウィンドウのプロセスのファイル名（例 `EXCEL.EXE`）。取れなければ `None`。
+fn foreground_image_name() -> Option<String> {
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.is_invalid() {
-            return false;
+            return None;
         }
 
         let mut pid: u32 = 0;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
         if pid == 0 {
-            return false;
+            return None;
         }
 
         // 名前取得に必要な最小限の権限だけを要求する。
         let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
             Ok(h) => h,
-            Err(_) => return false,
+            Err(_) => return None,
         };
 
         let mut buf = [0u16; 1024];
@@ -49,7 +57,7 @@ pub fn is_excel_foreground() -> bool {
         let _ = CloseHandle(handle);
 
         if result.is_err() {
-            return false;
+            return None;
         }
 
         let full_path = String::from_utf16_lossy(&buf[..len as usize]);
@@ -59,6 +67,6 @@ pub fn is_excel_foreground() -> bool {
             .next()
             .unwrap_or(full_path.as_str());
 
-        file_name.eq_ignore_ascii_case(EXCEL_IMAGE_NAME)
+        Some(file_name.to_string())
     }
 }

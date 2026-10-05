@@ -52,6 +52,8 @@ features = [
     "Win32_UI_Input_Ime",
     "Win32_Graphics_Gdi",
     "Win32_UI_HiDpi",
+    # 設定画面（標準コントロール）
+    "Win32_UI_Controls",
 ]
 
 # 開発時のログを完全に無効化したい本番ビルド向けの feature
