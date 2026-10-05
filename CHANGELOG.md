@@ -2,7 +2,7 @@
 
 本プロジェクトの主な変更点をまとめます。バージョンは [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
-## [Unreleased]
+## [1.3.0] - 2026-10-05
 
 ### 追加
 - **IME の入力モードを画面中央に表示する機能**。`あ` / `A` / `カ` / `ｶ` / `Ａ` を
@@ -192,6 +192,7 @@ UX と品質の総点検で見つかった問題への対応。
 - ON/OFF 切替は右クリックメニューから行う（左クリックによるトグルは `tray-item` の制約により非対応）。
 - 他ソフトとのキー競合は対象外。
 
+[1.3.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.3.0
 [1.2.3]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.2.3
 [1.2.2]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.2.2
 [1.2.1]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.2.1
