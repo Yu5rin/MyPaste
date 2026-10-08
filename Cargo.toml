@@ -1,6 +1,6 @@
 [package]
 name = "Atai-paste"
-version = "1.5.0"
+version = "1.5.1"
 edition = "2021"
 description = "Excel使用時に Ctrl+B を Ctrl+Shift+V にリマップする常駐アプリ「アタイの貼り付け」"
 authors = ["Yu5rin"]
@@ -55,6 +55,8 @@ features = [
     # キー割り当ての「書式なしで貼り付け」（クリップボード）
     "Win32_System_DataExchange",
     "Win32_System_Memory",
+    # 二重起動の防止（CreateMutexW の引数の型に要る）
+    "Win32_Security",
 ]
 
 [features]

@@ -41,6 +41,7 @@ mod keyboard;
 mod remap_logic;
 mod sendinput;
 mod settings_window;
+mod single_instance;
 mod startup;
 mod tray;
 mod ui;
@@ -89,6 +90,10 @@ pub enum TrayMessage {
 
 fn main() {
     logging::init();
+    // 二重起動は、何も表示せずに終わる（すでに動いている方をそのまま使ってもらう）。
+    let Some(_instance) = single_instance::acquire() else {
+        return;
+    };
     let mut settings = config::Settings::load();
     // 動作の記録は設定で ON にしたときだけ残す（開発用のビルドでは常に残す）。
     logging::set_enabled(settings.log.enabled);

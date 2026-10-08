@@ -75,6 +75,7 @@ src/
  ├ hotkey_rules.rs  // キー割り当ての解釈と検証（Win32 非依存）
  ├ actions.rs       // キー割り当ての動作の実行
  ├ ui.rs            // 画面の共通部品
+ ├ single_instance.rs // 二重起動の防止
  ├ tray.rs          // タスクトレイ制御（tray-item）
  ├ startup.rs       // 自動起動設定（スタートアップの .lnk 作成／削除）
  ├ ime_indicator.rs // 入力モードの画面中央表示（IME 状態の監視・表示ウィンドウ）

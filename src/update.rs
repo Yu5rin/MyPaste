@@ -677,7 +677,12 @@ pub fn run(settings: Settings, tx: Sender<TrayMessage>, manual: bool) {
     let _ = std::fs::remove_file(&downloaded);
 
     // 新しい実行ファイルを起動して、自分は終了する。
-    match std::process::Command::new(&installed).spawn() {
+    // 新しい版は二重起動の防止に掛かるので、更新後の起動であることを伝え、
+    // こちらが終わるのを待ってもらう。
+    match std::process::Command::new(&installed)
+        .arg(crate::single_instance::AFTER_UPDATE_ARG)
+        .spawn()
+    {
         Ok(_) => {
             log::info!("新しいバージョンを起動しました。終了します");
             let _ = tx.send(TrayMessage::Quit);
