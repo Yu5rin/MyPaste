@@ -16,9 +16,12 @@ use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
+    GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Memory::{
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Shell::ShellExecuteW;
@@ -37,6 +40,10 @@ const CF_UNICODETEXT: u32 = 13;
 /// クリップボードがほかのアプリに使われているときに、開き直す回数と間隔。
 const CLIPBOARD_RETRIES: u32 = 10;
 const CLIPBOARD_RETRY_WAIT: Duration = Duration::from_millis(20);
+
+/// 「まとめて貼り付ける」で、Ctrl+V を送ってから元のクリップボードに戻すまでの待ち時間。
+/// 貼り付け先のアプリがクリップボードを読み終える前に戻すと、元の内容が貼り付けられてしまう。
+const PASTE_RESTORE_WAIT: Duration = Duration::from_millis(500);
 
 /// 実行の依頼。
 struct Request {
@@ -107,10 +114,18 @@ unsafe fn execute(request: Request) {
             log::debug!("キー割り当て: キーを送ります（{}）", hotkey_rules::format_key_sequence(&keys));
             sendinput::send_key_sequence(&held, &keys);
         }
-        Action::TypeText(text) => {
+        Action::TypeText { text, paste } => {
             let text = hotkey_rules::expand_placeholders(&text, &local_time());
-            log::debug!("キー割り当て: 文字を入力します（{} 文字）", text.chars().count());
-            sendinput::send_text(&held, &text);
+            if paste {
+                log::debug!(
+                    "キー割り当て: 文字をまとめて貼り付けます（{} 文字）",
+                    text.chars().count()
+                );
+                paste_text(&held, &text);
+            } else {
+                log::debug!("キー割り当て: 文字を 1 文字ずつ入力します（{} 文字）", text.chars().count());
+                sendinput::send_text(&held, &text);
+            }
         }
         Action::Run { target, args } => {
             sendinput::suppress_menu(&held);
@@ -170,21 +185,133 @@ unsafe fn paste_plain(held: &Hotkey) {
         ime_indicator::notify("空");
         return;
     };
-    if let Err(e) = write_clipboard_text(&text) {
+    if let Err(e) = write_clipboard(&text, false) {
         log::error!("キー割り当て: クリップボードに書き込めませんでした: {e}");
         sendinput::release_modifiers(held);
         ime_indicator::notify("失敗");
         return;
     }
     log::debug!("キー割り当て: 書式なしで貼り付けます（{} 文字）", text.chars().count());
-    let ctrl_v = Hotkey {
+    sendinput::send_key_sequence(held, &[ctrl_v()]);
+}
+
+/// 文字をまとめて（一度に）貼り付ける。
+///
+/// 今のクリップボードの内容を控えてから、文字だけをクリップボードに入れて Ctrl+V を送り、
+/// 少し待って元の内容に戻す。1 文字ずつ送るのと違い、IME の状態や入力補完に左右されず、
+/// 長い文でも一瞬で入る。入れる文字はクリップボードの履歴（Win+V）に残さない。
+/// 待っている間に利用者が別のものをコピーした場合は、それを消さないよう元に戻さない。
+unsafe fn paste_text(held: &Hotkey, text: &str) {
+    let saved = snapshot_clipboard();
+    if let Err(e) = write_clipboard(text, true) {
+        // クリップボードが使えないときは、1 文字ずつ入力する。
+        log::warn!("キー割り当て: クリップボードを使えないため 1 文字ずつ入力します: {e}");
+        sendinput::send_text(held, text);
+        return;
+    }
+    let ours = GetClipboardSequenceNumber();
+    sendinput::send_key_sequence(held, &[ctrl_v()]);
+    std::thread::sleep(PASTE_RESTORE_WAIT);
+
+    if GetClipboardSequenceNumber() != ours {
+        log::debug!("キー割り当て: クリップボードが新しくなったため、元に戻しません");
+        return;
+    }
+    match saved {
+        Some(saved) => {
+            if let Err(e) = restore_clipboard(&saved) {
+                log::warn!("キー割り当て: クリップボードを元に戻せませんでした: {e}");
+            }
+        }
+        None => {
+            // もともと空（または控えられなかった）なら、空に戻す。
+            if open_clipboard() {
+                let _ = EmptyClipboard();
+                let _ = CloseClipboard();
+            }
+        }
+    }
+}
+
+/// Ctrl+V。
+fn ctrl_v() -> Hotkey {
+    Hotkey {
         ctrl: true,
         shift: false,
         alt: false,
         win: false,
         vk: 0x56,
-    };
-    sendinput::send_key_sequence(held, &[ctrl_v]);
+    }
+}
+
+/// 控えたクリップボードの内容（形式と中身）。
+struct ClipboardSnapshot(Vec<(u32, Vec<u8>)>);
+
+/// メモリの中身として写し取れる形式か。画像（ビットマップ）やメタファイルなど、
+/// メモリ以外のもので渡される形式は写し取れないので除く（画像は CF_DIB として残る）。
+fn copyable_format(format: u32) -> bool {
+    !matches!(format, 2 | 3 | 9 | 14 | 0x80..=0x8E | 0x300..=0x3FF)
+}
+
+/// 今のクリップボードの内容を控える。空なら `None`。
+unsafe fn snapshot_clipboard() -> Option<ClipboardSnapshot> {
+    if !open_clipboard() {
+        return None;
+    }
+    let mut items = Vec::new();
+    let mut format = 0u32;
+    loop {
+        format = EnumClipboardFormats(format);
+        if format == 0 {
+            break;
+        }
+        if !copyable_format(format) {
+            continue;
+        }
+        let Ok(handle) = GetClipboardData(format) else {
+            continue;
+        };
+        let memory = HGLOBAL(handle.0);
+        let size = GlobalSize(memory);
+        let ptr = GlobalLock(memory) as *const u8;
+        if ptr.is_null() {
+            continue;
+        }
+        items.push((format, std::slice::from_raw_parts(ptr, size).to_vec()));
+        let _ = GlobalUnlock(memory);
+    }
+    let _ = CloseClipboard();
+    (!items.is_empty()).then_some(ClipboardSnapshot(items))
+}
+
+/// 控えた内容をクリップボードに戻す。
+unsafe fn restore_clipboard(saved: &ClipboardSnapshot) -> Result<(), String> {
+    if !open_clipboard() {
+        return Err("ほかのアプリがクリップボードを使っています".into());
+    }
+    let _ = EmptyClipboard();
+    for (format, data) in &saved.0 {
+        if let Ok(memory) = global_copy(data) {
+            if SetClipboardData(*format, HANDLE(memory.0)).is_err() {
+                let _ = GlobalFree(memory);
+            }
+        }
+    }
+    let _ = CloseClipboard();
+    Ok(())
+}
+
+/// バイト列を、クリップボードに渡せるメモリに写す。
+unsafe fn global_copy(data: &[u8]) -> Result<HGLOBAL, String> {
+    let memory = GlobalAlloc(GMEM_MOVEABLE, data.len().max(1)).map_err(|e| e.to_string())?;
+    let ptr = GlobalLock(memory) as *mut u8;
+    if ptr.is_null() {
+        let _ = GlobalFree(memory);
+        return Err("メモリを確保できませんでした".into());
+    }
+    std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+    let _ = GlobalUnlock(memory);
+    Ok(memory)
 }
 
 /// クリップボードを開く。ほかのアプリが使っている間は少し待って開き直す。
@@ -222,18 +349,13 @@ unsafe fn read_clipboard_text() -> Option<String> {
     text.filter(|t| !t.is_empty())
 }
 
-/// クリップボードを、文字だけ（書式なし）にする。
-unsafe fn write_clipboard_text(text: &str) -> Result<(), String> {
+/// クリップボードを、文字だけ（書式なし）にする。`exclude_history` が真なら、Windows の
+/// クリップボードの履歴（Win+V）やクラウドへの同期に残さないよう印を付ける
+/// （一時的に使うだけのとき）。
+unsafe fn write_clipboard(text: &str, exclude_history: bool) -> Result<(), String> {
     let units: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    let bytes = units.len() * std::mem::size_of::<u16>();
-    let memory = GlobalAlloc(GMEM_MOVEABLE, bytes).map_err(|e| e.to_string())?;
-    let ptr = GlobalLock(memory) as *mut u16;
-    if ptr.is_null() {
-        let _ = GlobalFree(memory);
-        return Err("メモリを確保できませんでした".into());
-    }
-    std::ptr::copy_nonoverlapping(units.as_ptr(), ptr, units.len());
-    let _ = GlobalUnlock(memory);
+    let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+    let memory = global_copy(&bytes)?;
 
     if !open_clipboard() {
         let _ = GlobalFree(memory);
@@ -246,6 +368,15 @@ unsafe fn write_clipboard_text(text: &str) -> Result<(), String> {
     if result.is_err() {
         // 渡せなかったメモリは自分で解放する（渡せたらクリップボードのものになる）。
         let _ = GlobalFree(memory);
+    } else if exclude_history {
+        let format = RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing"));
+        if format != 0 {
+            if let Ok(mark) = global_copy(&[0]) {
+                if SetClipboardData(format, HANDLE(mark.0)).is_err() {
+                    let _ = GlobalFree(mark);
+                }
+            }
+        }
     }
     let _ = CloseClipboard();
     result

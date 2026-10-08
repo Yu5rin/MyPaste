@@ -59,6 +59,9 @@ pub struct HotkeyRuleSetting {
     pub args: String,
     /// 効くアプリ（プロセス名）。空ならすべてのアプリ。
     pub apps: Vec<String>,
+    /// 「文字を入力する」の入れ方。`"paste"`（クリップボードを使って一度に貼り付ける。既定）か
+    /// `"keys"`（1 文字ずつキー入力として送る）。ほかの動作では使わない。
+    pub input: String,
 }
 
 impl Default for HotkeyRuleSetting {
@@ -70,6 +73,7 @@ impl Default for HotkeyRuleSetting {
             value: String::new(),
             args: String::new(),
             apps: Vec::new(),
+            input: "paste".to_string(),
         }
     }
 }
@@ -510,6 +514,8 @@ mod tests {
         assert!(!s.hotkeys[1].enabled);
         // 知らない動作でも設定ファイル全体は読める（その割り当てだけ使わない）
         assert_eq!(s.hotkeys[2].action, "そんな動作は無い");
+        // 入れ方を書かなければ、まとめて貼り付ける
+        assert_eq!(s.hotkeys[0].input, "paste");
     }
 
     #[test]

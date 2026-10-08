@@ -114,7 +114,9 @@ impl ActionKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     SendKeys(Vec<Hotkey>),
-    TypeText(String),
+    /// 文字を入力する。`paste` が真なら、クリップボードを使って一度に貼り付ける
+    /// （偽なら 1 文字ずつキー入力として送る）。
+    TypeText { text: String, paste: bool },
     Run { target: String, args: String },
     PastePlain,
     ToggleTopmost,
@@ -177,7 +179,10 @@ impl Rule {
                         format!("入力する文字は {MAX_TEXT_CHARS} 文字までにしてください"),
                     ));
                 }
-                Action::TypeText(setting.value.clone())
+                Action::TypeText {
+                    text: setting.value.clone(),
+                    paste: input_is_paste(&setting.input),
+                }
             }
             ActionKind::Run => {
                 if value.is_empty() {
@@ -206,6 +211,12 @@ impl Rule {
         }
         process.is_some_and(|p| remap_logic::is_target_app(p, &self.apps))
     }
+}
+
+/// 「文字を入力する」の入れ方が「まとめて貼り付ける」か。`"keys"` のときだけ 1 文字ずつにし、
+/// それ以外（空・知らない値を含む）はまとめて貼り付ける。
+pub fn input_is_paste(input: &str) -> bool {
+    !input.trim().eq_ignore_ascii_case("keys")
 }
 
 /// 有効な割り当てだけを読み取る。読めないものは飛ばし、その理由を 2 つ目に返す（記録用）。
@@ -414,7 +425,22 @@ mod tests {
             }
         );
         let r = Rule::from_setting(&setting("Ctrl+Alt+D", "type_text", " {date} \n")).unwrap();
-        assert_eq!(r.action, Action::TypeText(" {date} \n".into()));
+        assert_eq!(
+            r.action,
+            Action::TypeText {
+                text: " {date} \n".into(),
+                paste: true
+            }
+        );
+        let mut s = setting("Ctrl+Alt+D", "type_text", "abc");
+        s.input = "keys".into();
+        assert_eq!(
+            Rule::from_setting(&s).unwrap().action,
+            Action::TypeText {
+                text: "abc".into(),
+                paste: false
+            }
+        );
         let r = Rule::from_setting(&setting("F1", "block", "")).unwrap();
         assert_eq!(r.action, Action::Block);
     }
@@ -490,6 +516,15 @@ mod tests {
         assert_eq!(expand_placeholders("{datetime}", &now), "2026/10/05 09:07");
         assert_eq!(expand_placeholders("{{date}} {x} }{", &now), "{date} {x} }{");
         assert_eq!(expand_placeholders("改行\nそのまま", &now), "改行\nそのまま");
+    }
+
+    #[test]
+    fn input_method() {
+        assert!(input_is_paste("paste"));
+        assert!(input_is_paste(""));
+        assert!(input_is_paste("なにか"));
+        assert!(!input_is_paste("keys"));
+        assert!(!input_is_paste(" KEYS "));
     }
 
     #[test]

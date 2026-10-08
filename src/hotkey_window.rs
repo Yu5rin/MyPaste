@@ -52,10 +52,11 @@ const ID_SCOPE: i32 = 322;
 const ID_APPS: i32 = 323;
 const ID_ADD: i32 = 324;
 const ID_UPDATE: i32 = 325;
+const ID_PASTE: i32 = 326;
 
 /// 画面の中身の大きさ（96 DPI 基準）。
 const CLIENT_W: i32 = 680;
-const CLIENT_H: i32 = 496;
+const CLIENT_H: i32 = 524;
 
 /// 効くアプリの選択肢。
 const SCOPES: [&str; 2] = ["すべてのアプリ", "下に書いたアプリだけ"];
@@ -63,12 +64,12 @@ const SCOPES: [&str; 2] = ["すべてのアプリ", "下に書いたアプリだ
 /// 画面の構成。並び順がそのまま Tab キーで移る順になる。
 const ITEMS: &[Item] = &[
     item(400, Kind::Label, "割り当て（上にあるものから順に調べます）", 12, 8, 304, 22),
-    item(ID_LIST, Kind::ListBox, "", 12, 32, 304, 340),
-    item(ID_UP, Kind::Button, "上へ", 12, 380, 70, 28),
-    item(ID_DOWN, Kind::Button, "下へ", 86, 380, 70, 28),
-    item(ID_DELETE, Kind::Button, "削除", 234, 380, 82, 28),
+    item(ID_LIST, Kind::ListBox, "", 12, 32, 304, 368),
+    item(ID_UP, Kind::Button, "上へ", 12, 408, 70, 28),
+    item(ID_DOWN, Kind::Button, "下へ", 86, 408, 70, 28),
+    item(ID_DELETE, Kind::Button, "削除", 234, 408, 82, 28),
     // 内容
-    item(401, Kind::Group, "割り当ての内容", 324, 8, 344, 400),
+    item(401, Kind::Group, "割り当ての内容", 324, 8, 344, 428),
     item(ID_ENABLED, Kind::Check, "この割り当てを使う", 336, 30, 320, 22),
     item(402, Kind::Label, "キー", 336, 58, 48, 24),
     item(ID_CTRL, Kind::Check, "Ctrl", 388, 59, 52, 22),
@@ -82,17 +83,18 @@ const ITEMS: &[Item] = &[
     item(ID_VALUE_LABEL, Kind::Label, "", 336, 152, 320, 22),
     item(ID_VALUE, Kind::MultiEdit, "", 336, 176, 320, 64),
     item(ID_HINT, Kind::Note, "", 336, 246, 320, 62),
-    item(405, Kind::Label, "引数", 336, 312, 48, 24),
-    item(ID_ARGS, Kind::Edit, "", 388, 312, 268, 24),
-    item(406, Kind::Label, "効くアプリ", 336, 344, 80, 24),
-    item(ID_SCOPE, Kind::Combo, "", 420, 344, 236, 200),
-    item(ID_APPS, Kind::Edit, "", 336, 374, 320, 24),
-    item(ID_ADD, Kind::Button, "新しい割り当てとして追加", 324, 416, 172, 28),
-    item(ID_UPDATE, Kind::Button, "選んだ割り当てを更新", 500, 416, 168, 28),
+    item(ID_PASTE, Kind::Check, "まとめて貼り付ける（クリップボードを一時的に使う）", 336, 312, 320, 22),
+    item(405, Kind::Label, "引数", 336, 340, 48, 24),
+    item(ID_ARGS, Kind::Edit, "", 388, 340, 268, 24),
+    item(406, Kind::Label, "効くアプリ", 336, 372, 80, 24),
+    item(ID_SCOPE, Kind::Combo, "", 420, 372, 236, 200),
+    item(ID_APPS, Kind::Edit, "", 336, 402, 320, 24),
+    item(ID_ADD, Kind::Button, "新しい割り当てとして追加", 324, 444, 172, 28),
+    item(ID_UPDATE, Kind::Button, "選んだ割り当てを更新", 500, 444, 168, 28),
     // 操作ボタン
-    item(407, Kind::Note, "「保存」を押すと、すぐに使えるようになります。効くアプリはプロセス名を空白で区切って書きます（例: EXCEL.EXE WINWORD.EXE）。", 12, 452, 472, 40),
-    item(ID_SAVE, Kind::DefaultButton, "保存", 496, 456, 82, 28),
-    item(ID_CANCEL, Kind::Button, "キャンセル", 586, 456, 82, 28),
+    item(407, Kind::Note, "「保存」を押すと、すぐに使えるようになります。効くアプリはプロセス名を空白で区切って書きます（例: EXCEL.EXE WINWORD.EXE）。", 12, 480, 472, 40),
+    item(ID_SAVE, Kind::DefaultButton, "保存", 496, 484, 82, 28),
+    item(ID_CANCEL, Kind::Button, "キャンセル", 586, 484, 82, 28),
 ];
 
 /// 画面のスレッドが持つ状態。
@@ -217,6 +219,7 @@ unsafe fn load_editor(hwnd: HWND, rule: &HotkeyRuleSetting) {
     // 複数行の欄は改行を \r\n で渡す。
     set_text(hwnd, ID_VALUE, &rule.value.replace("\r\n", "\n").replace('\n', "\r\n"));
     set_text(hwnd, ID_ARGS, &rule.args);
+    set_checked(hwnd, ID_PASTE, hotkey_rules::input_is_paste(&rule.input));
     let apps = remap_logic::normalize_apps(rule.apps.iter().map(String::as_str));
     set_combo_index(hwnd, ID_SCOPE, usize::from(!apps.is_empty()));
     set_text(hwnd, ID_APPS, &apps_to_line(&apps));
@@ -248,6 +251,7 @@ unsafe fn update_fields(hwnd: HWND) {
     set_text(hwnd, ID_HINT, info.hint);
     ui::set_enabled(hwnd, ID_VALUE, info.value_label.is_some());
     ui::set_enabled(hwnd, ID_ARGS, info.uses_args);
+    ui::set_enabled(hwnd, ID_PASTE, info.kind == ActionKind::TypeText);
     ui::set_enabled(hwnd, ID_APPS, combo_index(hwnd, ID_SCOPE) == Some(1));
 }
 
@@ -293,6 +297,12 @@ unsafe fn read_editor(hwnd: HWND) -> Result<HotkeyRuleSetting, (i32, String)> {
             String::new()
         },
         apps,
+        // 「文字を入力する」のときだけ意味がある。ほかの動作では既定のまま。
+        input: if info.kind == ActionKind::TypeText && !is_checked(hwnd, ID_PASTE) {
+            "keys".to_string()
+        } else {
+            "paste".to_string()
+        },
     };
     if let Err(e) = Rule::from_setting(&setting) {
         let id = match e.field {
