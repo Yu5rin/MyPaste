@@ -25,8 +25,11 @@ pub const DOUBLE_TAP_MS_MAX: u32 = 1000;
 pub const DEFAULT_DOUBLE_TAP_MS: u32 = 400;
 /// 一覧の 1 行に出す文字数の上限（実際には欄の幅に合わせて「…」で切る）。
 const ROW_CHARS: usize = 200;
-/// 下の欄に全文を出すときの文字数の上限。
-const PREVIEW_CHARS: usize = 5000;
+/// 一覧の 1 ページに並べる件数。
+pub const PAGE_SIZE: usize = 20;
+/// 全文の吹き出しに出す行数と、1 行の文字数の上限。
+const TIP_LINES: usize = 20;
+const TIP_LINE_CHARS: usize = 200;
 
 /// コピーされた文字の履歴（新しい順）。
 #[derive(Debug)]
@@ -333,13 +336,46 @@ pub fn row_text(text: &str) -> (String, usize) {
     (row, lines)
 }
 
-/// 下の欄に出す全文（改行は \r\n にそろえる。長すぎるものは途中まで）。
-pub fn preview_text(text: &str) -> String {
-    let mut preview: String = text.chars().take(PREVIEW_CHARS).collect();
-    if text.chars().count() > PREVIEW_CHARS {
-        preview.push_str("\n…（以下省略）");
+/// 全文の吹き出しに出す文（長いものは途中まで。改行は \r\n にそろえる）。
+pub fn tip_text(text: &str) -> String {
+    let text = text.trim_end_matches(['\r', '\n']);
+    let lines: Vec<&str> = text.lines().collect();
+    let mut shown: Vec<String> = lines
+        .iter()
+        .take(TIP_LINES)
+        .map(|l| {
+            let mut line: String = l.chars().take(TIP_LINE_CHARS).collect();
+            if l.chars().count() > TIP_LINE_CHARS {
+                line.push('…');
+            }
+            line
+        })
+        .collect();
+    if lines.len() > TIP_LINES {
+        shown.push(format!("…（ほか {} 行）", lines.len() - TIP_LINES));
     }
-    preview.replace("\r\n", "\n").replace('\n', "\r\n")
+    shown.join("\r\n")
+}
+
+/// ページの数（0 件でも 1 ページ）。
+pub fn page_count(len: usize) -> usize {
+    len.div_ceil(PAGE_SIZE).max(1)
+}
+
+/// `page` ページ目（0 から）に並べる位置の範囲。
+pub fn page_range(page: usize, len: usize) -> std::ops::Range<usize> {
+    let start = (page * PAGE_SIZE).min(len);
+    start..(start + PAGE_SIZE).min(len)
+}
+
+/// ページの見出し（例 `1〜20 件目 / 100 件`、絞り込み中は `1〜3 件目 / 3 件（絞り込み）`）。
+pub fn page_label(page: usize, len: usize, filtered: bool) -> String {
+    let range = page_range(page, len);
+    let tail = if filtered { "（絞り込み）" } else { "" };
+    if range.is_empty() {
+        return format!("0 件{tail}");
+    }
+    format!("{}〜{} 件目 / {len} 件{tail}", range.start + 1, range.end)
 }
 
 /// 絞り込み。`query` を空白で区切った語を**すべて**含むものの位置を返す（大文字・小文字、
@@ -516,8 +552,23 @@ mod tests {
         assert_eq!(row_text("hello"), ("hello".to_string(), 1));
         assert_eq!(row_text("\r\n  A\tB\r\n2行目\r\n"), ("A B".to_string(), 3));
         assert_eq!(row_text(&"あ".repeat(300)).0.chars().count(), 200);
-        assert_eq!(preview_text("a\nb\r\nc"), "a\r\nb\r\nc");
-        assert!(preview_text(&"x".repeat(6000)).ends_with("…（以下省略）"));
+        assert_eq!(tip_text("a\nb\r\nc\r\n"), "a\r\nb\r\nc");
+        let many = (1..=25).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(tip_text(&many).ends_with("20\r\n…（ほか 5 行）"));
+        assert!(tip_text(&"x".repeat(300)).ends_with("x…"));
+    }
+
+    #[test]
+    fn pages() {
+        assert_eq!(page_count(0), 1);
+        assert_eq!(page_count(20), 1);
+        assert_eq!(page_count(21), 2);
+        assert_eq!(page_count(100), 5);
+        assert_eq!(page_range(1, 25), 20..25);
+        assert_eq!(page_range(3, 25), 25..25);
+        assert_eq!(page_label(0, 100, false), "1〜20 件目 / 100 件");
+        assert_eq!(page_label(1, 25, true), "21〜25 件目 / 25 件（絞り込み）");
+        assert_eq!(page_label(0, 0, true), "0 件（絞り込み）");
     }
 
     #[test]
