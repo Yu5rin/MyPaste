@@ -6,19 +6,25 @@
 //! 実行は専用のスレッドで行う。
 //!
 //! 動作の種類と内容の解釈は [`crate::hotkey_rules`] にある。
+//!
+//! 実行スレッドは、クリップボードの持ち主になるための見えないウィンドウ（メッセージ専用）を
+//! 持つ。「文字をまとめて貼り付ける」では、このウィンドウで遅延レンダリング（中身は
+//! 求められたときに渡す）を使い、貼り付け先が本当に読みに来たかどうかを確かめる。
 
+use std::cell::{Cell, RefCell};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Mutex;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
-    GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardOwner,
+    OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
@@ -26,9 +32,12 @@ use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, GetForegroundWindow, GetShellWindow, GetWindowLongPtrW,
-    GetWindowThreadProcessId, SetWindowPos, GA_ROOT, GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOPMOST,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNORMAL, WS_EX_TOPMOST,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetAncestor,
+    GetForegroundWindow, GetShellWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
+    PeekMessageW, RegisterClassW, SetWindowPos, TranslateMessage, GA_ROOT, GWL_EXSTYLE,
+    HWND_MESSAGE, HWND_NOTOPMOST, HWND_TOPMOST, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROYCLIPBOARD,
+    WM_RENDERALLFORMATS, WM_RENDERFORMAT, WNDCLASSW, WS_EX_TOPMOST,
 };
 
 use crate::hotkey_rules::{self, Action, LocalTime};
@@ -41,9 +50,21 @@ const CF_UNICODETEXT: u32 = 13;
 const CLIPBOARD_RETRIES: u32 = 10;
 const CLIPBOARD_RETRY_WAIT: Duration = Duration::from_millis(20);
 
-/// 「まとめて貼り付ける」で、Ctrl+V を送ってから元のクリップボードに戻すまでの待ち時間。
-/// 貼り付け先のアプリがクリップボードを読み終える前に戻すと、元の内容が貼り付けられてしまう。
-const PASTE_RESTORE_WAIT: Duration = Duration::from_millis(500);
+/// 「まとめて貼り付ける」で、Ctrl+V を送ってから貼り付け先が文字を読みに来るのを待つ時間。
+/// これを過ぎても読みに来なければ、貼り付けを受け付けない入力欄とみなして 1 文字ずつ入力する。
+const PASTE_ACCEPT_WAIT: Duration = Duration::from_millis(500);
+/// 貼り付け先が文字を読みに来てから、元のクリップボードに戻すまでの待ち時間
+/// （同じ貼り付けの中で、別の形式を続けて読みに来ることがあるため）。
+const PASTE_SETTLE_WAIT: Duration = Duration::from_millis(300);
+
+thread_local! {
+    /// クリップボードの持ち主になる、見えないウィンドウ（実行スレッドだけで使う）。
+    static CLIP_WINDOW: Cell<HWND> = const { Cell::new(HWND(std::ptr::null_mut())) };
+    /// 遅延レンダリングで、求められたら渡す文字（UTF-16 と終端の 0 をバイト列にしたもの）。
+    static PENDING_TEXT: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    /// 貼り付け先が文字を読みに来たか。
+    static RENDERED: Cell<bool> = const { Cell::new(false) };
+}
 
 /// 実行の依頼。
 struct Request {
@@ -88,8 +109,13 @@ pub fn start() -> Worker {
     let thread = std::thread::spawn(move || unsafe {
         // ShellExecuteW のために COM を初期化しておく（関連付けによっては COM を使う）。
         let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+        let window = create_clipboard_window();
+        CLIP_WINDOW.with(|w| w.set(window));
         for request in rx {
             execute(request);
+        }
+        if !window.is_invalid() {
+            let _ = DestroyWindow(window);
         }
         if com {
             CoUninitialize();
@@ -195,39 +221,199 @@ unsafe fn paste_plain(held: &Hotkey) {
     sendinput::send_key_sequence(held, &[ctrl_v()]);
 }
 
-/// 文字をまとめて（一度に）貼り付ける。
+/// 文字をまとめて（一度に）貼り付ける。貼り付けを受け付けない入力欄では 1 文字ずつ入力する。
 ///
-/// 今のクリップボードの内容を控えてから、文字だけをクリップボードに入れて Ctrl+V を送り、
-/// 少し待って元の内容に戻す。1 文字ずつ送るのと違い、IME の状態や入力補完に左右されず、
-/// 長い文でも一瞬で入る。入れる文字はクリップボードの履歴（Win+V）に残さない。
+/// 1. 今のクリップボードの内容を控える。
+/// 2. 文字そのものは置かず、「求められたら渡す」（遅延レンダリング）という予約だけを置いて
+///    Ctrl+V を送る。予約にはクリップボードの履歴（Win+V）に残さない印を付ける。
+/// 3. 貼り付け先が読みに来たら文字を渡す。少し待って、元の内容に戻す。
+/// 4. 待っても読みに来なければ、貼り付けを受け付けない入力欄とみなし、元の内容に戻してから
+///    1 文字ずつ入力する（予約の段階では文字を渡していないので、二重には入らない）。
+///
 /// 待っている間に利用者が別のものをコピーした場合は、それを消さないよう元に戻さない。
 unsafe fn paste_text(held: &Hotkey, text: &str) {
     let saved = snapshot_clipboard();
-    if let Err(e) = write_clipboard(text, true) {
+    if let Err(e) = offer_text(text) {
         // クリップボードが使えないときは、1 文字ずつ入力する。
         log::warn!("キー割り当て: クリップボードを使えないため 1 文字ずつ入力します: {e}");
         sendinput::send_text(held, text);
         return;
     }
-    let ours = GetClipboardSequenceNumber();
     sendinput::send_key_sequence(held, &[ctrl_v()]);
-    std::thread::sleep(PASTE_RESTORE_WAIT);
 
-    if GetClipboardSequenceNumber() != ours {
-        log::debug!("キー割り当て: クリップボードが新しくなったため、元に戻しません");
-        return;
+    let accepted = pump_messages_until(PASTE_ACCEPT_WAIT, || RENDERED.with(Cell::get));
+    if accepted {
+        pump_messages_until(PASTE_SETTLE_WAIT, || false);
     }
-    match saved {
-        Some(saved) => {
-            if let Err(e) = restore_clipboard(&saved) {
-                log::warn!("キー割り当て: クリップボードを元に戻せませんでした: {e}");
+    PENDING_TEXT.with(|p| p.borrow_mut().take());
+
+    // 自分が持ち主のままなら元に戻す（別のものがコピーされていたら戻さない）。
+    if GetClipboardOwner().ok() == Some(clip_window()) {
+        match &saved {
+            Some(saved) => {
+                if let Err(e) = restore_clipboard(saved) {
+                    log::warn!("キー割り当て: クリップボードを元に戻せませんでした: {e}");
+                }
+            }
+            None => {
+                // もともと空（または控えられなかった）なら、空に戻す。
+                if open_clipboard() {
+                    let _ = EmptyClipboard();
+                    let _ = CloseClipboard();
+                }
             }
         }
-        None => {
-            // もともと空（または控えられなかった）なら、空に戻す。
-            if open_clipboard() {
-                let _ = EmptyClipboard();
+    } else {
+        log::debug!("キー割り当て: クリップボードが新しくなったため、元に戻しません");
+    }
+
+    if !accepted {
+        log::debug!(
+            "キー割り当て: 貼り付けを受け付けない入力欄のため、1 文字ずつ入力します（{}）",
+            crate::excel_check::foreground_process_name().unwrap_or_else(|| "不明".into())
+        );
+        // 修飾キーは Ctrl+V を送るときに離してある。
+        sendinput::send_text(&Hotkey::unpack(0), text);
+    }
+}
+
+/// 文字を、遅延レンダリングでクリップボードに予約する（中身は求められたときに渡す）。
+unsafe fn offer_text(text: &str) -> Result<(), String> {
+    let window = clip_window();
+    if window.is_invalid() {
+        return Err("クリップボード用のウィンドウがありません".into());
+    }
+    let units: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+    if !open_clipboard() {
+        return Err("ほかのアプリがクリップボードを使っています".into());
+    }
+    // EmptyClipboard で前の予約が消える（WM_DESTROYCLIPBOARD）ので、そのあとで用意する。
+    let result = EmptyClipboard().map_err(|e| e.to_string());
+    if result.is_ok() {
+        PENDING_TEXT.with(|p| *p.borrow_mut() = Some(bytes));
+        RENDERED.with(|r| r.set(false));
+        // 中身を渡さずに形式だけを置く（遅延レンダリング）。この呼び出しは成功しても
+        // ハンドルを返さないので、結果は見ない。
+        let _ = SetClipboardData(CF_UNICODETEXT, HANDLE(std::ptr::null_mut()));
+        mark_exclude_from_history();
+    }
+    let _ = CloseClipboard();
+    result
+}
+
+/// メッセージを処理しながら、`done` が真になるか `timeout` が過ぎるまで待つ。
+/// 貼り付け先からの「文字を渡して」（WM_RENDERFORMAT）は、ここで処理される。
+/// `done` が真になったら `true`。
+unsafe fn pump_messages_until(timeout: Duration, done: impl Fn() -> bool) -> bool {
+    let start = Instant::now();
+    let mut msg = MSG::default();
+    loop {
+        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if done() {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// 予約しておいた文字を、クリップボードに渡す（クリップボードは開かれている前提）。
+unsafe fn render_pending_text() {
+    let bytes = PENDING_TEXT.with(|p| p.borrow().clone());
+    let Some(bytes) = bytes else {
+        return;
+    };
+    if let Ok(memory) = global_copy(&bytes) {
+        if SetClipboardData(CF_UNICODETEXT, HANDLE(memory.0)).is_err() {
+            let _ = GlobalFree(memory);
+        } else {
+            RENDERED.with(|r| r.set(true));
+        }
+    }
+}
+
+/// クリップボード用の見えないウィンドウのプロシージャ。
+unsafe extern "system" fn clip_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        // 貼り付け先が文字を求めてきた（クリップボードは相手が開いている）。
+        WM_RENDERFORMAT => {
+            if wparam.0 as u32 == CF_UNICODETEXT {
+                render_pending_text();
+            }
+            LRESULT(0)
+        }
+        // 持ち主のまま終了するときは、予約を中身に置き換えておく。
+        WM_RENDERALLFORMATS => {
+            if OpenClipboard(hwnd).is_ok() {
+                if GetClipboardOwner().ok() == Some(hwnd) {
+                    render_pending_text();
+                }
                 let _ = CloseClipboard();
+            }
+            LRESULT(0)
+        }
+        // 別のものがコピーされた（または自分で空にした）。予約は無効になる。
+        WM_DESTROYCLIPBOARD => {
+            PENDING_TEXT.with(|p| p.borrow_mut().take());
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// クリップボード用の見えないウィンドウ（メッセージ専用）を作る。作れなければ無効なハンドル。
+unsafe fn create_clipboard_window() -> HWND {
+    let Ok(instance) = GetModuleHandleW(None) else {
+        return HWND::default();
+    };
+    let class_name = w!("AtaiPasteClipboard");
+    let class = WNDCLASSW {
+        lpfnWndProc: Some(clip_wnd_proc),
+        hInstance: instance.into(),
+        lpszClassName: class_name,
+        ..Default::default()
+    };
+    RegisterClassW(&class);
+    CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        class_name,
+        w!(""),
+        WINDOW_STYLE::default(),
+        0,
+        0,
+        0,
+        0,
+        HWND_MESSAGE,
+        None,
+        instance,
+        None,
+    )
+    .unwrap_or_default()
+}
+
+fn clip_window() -> HWND {
+    CLIP_WINDOW.with(Cell::get)
+}
+
+/// クリップボードの今の内容に、クリップボードの履歴（Win+V）やクラウドへの同期に残さない
+/// 印を付ける（クリップボードは開かれている前提）。
+unsafe fn mark_exclude_from_history() {
+    let format = RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing"));
+    if format != 0 {
+        if let Ok(mark) = global_copy(&[0]) {
+            if SetClipboardData(format, HANDLE(mark.0)).is_err() {
+                let _ = GlobalFree(mark);
             }
         }
     }
@@ -317,7 +503,9 @@ unsafe fn global_copy(data: &[u8]) -> Result<HGLOBAL, String> {
 /// クリップボードを開く。ほかのアプリが使っている間は少し待って開き直す。
 unsafe fn open_clipboard() -> bool {
     for _ in 0..CLIPBOARD_RETRIES {
-        if OpenClipboard(None).is_ok() {
+        // 持ち主のウィンドウを渡して開く（None だと EmptyClipboard 後の持ち主が無くなり、
+        // SetClipboardData が失敗することがある）。
+        if OpenClipboard(clip_window()).is_ok() {
             return true;
         }
         std::thread::sleep(CLIPBOARD_RETRY_WAIT);
@@ -369,14 +557,7 @@ unsafe fn write_clipboard(text: &str, exclude_history: bool) -> Result<(), Strin
         // 渡せなかったメモリは自分で解放する（渡せたらクリップボードのものになる）。
         let _ = GlobalFree(memory);
     } else if exclude_history {
-        let format = RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing"));
-        if format != 0 {
-            if let Ok(mark) = global_copy(&[0]) {
-                if SetClipboardData(format, HANDLE(mark.0)).is_err() {
-                    let _ = GlobalFree(mark);
-                }
-            }
-        }
+        mark_exclude_from_history();
     }
     let _ = CloseClipboard();
     result
