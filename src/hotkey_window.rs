@@ -24,6 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MB_ICONWARNING, MB_YESNOCANCEL, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
 };
 
+use crate::clip_history;
 use crate::config::{self, HotkeyRuleSetting};
 use crate::hotkey_rules::{self, ActionKind, Field, Rule, ACTIONS};
 use crate::remap_logic::{self, Hotkey, KEYS};
@@ -535,6 +536,23 @@ unsafe fn on_save(hwnd: HWND) {
     if let Some(message) = hotkey_rules::find_conflict(&rules, (remap.0, &remap.1)) {
         show_message(hwnd, &message, MB_ICONWARNING);
         return;
+    }
+    // クリップボードの履歴を出すキー（設定画面で決める）と重なっていないか。
+    let history = clip_history::Config::from_settings(&config::Settings::load().clipboard_history);
+    if let Some(key) = history.hotkey.filter(|_| history.enabled) {
+        if let Some(n) = hotkey_rules::find_key_in_rules(&rules, key) {
+            show_message(
+                hwnd,
+                &format!(
+                    "{n} 番目の割り当て（{}）は、クリップボードの履歴を出すキーと同じです。\
+                     履歴の一覧が先に出るため、この割り当ては使われません。別のキーにするか、\
+                     設定画面でクリップボードの履歴を出すキーを変えてください。",
+                    key.format()
+                ),
+                MB_ICONWARNING,
+            );
+            return;
+        }
     }
     if let Err(e) = config::save_hotkeys(&rules) {
         log::error!("キー割り当ての保存に失敗: {e}");

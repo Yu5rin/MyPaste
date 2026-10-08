@@ -11,8 +11,12 @@
 //! その動作の実行を [`crate::actions`] に頼む（[`set_rules`]）。値貼り付けのキーが
 //! 先に効き、キー割り当ては上から順に調べて最初に当てはまったものだけを使う。
 //!
+//! クリップボードの履歴の一覧を出す操作（キーの組み合わせ、または Ctrl などの 2 回押し）も
+//! ここで捕まえる（[`set_history_trigger`]）。キー割り当ての ON/OFF にはかかわらず効く。
+//!
 //! ON/OFF 状態はメモリ上（[`ENABLED`]）にのみ保持し、終了時にリセットされる。
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::RwLock;
 
@@ -26,6 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
+use crate::clip_history::{DoubleTap, Modifier};
 use crate::hotkey_rules::{Action, Rule};
 use crate::remap_logic::Hotkey;
 use crate::{actions, excel_check, sendinput};
@@ -46,6 +51,46 @@ static HOTKEY: AtomicU32 = AtomicU32::new(0x0142);
 
 /// 対象アプリのプロセス名（大文字）。
 static TARGET_APPS: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
+/// クリップボードの履歴の一覧を出すキーの組み合わせ（[`Hotkey::pack`] の値。0 は使わない）。
+static HISTORY_HOTKEY: AtomicU32 = AtomicU32::new(0);
+/// 履歴の一覧を出す 2 回押しのキー（0 = 使わない、1 = Ctrl、2 = Shift、3 = Alt）と間隔（ミリ秒）。
+static HISTORY_DOUBLE_TAP: AtomicU32 = AtomicU32::new(0);
+static HISTORY_DOUBLE_TAP_MS: AtomicU32 = AtomicU32::new(400);
+
+thread_local! {
+    /// 2 回押しの判定（フックのスレッドだけで使う）。
+    static DOUBLE_TAP: RefCell<DoubleTap> = RefCell::new(DoubleTap::default());
+}
+
+/// クリップボードの履歴の一覧を出す操作を決める。どちらも `None` なら、キーでは出さない。
+pub fn set_history_trigger(hotkey: Option<Hotkey>, double_tap: Option<Modifier>, interval_ms: u32) {
+    HISTORY_HOTKEY.store(hotkey.map_or(0, |h| h.pack()), Ordering::SeqCst);
+    let code = match double_tap {
+        None => 0,
+        Some(Modifier::Ctrl) => 1,
+        Some(Modifier::Shift) => 2,
+        Some(Modifier::Alt) => 3,
+    };
+    HISTORY_DOUBLE_TAP.store(code, Ordering::SeqCst);
+    HISTORY_DOUBLE_TAP_MS.store(interval_ms, Ordering::SeqCst);
+}
+
+fn history_hotkey() -> Option<Hotkey> {
+    match HISTORY_HOTKEY.load(Ordering::SeqCst) {
+        0 => None,
+        packed => Some(Hotkey::unpack(packed)),
+    }
+}
+
+fn history_double_tap() -> Option<Modifier> {
+    match HISTORY_DOUBLE_TAP.load(Ordering::SeqCst) {
+        1 => Some(Modifier::Ctrl),
+        2 => Some(Modifier::Shift),
+        3 => Some(Modifier::Alt),
+        _ => None,
+    }
+}
 
 /// アプリが「離した」を送った（[`mark_released_by_us`]）が、利用者はまだ押したままの
 /// 修飾キー（[`MOD_CTRL`] などのビット）。`GetAsyncKeyState` はアプリが送った「離した」も
@@ -245,6 +290,17 @@ unsafe extern "system" fn low_level_keyboard_proc(
 
         // 自分が送った入力・注入入力は対象外。
         if !injected && !is_self {
+            // Ctrl などの 2 回押しで、クリップボードの履歴の一覧を出す（キーはそのまま通す）。
+            if let Some(key) = history_double_tap() {
+                let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
+                let interval = HISTORY_DOUBLE_TAP_MS.load(Ordering::SeqCst);
+                let fired = DOUBLE_TAP
+                    .with(|d| d.borrow_mut().on_key(key, kb.vkCode, down, kb.time, interval));
+                if fired {
+                    log::debug!("クリップボードの履歴: 2 回押しを捕まえました");
+                    actions::dispatch(Action::ClipboardHistory, Hotkey::unpack(0));
+                }
+            }
             let hotkey = hotkey();
             match message {
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
@@ -274,6 +330,15 @@ unsafe extern "system" fn low_level_keyboard_proc(
                             } else {
                                 log::debug!("{} はそのまま通しました（OFF のため）", hotkey.format());
                             }
+                        }
+                    }
+                    // クリップボードの履歴の一覧を出すキー（キー割り当ての ON/OFF にかかわらず効く）。
+                    if let Some(history) = history_hotkey() {
+                        if kb.vkCode == history.vk && modifiers_match(&history) {
+                            ACTIVE_VK.store(kb.vkCode, Ordering::SeqCst);
+                            log::debug!("クリップボードの履歴: {} を捕まえました", history.format());
+                            actions::dispatch(Action::ClipboardHistory, history);
+                            return LRESULT(1);
                         }
                     }
                     // キー割り当て。実行は別のスレッドに頼み、ここではすぐに戻る。

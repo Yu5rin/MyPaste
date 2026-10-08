@@ -59,6 +59,8 @@ features = [
     "Win32_System_Memory",
     # 二重起動の防止（CreateMutexW の引数の型に要る）
     "Win32_Security",
+    # クリップボードの履歴を暗号化して保存する（DPAPI）
+    "Win32_Security_Cryptography",
 ]
 
 [features]

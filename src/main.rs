@@ -33,6 +33,7 @@ mod config;
 mod excel_check;
 mod actions;
 mod clip_history;
+mod clip_store;
 mod hotkey_rules;
 mod hotkey_window;
 mod http;
@@ -74,6 +75,8 @@ pub enum TrayMessage {
     OpenSettings,
     /// 設定画面で保存された（settings.json への書き込みは済んでいる。反映だけ行う）
     SettingsSaved(Box<config::Settings>),
+    /// 設定画面で設定を読み込んだ（settings.json の置き換えは済んでいる。キー割り当ても含めて反映する）
+    SettingsImported(Box<config::Settings>),
     /// キー割り当て ON/OFF 切替
     ToggleHotkeys,
     /// キー割り当て画面を開く
@@ -108,7 +111,7 @@ fn main() {
 
     // キーリマップのキーと対象アプリを、フックを設置する前に決めておく。
     let hotkey = configure_remap(&settings);
-    configure_hotkeys(&settings.hotkeys);
+    configure_hotkeys(&settings);
     // キー割り当ての動作を実行するスレッド。フックより先に始めておく。
     let action_worker = actions::start();
 
@@ -251,6 +254,7 @@ fn main() {
                 settings = *saved;
                 settings.hotkeys = hotkeys;
                 let hotkey = configure_remap(&settings);
+                configure_hotkeys(&settings);
                 let was_logging = logging::is_enabled();
                 logging::set_enabled(settings.log.enabled);
                 if logging::is_enabled() && !was_logging {
@@ -276,6 +280,12 @@ fn main() {
                 }
                 log::info!("設定を反映しました（キー: {}）", hotkey.format());
             }
+            TrayMessage::SettingsImported(imported) => {
+                // キー割り当ても読み込んだものにして、設定の保存と同じように反映する。
+                let hotkeys = imported.hotkeys.clone();
+                let _ = tx.send(TrayMessage::SettingsSaved(imported));
+                let _ = tx.send(TrayMessage::HotkeysSaved(hotkeys));
+            }
             TrayMessage::ToggleHotkeys => {
                 let on = keyboard::toggle_rules();
                 if let Err(e) = tray.set_hotkeys_checked(on) {
@@ -291,7 +301,7 @@ fn main() {
             TrayMessage::ShowList => actions::show_assignment_list(),
             TrayMessage::HotkeysSaved(hotkeys) => {
                 settings.hotkeys = hotkeys;
-                configure_hotkeys(&settings.hotkeys);
+                configure_hotkeys(&settings);
             }
             TrayMessage::CheckUpdate => {
                 // 手動確認。結果（最新である／失敗した）もダイアログで知らせる。
@@ -350,19 +360,35 @@ fn log_startup(settings: &config::Settings) {
     );
 }
 
-/// キー割り当てを読み取ってフックへ渡す。使えない割り当ては記録に残して飛ばす。
-fn configure_hotkeys(hotkeys: &[config::HotkeyRuleSetting]) {
-    let (rules, problems) = hotkey_rules::compile(hotkeys);
+/// キー割り当てとクリップボードの履歴の設定を読み取ってフックへ渡す。使えない割り当ては
+/// 記録に残して飛ばす。
+fn configure_hotkeys(settings: &config::Settings) {
+    let (rules, problems) = hotkey_rules::compile(&settings.hotkeys);
     for problem in problems {
         log::warn!("{problem}");
     }
     log::info!("キー割り当て: {} 件を使います", rules.len());
-    actions::set_history_enabled(
-        rules
-            .iter()
-            .any(|r| r.action == hotkey_rules::Action::ClipboardHistory),
-    );
+    let assigned = rules
+        .iter()
+        .any(|r| r.action == hotkey_rules::Action::ClipboardHistory);
     keyboard::set_rules(rules);
+
+    let history = clip_history::Config::from_settings(&settings.clipboard_history);
+    if let Some(problem) = &history.problem {
+        log::warn!("クリップボードの履歴: {problem}");
+    }
+    let (hotkey, double_tap) = if history.enabled {
+        (history.hotkey, history.trigger.double_tap_key())
+    } else {
+        (None, None)
+    };
+    keyboard::set_history_trigger(hotkey, double_tap, history.double_tap_ms);
+    actions::set_history_config(actions::HistoryConfig {
+        record: history.enabled || assigned,
+        max_items: history.max_items,
+        keep: history.keep_after_exit,
+        position: history.position,
+    });
 }
 
 /// 設定からキーリマップのキーと対象アプリを決めてフックへ渡し、使うキーを返す。

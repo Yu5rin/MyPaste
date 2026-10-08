@@ -23,6 +23,8 @@ const SETTINGS_FILE: &str = "settings.json";
 const LOG_FILE: &str = "log.txt";
 /// 状態ファイル名。
 const STATE_FILE: &str = "update_state.json";
+/// クリップボードの履歴を残しておくファイル名（暗号化して保存する。[`crate::clip_store`]）。
+const CLIP_HISTORY_FILE: &str = "clip_history.dat";
 
 /// 設定全体。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -37,6 +39,42 @@ pub struct Settings {
     pub log: LogSettings,
     /// キー割り当て（[`crate::hotkey_rules`]）。上から順に調べる。
     pub hotkeys: Vec<HotkeyRuleSetting>,
+    /// クリップボードの履歴（[`crate::clip_history`]）。
+    pub clipboard_history: ClipboardHistorySettings,
+}
+
+/// クリップボードの履歴に関する設定。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClipboardHistorySettings {
+    /// コピーした文字を記録し、一覧から貼り付けられるようにするか。
+    pub enabled: bool,
+    /// 一覧を出す操作（`"hotkey"` / `"double_ctrl"` / `"double_shift"` / `"double_alt"`）。
+    pub trigger: String,
+    /// `trigger` が `"hotkey"` のときのキーの組み合わせ。
+    pub hotkey: String,
+    /// 2 回押しとみなす間隔（ミリ秒）。
+    pub double_tap_ms: u32,
+    /// 覚えておく件数（10〜100）。
+    pub max_items: usize,
+    /// アプリを終了しても履歴を残すか（暗号化してファイルに保存する）。
+    pub keep_after_exit: bool,
+    /// 一覧を出す位置（`"caret"` / `"mouse"`）。
+    pub position: String,
+}
+
+impl Default for ClipboardHistorySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            trigger: "hotkey".to_string(),
+            hotkey: "Ctrl+Alt+H".to_string(),
+            double_tap_ms: crate::clip_history::DEFAULT_DOUBLE_TAP_MS,
+            max_items: crate::clip_history::DEFAULT_ITEMS,
+            keep_after_exit: true,
+            position: "caret".to_string(),
+        }
+    }
 }
 
 /// キー割り当て 1 つ分の設定（`settings.json` の書き方そのまま）。
@@ -259,6 +297,7 @@ pub fn save_from_settings_window(settings: &Settings) -> Result<(), String> {
         "update": {
             "check_on_startup": settings.update.check_on_startup,
         },
+        "clipboard_history": settings.clipboard_history,
     }))
 }
 
@@ -266,6 +305,80 @@ pub fn save_from_settings_window(settings: &Settings) -> Result<(), String> {
 pub fn save_hotkeys(hotkeys: &[HotkeyRuleSetting]) -> Result<(), String> {
     let value = serde_json::to_value(hotkeys).map_err(|e| e.to_string())?;
     save_patch(&serde_json::json!({ "hotkeys": value }))
+}
+
+/// 設定とキー割り当てを、まとめて書き出す（PC の引っ越し用）。
+///
+/// `settings.json` の中身（利用者が書いた項目も含む）に、自動起動の状態（`autostart`。
+/// スタートアップのショートカットで表しているため settings.json には無い）を添える。
+/// クリップボードの履歴の中身は含めない。
+pub fn export_all(autostart: bool) -> Result<String, String> {
+    let mut root = match settings_path().map(|p| std::fs::read_to_string(&p)) {
+        Some(Ok(text)) => serde_json::from_str::<serde_json::Value>(strip_bom(&text))
+            .map_err(|e| format!("settings.json を解釈できないため書き出せません: {e}"))?,
+        _ => serde_json::to_value(Settings::load()).map_err(|e| e.to_string())?,
+    };
+    let object = root
+        .as_object_mut()
+        .ok_or("settings.json の形が想定と違うため書き出せません")?;
+    object.insert(EXPORT_MARK.into(), serde_json::json!(env!("CARGO_PKG_VERSION")));
+    object.insert(AUTOSTART_KEY.into(), serde_json::json!(autostart));
+    serde_json::to_string_pretty(&root).map_err(|e| e.to_string())
+}
+
+/// 書き出したファイルの印（書き出した版）。
+const EXPORT_MARK: &str = "exported_by_version";
+/// 書き出したファイルの、自動起動の状態。
+const AUTOSTART_KEY: &str = "autostart";
+
+/// 読み込んだ設定。
+#[derive(Debug)]
+pub struct Imported {
+    /// settings.json にそのまま書く中身（書き出し用の項目は除いたもの）。
+    pub root: serde_json::Value,
+    /// 読み取った設定。
+    pub settings: Settings,
+    /// 自動起動の状態（書かれていなければ `None` = 今のまま）。
+    pub autostart: Option<bool>,
+}
+
+/// 書き出したファイル（または settings.json）を読む。このアプリの設定らしい項目が 1 つも
+/// 無ければ、誤ったファイルとみなして `Err`。
+pub fn parse_import(text: &str) -> Result<Imported, String> {
+    let mut root: serde_json::Value = serde_json::from_str(strip_bom(text))
+        .map_err(|e| format!("JSON として読めません（{e}）"))?;
+    let object = root.as_object_mut().ok_or("設定の形が想定と違います")?;
+    const KNOWN: [&str; 6] = ["remap", "hotkeys", "ime_indicator", "clipboard_history", "update", "log"];
+    if !KNOWN.iter().any(|k| object.contains_key(*k)) {
+        return Err("このアプリの設定が書かれていません".into());
+    }
+    let autostart = object.remove(AUTOSTART_KEY).and_then(|v| v.as_bool());
+    object.remove(EXPORT_MARK);
+    let settings: Settings = serde_json::from_value(root.clone())
+        .map_err(|e| format!("設定の形が想定と違います（{e}）"))?;
+    Ok(Imported {
+        root,
+        settings,
+        autostart,
+    })
+}
+
+/// 読み込んだ設定で `settings.json` を置き換える。
+pub fn replace_settings(root: &serde_json::Value) -> Result<(), String> {
+    let path = settings_path().ok_or("設定ファイルの場所を決められません")?;
+    let text = serde_json::to_string_pretty(root).map_err(|e| e.to_string())?;
+    write_replacing(&path, text.as_bytes())
+        .map_err(|e| format!("settings.json に書き込めませんでした: {e}"))
+}
+
+/// クリップボードの履歴を残しておくファイルのパス。
+pub fn clip_history_file() -> Option<PathBuf> {
+    data_dir().map(|d| d.join(CLIP_HISTORY_FILE))
+}
+
+/// ファイルを、途中で壊れないように書き換える（[`write_replacing`]）。
+pub fn write_file_safely(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    write_replacing(path, data)
 }
 
 /// 書き出し・読み込みで扱うファイルの大きさの上限（誤って大きなファイルを選んだときに備える）。
@@ -326,7 +439,9 @@ fn save_patch(patch: &serde_json::Value) -> Result<(), String> {
 /// ファイルを書き換える。いったん隣の一時ファイルに書いてから置き換えるので、書き込みの
 /// 途中で電源が切れたりしても、元のファイルが壊れた中途半端な状態で残らない。
 fn write_replacing(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let temp = path.with_extension("json.tmp");
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(".tmp");
+    let temp = PathBuf::from(temp);
     std::fs::write(&temp, data)?;
     // Windows でも、既にあるファイルを置き換えられる（MoveFileExW の置き換え指定）。
     std::fs::rename(&temp, path).inspect_err(|_| {
@@ -454,8 +569,8 @@ pub fn is_writable(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        hotkeys_from_json, hotkeys_to_json, is_due, merge_json, strip_bom, HotkeyRuleSetting,
-        Settings,
+        hotkeys_from_json, hotkeys_to_json, is_due, merge_json, parse_import, strip_bom,
+        HotkeyRuleSetting, Settings,
     };
 
     const HOUR: u64 = 3600;
@@ -608,6 +723,29 @@ mod tests {
         assert_eq!(hotkeys_from_json(&format!("\u{feff}{array}")).unwrap(), rules);
         let whole = format!(r#"{{"remap":{{"hotkey":"Ctrl+B"}},"hotkeys":{array}}}"#);
         assert_eq!(hotkeys_from_json(&whole).unwrap(), rules);
+    }
+
+    #[test]
+    fn import_settings() {
+        let text = r#"{"remap":{"hotkey":"Ctrl+Q"},"autostart":true,"exported_by_version":"1.6.0",
+                       "clipboard_history":{"enabled":true,"trigger":"double_ctrl"},"mine":1}"#;
+        let imported = parse_import(&format!("\u{feff}{text}")).unwrap();
+        assert_eq!(imported.autostart, Some(true));
+        assert_eq!(imported.settings.remap.hotkey, "Ctrl+Q");
+        assert!(imported.settings.clipboard_history.enabled);
+        assert_eq!(imported.settings.clipboard_history.trigger, "double_ctrl");
+        // 書かれていない項目は既定値。
+        assert_eq!(imported.settings.clipboard_history.max_items, 100);
+        // 書き出し用の印は settings.json に入れない。利用者の項目は残す。
+        let root = imported.root.as_object().unwrap();
+        assert!(!root.contains_key("autostart"));
+        assert!(!root.contains_key("exported_by_version"));
+        assert!(root.contains_key("mine"));
+
+        assert!(parse_import(r#"{"hotkeys":[]}"#).unwrap().autostart.is_none());
+        assert!(parse_import(r#"{"name":"別のアプリ"}"#).is_err());
+        assert!(parse_import("[1]").is_err());
+        assert!(parse_import("x").is_err());
     }
 
     #[test]

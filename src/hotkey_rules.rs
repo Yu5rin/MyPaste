@@ -99,7 +99,7 @@ pub const ACTIONS: [ActionInfo; 9] = [
         key: "clipboard_history",
         name: "クリップボードの履歴から貼り付け",
         value_label: None,
-        hint: "最近コピーした文字（20 件まで）の一覧を出し、選んだものを書式なしで貼り付けます。数字キーか矢印キーと Enter で選びます。履歴はこの割り当てがあるときだけ記録し、アプリを終了すると消えます。パスワード管理ソフトなどが記録しないよう求めた内容は記録しません。",
+        hint: "最近コピーした文字の一覧を出し、選んだものを書式なしで貼り付けます（数字キーか矢印キーと Enter で選びます）。設定画面の「クリップボードの履歴」でも、一覧を出すキーや件数を決められます。",
         uses_args: false,
         uses_transforms: false,
     },
@@ -427,6 +427,16 @@ pub fn list_text(
         text.push_str(&format!("    {}\n", describe(setting)));
     }
     text.trim_end().to_string()
+}
+
+/// 有効で読めるキー割り当てのうち、`hotkey` を使っているものの番号（1 から）を返す。
+pub fn find_key_in_rules(settings: &[HotkeyRuleSetting], hotkey: Hotkey) -> Option<usize> {
+    settings
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.enabled)
+        .find(|(_, s)| Rule::from_setting(s).is_ok_and(|r| r.hotkey == hotkey))
+        .map(|(i, _)| i + 1)
 }
 
 /// 2 つの範囲（空はすべてのアプリ）が重なるか。

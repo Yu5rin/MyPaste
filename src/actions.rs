@@ -42,24 +42,24 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
+    AppendMenuW, KillTimer, SetTimer, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetAncestor, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo,
     GetMessageW, GetShellWindow, GetWindowLongPtrW, GetWindowThreadProcessId, MessageBoxW,
     PeekMessageW, PostMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW,
     SetForegroundWindow, SetLayeredWindowAttributes, SetWindowPos, TrackPopupMenuEx,
     TranslateMessage, GA_ROOT, GUITHREADINFO, GWL_EXSTYLE, HWND_MESSAGE, HWND_NOTOPMOST,
     HWND_TOPMOST, LWA_ALPHA, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
-    MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_SHOWWINDOW, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLIPBOARDUPDATE, WM_DESTROYCLIPBOARD, WM_NULL,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLIPBOARDUPDATE, WM_DESTROYCLIPBOARD, WM_NULL, WM_TIMER,
     WM_QUIT, WM_RENDERALLFORMATS, WM_RENDERFORMAT, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
 
-use crate::clip_history::{self, History};
+use crate::clip_history::{self, History, MenuPosition};
 use crate::hotkey_rules::{self, Action, LocalTime};
 use crate::remap_logic::Hotkey;
-use crate::{config, ime_indicator, keyboard, remap_logic, sendinput, text_transform};
+use crate::{clip_store, config, ime_indicator, keyboard, remap_logic, sendinput, text_transform};
 
 /// クリップボードの文字（`CF_UNICODETEXT`）。
 const CF_UNICODETEXT: u32 = 13;
@@ -83,12 +83,37 @@ thread_local! {
     static RENDERED: Cell<bool> = const { Cell::new(false) };
     /// 動作を実行している途中か（履歴の一覧を出している間も、届いた依頼を割り込ませない）。
     static BUSY: Cell<bool> = const { Cell::new(false) };
-    /// コピーされた文字の履歴（アプリが動いている間だけ。ファイルには書かない）。
+    /// コピーされた文字の履歴。
     static HISTORY: RefCell<History> = RefCell::new(History::default());
+    /// 保存しておいた履歴を読み込んだか（最初に記録を始めるときに 1 回だけ読む）。
+    static HISTORY_LOADED: Cell<bool> = const { Cell::new(false) };
+    /// 履歴が変わって、まだファイルに保存していないか。
+    static HISTORY_DIRTY: Cell<bool> = const { Cell::new(false) };
 }
 
-/// クリップボードの履歴を記録するか（「クリップボードの履歴から貼り付け」の割り当てがあるときだけ）。
-static HISTORY_WANTED: AtomicBool = AtomicBool::new(false);
+/// クリップボードの履歴の使い方（[`set_history_config`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryConfig {
+    /// 記録するか（設定で ON にしたか、その動作の割り当てがあるとき）。
+    pub record: bool,
+    /// 覚えておく件数。
+    pub max_items: usize,
+    /// アプリを終了しても残すか（暗号化してファイルに保存する）。
+    pub keep: bool,
+    /// 一覧を出す位置。
+    pub position: MenuPosition,
+}
+
+static HISTORY_CONFIG: Mutex<HistoryConfig> = Mutex::new(HistoryConfig {
+    record: false,
+    max_items: clip_history::DEFAULT_ITEMS,
+    keep: false,
+    position: MenuPosition::Caret,
+});
+
+fn history_config() -> HistoryConfig {
+    *HISTORY_CONFIG.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 /// 実行の依頼。
 struct Request {
@@ -104,10 +129,16 @@ static WORKER_WINDOW: AtomicIsize = AtomicIsize::new(0);
 
 /// 依頼が積まれたことを、実行スレッドの見えないウィンドウへ知らせるメッセージ。
 const WM_APP_REQUEST: u32 = WM_APP + 1;
-/// 履歴を記録するかが変わったことを知らせるメッセージ。
+/// 履歴の使い方が変わったことを知らせるメッセージ。
 const WM_APP_HISTORY: u32 = WM_APP + 2;
+/// 履歴を消すよう知らせるメッセージ（設定画面の「履歴を消す」）。
+const WM_APP_CLEAR_HISTORY: u32 = WM_APP + 3;
 
-/// 履歴の一覧の「履歴を消す」の番号（履歴の番号 1〜20 と重ならないもの）。
+/// 履歴を保存するまでの待ち時間を計るタイマー（続けてコピーしたときに、何度も書かないように）。
+const TIMER_SAVE_HISTORY: usize = 1;
+const SAVE_HISTORY_DELAY_MS: u32 = 2000;
+
+/// 履歴の一覧の「履歴を消す」の番号（履歴の番号 1〜100 と重ならないもの）。
 const MENU_CLEAR_HISTORY: usize = 1000;
 /// 履歴の一覧の持ち主のウィンドウを出してから、前面にするまでの待ち時間。
 const MENU_SHOW_WAIT: Duration = Duration::from_millis(30);
@@ -172,6 +203,7 @@ pub fn start() -> Worker {
         }
 
         WORKER_WINDOW.store(0, Ordering::SeqCst);
+        save_history_now();
         if !window.is_invalid() {
             let _ = RemoveClipboardFormatListener(window);
             let _ = DestroyWindow(window);
@@ -207,16 +239,24 @@ pub fn dispatch(action: Action, held: Hotkey) {
     }
 }
 
-/// クリップボードの履歴を記録するかを決める（キー割り当てを読み直したとき）。
-/// 記録しないときは、覚えている履歴も消す。
-pub fn set_history_enabled(enabled: bool) {
-    HISTORY_WANTED.store(enabled, Ordering::SeqCst);
+/// クリップボードの履歴の使い方を決める（起動時と、設定・キー割り当てを保存したとき）。
+pub fn set_history_config(config: HistoryConfig) {
+    *HISTORY_CONFIG.lock().unwrap_or_else(|p| p.into_inner()) = config;
+    post_to_worker(WM_APP_HISTORY);
+}
+
+/// 覚えている履歴（保存したものも）を消す（設定画面の「履歴を消す」）。
+pub fn clear_history() {
+    post_to_worker(WM_APP_CLEAR_HISTORY);
+}
+
+fn post_to_worker(msg: u32) {
     let window = WORKER_WINDOW.load(Ordering::SeqCst);
     if window != 0 {
         unsafe {
             let _ = PostMessageW(
                 HWND(window as *mut core::ffi::c_void),
-                WM_APP_HISTORY,
+                msg,
                 WPARAM(0),
                 LPARAM(0),
             );
@@ -224,22 +264,86 @@ pub fn set_history_enabled(enabled: bool) {
     }
 }
 
-/// 履歴を記録するかに合わせて、クリップボードの変化の知らせを受け取る・やめる。
+/// 履歴の使い方に合わせて、クリップボードの変化の知らせを受け取る・やめる、保存した履歴を
+/// 読む・消す。
 unsafe fn apply_history_setting(window: HWND) {
     if window.is_invalid() {
         return;
     }
+    let config = history_config();
     // 二重に登録しないよう、いったん外してから必要なら登録し直す。
     let _ = RemoveClipboardFormatListener(window);
-    if HISTORY_WANTED.load(Ordering::SeqCst) {
-        if let Err(e) = AddClipboardFormatListener(window) {
-            log::warn!("クリップボードの履歴を記録できません: {e}");
-        } else {
-            log::debug!("クリップボードの履歴を記録します");
+    if !config.record {
+        // 記録をやめたら、覚えている履歴も保存した履歴も消す。
+        HISTORY.with(|h| h.borrow_mut().clear());
+        HISTORY_DIRTY.with(|d| d.set(false));
+        HISTORY_LOADED.with(|l| l.set(false));
+        clip_store::delete();
+        return;
+    }
+    if !HISTORY_LOADED.with(Cell::get) {
+        HISTORY_LOADED.with(|l| l.set(true));
+        if config.keep {
+            let saved = clip_store::load();
+            log::debug!("保存していたクリップボードの履歴を読みました（{} 件）", saved.len());
+            HISTORY.with(|h| *h.borrow_mut() = History::from_saved(saved, config.max_items));
+        }
+    }
+    let before = HISTORY.with(|h| h.borrow().len());
+    HISTORY.with(|h| h.borrow_mut().set_max(config.max_items));
+    if config.keep {
+        // 件数を減らしたときや、残す設定にしたときは、今の履歴を保存し直す。
+        if before != HISTORY.with(|h| h.borrow().len()) || !history_file_exists() {
+            mark_history_changed();
         }
     } else {
-        HISTORY.with(|h| h.borrow_mut().clear());
+        HISTORY_DIRTY.with(|d| d.set(false));
+        clip_store::delete();
     }
+    if let Err(e) = AddClipboardFormatListener(window) {
+        log::warn!("クリップボードの履歴を記録できません: {e}");
+    } else {
+        log::debug!(
+            "クリップボードの履歴を記録します（{} 件まで、終了後も残す: {}）",
+            config.max_items,
+            if config.keep { "はい" } else { "いいえ" }
+        );
+    }
+}
+
+fn history_file_exists() -> bool {
+    config::clip_history_file().is_some_and(|p| p.exists())
+}
+
+/// 履歴が変わった。残す設定なら、少し待ってから保存する。
+unsafe fn mark_history_changed() {
+    if !history_config().keep {
+        return;
+    }
+    HISTORY_DIRTY.with(|d| d.set(true));
+    let window = clip_window();
+    if !window.is_invalid() {
+        SetTimer(window, TIMER_SAVE_HISTORY, SAVE_HISTORY_DELAY_MS, None);
+    }
+}
+
+/// まだ保存していない履歴があれば、今すぐ保存する。
+fn save_history_now() {
+    if !HISTORY_DIRTY.with(|d| d.replace(false)) || !history_config().keep {
+        return;
+    }
+    let items: Vec<String> = HISTORY.with(|h| h.borrow().items().cloned().collect());
+    if let Err(e) = clip_store::save(&items) {
+        log::warn!("クリップボードの履歴を保存できませんでした: {e}");
+    }
+}
+
+/// 覚えている履歴と、保存した履歴を消す。
+fn clear_all_history() {
+    HISTORY.with(|h| h.borrow_mut().clear());
+    HISTORY_DIRTY.with(|d| d.set(false));
+    clip_store::delete();
+    log::debug!("クリップボードの履歴を消しました");
 }
 
 /// クリップボードが変わった。記録してよい文字なら履歴に加える。
@@ -253,7 +357,9 @@ unsafe fn record_clipboard() {
         return;
     }
     if let Some(text) = read_clipboard_text() {
-        HISTORY.with(|h| h.borrow_mut().push(&text));
+        if HISTORY.with(|h| h.borrow_mut().push(&text)) {
+            mark_history_changed();
+        }
     }
 }
 
@@ -438,7 +544,8 @@ unsafe fn paste_transformed(held: &Hotkey, transforms: &[text_transform::Transfo
 unsafe fn paste_from_history(held: &Hotkey) {
     // 一覧を数字キーで選べるよう、押されたままの修飾キーを先に離す。
     sendinput::release_modifiers(held);
-    if !HISTORY_WANTED.load(Ordering::SeqCst) {
+    let config = history_config();
+    if !config.record {
         return;
     }
     let items: Vec<String> = HISTORY.with(|h| h.borrow().items().cloned().collect());
@@ -456,15 +563,41 @@ unsafe fn paste_from_history(held: &Hotkey) {
         ime_indicator::notify("失敗");
         return;
     }
-    for (i, text) in items.iter().enumerate() {
-        let label = HSTRING::from(clip_history::menu_label(i, text));
+    // 最初の 10 件はそのまま並べ、11 件目からは 10 件ずつまとめる（100 件を 1 列に並べると、
+    // 画面に収まらないため）。まとめた段には A〜I、各段の中では 1〜0 のキーで移れる。
+    let first_page = items.len().min(clip_history::MENU_PAGE);
+    for (i, text) in items.iter().take(first_page).enumerate() {
+        let label = HSTRING::from(clip_history::menu_label(Some(i), text));
         let _ = AppendMenuW(menu, MF_STRING, i + 1, &label);
+    }
+    if items.len() > clip_history::MENU_PAGE {
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        for (page, start) in (clip_history::MENU_PAGE..items.len())
+            .step_by(clip_history::MENU_PAGE)
+            .enumerate()
+        {
+            let Ok(sub) = CreatePopupMenu() else {
+                break;
+            };
+            let end = (start + clip_history::MENU_PAGE).min(items.len());
+            for (j, text) in items[start..end].iter().enumerate() {
+                let label = HSTRING::from(clip_history::menu_label(Some(j), text));
+                let _ = AppendMenuW(sub, MF_STRING, start + j + 1, &label);
+            }
+            let letter = char::from(b'A' + (page as u8).min(25));
+            let title = HSTRING::from(format!(
+                "&{letter} {}",
+                clip_history::page_label(start, end - start)
+            ));
+            // 段ごと親のメニューに付ける（親を消すと一緒に消える）。
+            let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, &title);
+        }
     }
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, MENU_CLEAR_HISTORY, w!("履歴を消す(&X)"));
 
     let target = GetForegroundWindow();
-    let point = menu_point(target);
+    let point = menu_point(target, config.position);
     // 持ち主のウィンドウを、一覧を出す位置に 1 ピクセルの透明なウィンドウとして出して前面にする
     // （隠したままだと、環境によっては一覧がキー入力を受け取れない）。使い回すと 2 回目以降に
     // 前面にならない環境があるので、毎回作って閉じる。
@@ -510,8 +643,7 @@ unsafe fn paste_from_history(held: &Hotkey) {
     match chosen {
         0 => {}
         MENU_CLEAR_HISTORY => {
-            HISTORY.with(|h| h.borrow_mut().clear());
-            log::debug!("キー割り当て: クリップボードの履歴を消しました");
+            clear_all_history();
             ime_indicator::notify("消去");
         }
         n => {
@@ -529,9 +661,10 @@ unsafe fn paste_from_history(held: &Hotkey) {
     }
 }
 
-/// 履歴の一覧を出す位置。入力位置（キャレット）が分かればその下、分からなければマウスの位置。
-unsafe fn menu_point(target: HWND) -> POINT {
-    if !target.is_invalid() {
+/// 履歴の一覧を出す位置。入力位置の近くにするときは、入力位置（キャレット）が分かればその下、
+/// 分からなければマウスの位置。
+unsafe fn menu_point(target: HWND, position: MenuPosition) -> POINT {
+    if position == MenuPosition::Caret && !target.is_invalid() {
         let thread_id = GetWindowThreadProcessId(target, None);
         let mut info = GUITHREADINFO {
             cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
@@ -809,9 +942,19 @@ unsafe extern "system" fn clip_wnd_proc(
             run_queued_requests();
             LRESULT(0)
         }
-        // 履歴を記録するかが変わった。
+        // 履歴の使い方が変わった。
         WM_APP_HISTORY => {
             apply_history_setting(hwnd);
+            LRESULT(0)
+        }
+        WM_APP_CLEAR_HISTORY => {
+            clear_all_history();
+            LRESULT(0)
+        }
+        // 履歴を保存する時間になった。
+        WM_TIMER if wparam.0 == TIMER_SAVE_HISTORY => {
+            let _ = KillTimer(hwnd, TIMER_SAVE_HISTORY);
+            save_history_now();
             LRESULT(0)
         }
         // クリップボードが変わった（履歴を記録しているときだけ届く）。
