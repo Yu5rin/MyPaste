@@ -44,9 +44,18 @@ pub const DEFAULT_OPACITY: u32 = 90;
 const TIP_LINES: usize = 20;
 const TIP_LINE_CHARS: usize = 200;
 
-/// コピーされた文字の履歴（新しい順）。
+/// ピン留めできる件数の上限。
+pub const MAX_PINNED: usize = 1000;
+
+/// コピーされた文字の履歴。
+///
+/// ピン留めしたもの（[`History::pin`]）は別に持ち、覚えておく件数や大きさの上限では消さない。
+/// 一覧には、ピン留めしたものを先に、続けてそのほかを新しい順に並べる。
 #[derive(Debug)]
 pub struct History {
+    /// ピン留めしたもの（新しく留めたものが先）。
+    pinned: Vec<String>,
+    /// そのほか（新しい順）。
     items: VecDeque<String>,
     max: usize,
 }
@@ -57,31 +66,58 @@ impl Default for History {
     }
 }
 
+/// ファイルに保存する形。
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Saved {
+    pub pinned: Vec<String>,
+    /// ピン留めしていないもの（新しい順）。
+    pub items: Vec<String>,
+}
+
 impl History {
     pub fn new(max: usize) -> Self {
         Self {
+            pinned: Vec::new(),
             items: VecDeque::new(),
             max: clamp_items(max),
         }
     }
 
-    /// 保存しておいた履歴（新しい順）から作る。条件に合わないものと重複は除く。
-    pub fn from_saved(saved: Vec<String>, max: usize) -> Self {
+    /// 保存しておいた履歴から作る。条件に合わないものと重複は除く。
+    pub fn from_saved(saved: Saved, max: usize) -> Self {
         let mut history = Self::new(max);
+        for text in saved.pinned {
+            if is_storable(&text)
+                && !history.pinned.contains(&text)
+                && history.pinned.len() < MAX_PINNED
+            {
+                history.pinned.push(text);
+            }
+        }
         // 古いものから順に入れると、新しいものが先頭に来て、重複は新しい方が残る。
-        for text in saved.iter().rev() {
+        for text in saved.items.iter().rev() {
             history.push(text);
         }
         history
     }
 
-    /// 覚えておく件数を変える（減らしたときは古いものから消す）。
+    /// 保存する形にする。
+    pub fn to_saved(&self) -> Saved {
+        Saved {
+            pinned: self.pinned.clone(),
+            items: self.items.iter().cloned().collect(),
+        }
+    }
+
+    /// 覚えておく件数を変える（減らしたときは古いものから消す。ピン留めしたものは消さない）。
     pub fn set_max(&mut self, max: usize) {
         self.max = clamp_items(max);
         self.items.truncate(self.max);
     }
 
-    /// 全体の大きさが上限を超えていたら、古いものから消す（いちばん新しいものは残す）。
+    /// 全体の大きさが上限を超えていたら、古いものから消す（いちばん新しいものと、
+    /// ピン留めしたものは残す）。
     fn trim_to_total(&mut self) {
         let mut total: usize = self.items.iter().map(String::len).sum();
         while total > MAX_TOTAL_BYTES && self.items.len() > 1 {
@@ -92,10 +128,10 @@ impl History {
     }
 
     /// コピーされた文字を加える。空白だけの文字や、長すぎる文字は覚えない。
-    /// すでにある文字なら、前のものを消していちばん新しい位置へ移す。
-    /// 履歴が変わったら `true`。
+    /// すでにある文字なら、前のものを消していちばん新しい位置へ移す（ピン留めしたものと
+    /// 同じなら、何もしない）。履歴が変わったら `true`。
     pub fn push(&mut self, text: &str) -> bool {
-        if text.trim().is_empty() || text.chars().count() > MAX_CHARS {
+        if !is_storable(text) || self.pinned.iter().any(|t| t == text) {
             return false;
         }
         if self.items.front().is_some_and(|t| t == text) {
@@ -110,12 +146,66 @@ impl History {
         true
     }
 
+    /// 一覧に出す順（ピン留めしたものが先）。
+    #[cfg(test)]
     pub fn items(&self) -> impl Iterator<Item = &String> {
-        self.items.iter()
+        self.pinned.iter().chain(self.items.iter())
     }
 
-    /// 1 件を消す（一覧で消したとき）。消えたら `true`。
+    /// 一覧に出す順に、(文字, ピン留めしているか)。
+    pub fn entries(&self) -> Vec<(String, bool)> {
+        self.pinned
+            .iter()
+            .map(|t| (t.clone(), true))
+            .chain(self.items.iter().map(|t| (t.clone(), false)))
+            .collect()
+    }
+
+    /// ピン留めする（ピン留めしたものの先頭へ）。変わったら `true`。
+    pub fn pin(&mut self, text: &str) -> bool {
+        if self.pinned.iter().any(|t| t == text) || self.pinned.len() >= MAX_PINNED {
+            return false;
+        }
+        let Some(i) = self.items.iter().position(|t| t == text) else {
+            return false;
+        };
+        self.items.remove(i);
+        self.pinned.insert(0, text.to_string());
+        true
+    }
+
+    /// ピン留めを外す（ピン留めしていないものの先頭へ戻す）。変わったら `true`。
+    pub fn unpin(&mut self, text: &str) -> bool {
+        let Some(i) = self.pinned.iter().position(|t| t == text) else {
+            return false;
+        };
+        let text = self.pinned.remove(i);
+        self.items.push_front(text);
+        self.items.truncate(self.max);
+        self.trim_to_total();
+        true
+    }
+
+    /// 貼り付けたものを、いちばん新しい位置へ移す（ピン留めしたものは動かさない）。
+    /// 変わったら `true`。
+    pub fn move_to_top(&mut self, text: &str) -> bool {
+        match self.items.iter().position(|t| t == text) {
+            Some(0) | None => false,
+            Some(i) => {
+                if let Some(item) = self.items.remove(i) {
+                    self.items.push_front(item);
+                }
+                true
+            }
+        }
+    }
+
+    /// 1 件を消す（一覧で消したとき。ピン留めしたものも消せる）。消えたら `true`。
     pub fn remove(&mut self, text: &str) -> bool {
+        if let Some(i) = self.pinned.iter().position(|t| t == text) {
+            self.pinned.remove(i);
+            return true;
+        }
         match self.items.iter().position(|t| t == text) {
             Some(i) => {
                 self.items.remove(i);
@@ -125,13 +215,26 @@ impl History {
         }
     }
 
+    /// 全部の件数（ピン留めしたものを含む）。
     pub fn len(&self) -> usize {
-        self.items.len()
+        self.pinned.len() + self.items.len()
     }
 
-    pub fn clear(&mut self) {
+    /// ピン留めしていないものを消す（「履歴を消す」）。
+    pub fn clear_unpinned(&mut self) {
         self.items.clear();
     }
+
+    /// ピン留めしたものも含めて、すべて消す（記録をやめたとき）。
+    pub fn clear(&mut self) {
+        self.pinned.clear();
+        self.items.clear();
+    }
+}
+
+/// 覚えてよい文字か（空白だけ・長すぎるものは覚えない）。
+fn is_storable(text: &str) -> bool {
+    !text.trim().is_empty() && text.chars().count() <= MAX_CHARS
 }
 
 /// 件数を範囲に収める。
@@ -139,14 +242,20 @@ pub fn clamp_items(max: usize) -> usize {
     max.clamp(MIN_ITEMS, MAX_ITEMS_LIMIT)
 }
 
-/// 履歴をファイルに保存する形（JSON の文字列の配列、新しい順）にする。
-pub fn to_json(items: &[String]) -> String {
-    serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string())
+/// 履歴をファイルに保存する形（JSON）にする。
+pub fn to_json(saved: &Saved) -> String {
+    serde_json::to_string(saved).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// 保存しておいた形から読む。読めなければ空。
-pub fn from_json(text: &str) -> Vec<String> {
-    serde_json::from_str(text).unwrap_or_default()
+/// 保存しておいた形から読む。前の版の形（文字列の配列、新しい順）も読む。読めなければ空。
+pub fn from_json(text: &str) -> Saved {
+    if let Ok(saved) = serde_json::from_str::<Saved>(text) {
+        return saved;
+    }
+    Saved {
+        pinned: Vec::new(),
+        items: serde_json::from_str(text).unwrap_or_default(),
+    }
 }
 
 /// 一覧を出す操作。
@@ -377,6 +486,10 @@ pub struct Config {
     pub opacity: u32,
     pub page_size: usize,
     pub theme: Theme,
+    /// 一覧から貼り付けたものを、いちばん上に移すか。
+    pub move_to_top: bool,
+    /// 記録しないアプリ（大文字のプロセス名）。
+    pub exclude_apps: Vec<String>,
     /// 使えない値があったときの理由（記録用）。
     pub problem: Option<String>,
 }
@@ -410,6 +523,10 @@ impl Config {
             opacity: settings.opacity.clamp(MIN_OPACITY, MAX_OPACITY),
             page_size: settings.page_size.clamp(MIN_PAGE_SIZE, MAX_PAGE_SIZE),
             theme: Theme::from_setting(&settings.theme),
+            move_to_top: settings.move_to_top,
+            exclude_apps: crate::remap_logic::normalize_apps(
+                settings.exclude_apps.iter().map(String::as_str),
+            ),
             problem,
         }
     }
@@ -611,14 +728,59 @@ mod tests {
         let mut h = History::default();
         h.push("古い");
         h.push("新しい\r\n2 行目");
-        let saved = from_json(&to_json(&items(&h)));
+        h.push("留める");
+        h.pin("留める");
+        let saved = from_json(&to_json(&h.to_saved()));
         let restored = History::from_saved(saved, 100);
-        assert_eq!(items(&restored), items(&h));
+        assert_eq!(restored.entries(), h.entries());
         // 重複や空のものが混じっていても、新しい方を残して読む。
-        let restored =
-            History::from_saved(vec!["a".into(), " ".into(), "b".into(), "a".into()], 100);
+        let restored = History::from_saved(
+            Saved {
+                pinned: vec![],
+                items: vec!["a".into(), " ".into(), "b".into(), "a".into()],
+            },
+            100,
+        );
         assert_eq!(items(&restored), ["a", "b"]);
-        assert!(from_json("壊れた").is_empty());
+        // 前の版の形（文字列の配列）も読める。
+        assert_eq!(from_json(r#"["x","y"]"#).items, ["x", "y"]);
+        assert_eq!(from_json("壊れた"), Saved::default());
+    }
+
+    #[test]
+    fn pins_survive_limits_and_stay_first() {
+        let mut h = History::new(10);
+        h.push("大事");
+        assert!(h.pin("大事"));
+        assert!(!h.pin("大事"));
+        for i in 0..30 {
+            h.push(&i.to_string());
+        }
+        // ピン留めは件数の上限で消えず、先頭に出る。
+        assert_eq!(h.items().next().unwrap(), "大事");
+        assert_eq!(h.len(), 11);
+        // ピン留めと同じ文字をコピーしても増えない。
+        assert!(!h.push("大事"));
+        // 外すと、ふつうの履歴の先頭に戻る。
+        assert!(h.unpin("大事"));
+        assert_eq!(h.entries()[0], ("大事".to_string(), false));
+        assert_eq!(h.len(), 10);
+        // 「履歴を消す」はピン留めを残す。
+        h.pin("大事");
+        h.clear_unpinned();
+        assert_eq!(items(&h), ["大事"]);
+    }
+
+    #[test]
+    fn moves_pasted_to_top() {
+        let mut h = History::default();
+        h.push("a");
+        h.push("b");
+        h.push("c");
+        assert!(h.move_to_top("a"));
+        assert_eq!(items(&h), ["a", "c", "b"]);
+        assert!(!h.move_to_top("a"));
+        assert!(!h.move_to_top("なし"));
     }
 
     #[test]
@@ -639,6 +801,13 @@ mod tests {
         assert_eq!(config.hotkey, Some(Hotkey::parse("Ctrl+Alt+H").unwrap()));
         assert_eq!(config.max_items, 1000);
         assert_eq!(config.theme, Theme::System);
+        assert!(config.move_to_top);
+        assert!(config.exclude_apps.is_empty());
+        let config = Config::from_settings(&ClipboardHistorySettings {
+            exclude_apps: vec!["keepass".into(), "1Password.exe".into()],
+            ..ClipboardHistorySettings::default()
+        });
+        assert_eq!(config.exclude_apps, ["KEEPASS.EXE", "1PASSWORD.EXE"]);
         assert!(config.keep_after_exit);
         assert_eq!((config.width, config.opacity, config.page_size), (260, 90, 20));
         settings.trigger = "double_ctrl".into();

@@ -86,6 +86,10 @@ pub struct ClipboardHistorySettings {
     pub page_size: usize,
     /// 一覧の配色（`"system"` / `"light"` / `"dark"` / `"blue"` / `"green"`）。
     pub theme: String,
+    /// 一覧から貼り付けたものを、履歴のいちばん上に移すか。
+    pub move_to_top: bool,
+    /// 記録しないアプリ（プロセス名）。そのアプリでコピーしたものは履歴に入れない。
+    pub exclude_apps: Vec<String>,
 }
 
 impl Default for ClipboardHistorySettings {
@@ -102,6 +106,8 @@ impl Default for ClipboardHistorySettings {
             opacity: crate::clip_history::DEFAULT_OPACITY,
             page_size: crate::clip_history::DEFAULT_PAGE_SIZE,
             theme: "system".to_string(),
+            move_to_top: true,
+            exclude_apps: Vec::new(),
         }
     }
 }

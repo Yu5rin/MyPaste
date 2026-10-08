@@ -9,7 +9,7 @@
 //! - `OpenProcess` + `QueryFullProcessImageNameW` … 実行ファイルのフルパス
 
 use windows::core::PWSTR;
-use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Foundation::{CloseHandle, HWND};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION,
@@ -29,8 +29,12 @@ pub fn is_target_foreground(apps: &[String]) -> bool {
 /// 最前面のウィンドウのプロセスのファイル名（例 `EXCEL.EXE`）。取れなければ `None`。
 /// （管理者権限で動いているプロセスなどは取れないことがある。動作の記録にも使う）
 pub fn foreground_process_name() -> Option<String> {
+    process_name_of_window(unsafe { GetForegroundWindow() })
+}
+
+/// ウィンドウのプロセスのファイル名（例 `EXCEL.EXE`）。取れなければ `None`。
+pub fn process_name_of_window(hwnd: HWND) -> Option<String> {
     unsafe {
-        let hwnd = GetForegroundWindow();
         if hwnd.is_invalid() {
             return None;
         }

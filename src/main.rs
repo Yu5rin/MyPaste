@@ -400,10 +400,12 @@ fn configure_hotkeys(settings: &config::Settings) {
         (None, None)
     };
     keyboard::set_history_trigger(hotkey, double_tap, history.double_tap_ms);
+    actions::set_history_exclude_apps(history.exclude_apps.clone());
     actions::set_history_config(actions::HistoryConfig {
         record: history.enabled || assigned,
         max_items: history.max_items,
         keep: history.keep_after_exit,
+        move_to_top: history.move_to_top,
         view: history_window::View {
             position: history.position,
             width: history.width,

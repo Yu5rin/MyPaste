@@ -24,6 +24,7 @@ pub enum ActionKind {
     Run,
     PastePlain,
     PasteTransform,
+    PasteSnippet,
     ClipboardHistory,
     ToggleTopmost,
     ShowList,
@@ -48,7 +49,7 @@ pub struct ActionInfo {
 }
 
 /// 動作の一覧（設定画面の一覧もこの順に並べる）。
-pub const ACTIONS: [ActionInfo; 9] = [
+pub const ACTIONS: [ActionInfo; 10] = [
     ActionInfo {
         kind: ActionKind::SendKeys,
         key: "send_keys",
@@ -93,6 +94,15 @@ pub const ACTIONS: [ActionInfo; 9] = [
         hint: "",
         uses_args: false,
         uses_transforms: true,
+    },
+    ActionInfo {
+        kind: ActionKind::PasteSnippet,
+        key: "paste_snippet",
+        name: "定型文を貼り付け",
+        value_label: Some("定型文の名前（定型文の画面の一覧に出ている名前）"),
+        hint: "登録した定型文を、一覧を出さずにすぐ貼り付けます。{date} などは貼り付けるときに置き換えます。名前が見つからないときは、画面に「なし」と出ます。",
+        uses_args: false,
+        uses_transforms: false,
     },
     ActionInfo {
         kind: ActionKind::ClipboardHistory,
@@ -160,6 +170,8 @@ pub enum Action {
     PastePlain,
     /// クリップボードの文字を整えて貼り付ける（クリップボードの中身は変えない）。
     PasteTransform(Vec<Transform>),
+    /// 名前で選んだ定型文を貼り付ける。
+    PasteSnippet(String),
     ClipboardHistory,
     ToggleTopmost,
     ShowList,
@@ -244,6 +256,12 @@ impl Rule {
                     return Err(error(Field::Value, "整え方を 1 つ以上選んでください"));
                 }
                 Action::PasteTransform(transforms)
+            }
+            ActionKind::PasteSnippet => {
+                if value.is_empty() {
+                    return Err(error(Field::Value, "貼り付ける定型文の名前を書いてください"));
+                }
+                Action::PasteSnippet(value.to_string())
             }
             ActionKind::ClipboardHistory => Action::ClipboardHistory,
             ActionKind::ToggleTopmost => Action::ToggleTopmost,
@@ -620,6 +638,10 @@ mod tests {
         assert_eq!(r.action, Action::ClipboardHistory);
         let r = Rule::from_setting(&setting("Ctrl+Alt+L", "show_list", "")).unwrap();
         assert_eq!(r.action, Action::ShowList);
+        let r = Rule::from_setting(&setting("Ctrl+Alt+1", "paste_snippet", " 住所 ")).unwrap();
+        assert_eq!(r.action, Action::PasteSnippet("住所".into()));
+        let e = Rule::from_setting(&setting("Ctrl+Alt+1", "paste_snippet", "")).unwrap_err();
+        assert_eq!(e.field, Field::Value);
         let r = Rule::from_setting(&setting("Ctrl+Alt+T", "paste_transform", "trim,zen_to_han"))
             .unwrap();
         assert_eq!(

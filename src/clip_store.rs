@@ -18,13 +18,15 @@ use crate::{clip_history, config};
 /// 保存しておいた履歴（新しい順）を読む。ファイルが無いときや、別のユーザー・別の PC で
 /// 保存したもので元に戻せないときは空。ファイルがあるのに読めない（ほかのアプリが使っている など）
 /// ときは `Err`（呼び出し側は、その間は上書きしない）。
-pub fn load() -> Result<Vec<String>, String> {
+pub fn load() -> Result<clip_history::Saved, String> {
     let Some(path) = config::clip_history_file() else {
-        return Ok(Vec::new());
+        return Ok(clip_history::Saved::default());
     };
     let data = match std::fs::read(&path) {
         Ok(data) => data,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(clip_history::Saved::default())
+        }
         Err(e) => return Err(e.to_string()),
     };
     match unprotect(&data) {
@@ -32,15 +34,15 @@ pub fn load() -> Result<Vec<String>, String> {
         None => {
             // 別のユーザーや別の PC で保存したもの。読めないので使わない（次の保存で置き換わる）。
             log::warn!("クリップボードの履歴を元に戻せませんでした（別のユーザー・PC で保存したもの）");
-            Ok(Vec::new())
+            Ok(clip_history::Saved::default())
         }
     }
 }
 
 /// 履歴（新しい順）を暗号化して保存する。
-pub fn save(items: &[String]) -> Result<(), String> {
+pub fn save(saved: &clip_history::Saved) -> Result<(), String> {
     let path = config::clip_history_file().ok_or("履歴の保存先を決められません")?;
-    let data = protect(clip_history::to_json(items).as_bytes())
+    let data = protect(clip_history::to_json(saved).as_bytes())
         .ok_or("履歴を暗号化できませんでした")?;
     config::write_file_safely(&path, &data).map_err(|e| e.to_string())
 }

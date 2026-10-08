@@ -94,13 +94,15 @@ const ID_CH_WIDTH: i32 = 152;
 const ID_CH_OPACITY: i32 = 153;
 const ID_CH_PAGE: i32 = 154;
 const ID_CH_THEME: i32 = 155;
+const ID_CH_MOVE_TOP: i32 = 156;
+const ID_CH_EXCLUDE: i32 = 157;
 const ID_EXPORT: i32 = 160;
 const ID_IMPORT: i32 = 161;
 
 
 /// 画面の中身の大きさ（96 DPI 基準）。
 const CLIENT_W: i32 = 948;
-const CLIENT_H: i32 = 578;
+const CLIENT_H: i32 = 640;
 
 /// 画面の構成。並び順がそのまま Tab キーで移る順になる。
 /// 見出しや枠など、ID で触らないものは 200 番台の通し番号にしている。
@@ -143,7 +145,7 @@ const ITEMS: &[Item] = &[
     item(ID_LOG, Kind::Check, "トラブル調査用に動作を記録する（log.txt）", 24, 485, 330, 22),
     item(ID_OPEN_LOG, Kind::Button, "記録を開く", 362, 482, 90, 28),
     // クリップボードの履歴（右の列）
-    item(230, Kind::Group, "クリップボードの履歴", 480, 8, 456, 394),
+    item(230, Kind::Group, "クリップボードの履歴", 480, 8, 456, 456),
     item(ID_CH_ENABLED, Kind::Check, "コピーした文字を記録して、一覧から選んで貼り付ける", 492, 30, 432, 22),
     item(231, Kind::Label, "一覧を出す操作", 492, 60, 120, 24),
     item(ID_CH_TRIGGER, Kind::Combo, "", 616, 60, 308, 200),
@@ -174,18 +176,21 @@ const ITEMS: &[Item] = &[
     item(248, Kind::Label, "配色", 712, 282, 64, 24),
     item(ID_CH_THEME, Kind::Combo, "", 784, 282, 140, 200),
     item(ID_CH_KEEP, Kind::Check, "アプリを終了しても履歴を残す（暗号化して保存）", 492, 312, 432, 22),
-    item(239, Kind::Note, "一覧はクリックか矢印キーと Enter で選びます。一覧の上で Shift+ホイールを回すと不透明度を変えられます。パスワード管理ソフトなどの内容は記録しません。", 492, 338, 334, 58),
-    item(ID_CH_CLEAR, Kind::Button, "履歴を消す", 834, 344, 90, 28),
+    item(ID_CH_MOVE_TOP, Kind::Check, "一覧から貼り付けたものを、いちばん上に移す", 492, 338, 432, 22),
+    item(249, Kind::Label, "記録しないアプリ", 492, 366, 120, 24),
+    item(ID_CH_EXCLUDE, Kind::Edit, "", 616, 366, 308, 24),
+    item(239, Kind::Note, "一覧はクリックか矢印キーと Enter で選び、右クリックでピン留めできます。記録しないアプリはプロセス名を空白で区切って書きます（例: KeePass.exe）。", 492, 398, 334, 58),
+    item(ID_CH_CLEAR, Kind::Button, "履歴を消す", 834, 404, 90, 28),
     // 設定の書き出し・読み込み（右の列）
-    item(240, Kind::Group, "設定の書き出し・読み込み（PC の引っ越しに）", 480, 410, 456, 116),
-    item(241, Kind::Note, "保存済みの設定・キー割り当て・定型文・自動起動の状態を 1 つのファイルにまとめます。新しい PC では、このアプリを置いてから「読み込む」を押します（履歴の中身は含めません）。", 492, 432, 432, 52),
-    item(ID_EXPORT, Kind::Button, "設定を書き出す...", 492, 488, 150, 28),
-    item(ID_IMPORT, Kind::Button, "設定を読み込む...", 650, 488, 150, 28),
+    item(240, Kind::Group, "設定の書き出し・読み込み（PC の引っ越しに）", 480, 472, 456, 116),
+    item(241, Kind::Note, "保存済みの設定・キー割り当て・定型文・自動起動の状態を 1 つのファイルにまとめます。新しい PC では、このアプリを置いてから「読み込む」を押します（履歴の中身は含めません）。", 492, 494, 432, 52),
+    item(ID_EXPORT, Kind::Button, "設定を書き出す...", 492, 550, 150, 28),
+    item(ID_IMPORT, Kind::Button, "設定を読み込む...", 650, 550, 150, 28),
     // 操作ボタン
-    item(ID_OPEN_FOLDER, Kind::Button, "設定ファイルの場所を開く", 12, 538, 178, 28),
-    item(ID_DEFAULTS, Kind::Button, "既定に戻す", 198, 538, 86, 28),
-    item(ID_SAVE, Kind::DefaultButton, "保存", 758, 538, 86, 28),
-    item(ID_CANCEL, Kind::Button, "キャンセル", 850, 538, 86, 28),
+    item(ID_OPEN_FOLDER, Kind::Button, "設定ファイルの場所を開く", 12, 600, 178, 28),
+    item(ID_DEFAULTS, Kind::Button, "既定に戻す", 198, 600, 86, 28),
+    item(ID_SAVE, Kind::DefaultButton, "保存", 758, 600, 86, 28),
+    item(ID_CANCEL, Kind::Button, "キャンセル", 850, 600, 86, 28),
 ];
 
 /// 画面に表示する値。
@@ -336,6 +341,14 @@ unsafe fn fill_history(hwnd: HWND, settings: &ClipboardHistorySettings) {
     set_text(hwnd, ID_CH_WIDTH, &config.width.to_string());
     set_text(hwnd, ID_CH_OPACITY, &config.opacity.to_string());
     set_text(hwnd, ID_CH_PAGE, &config.page_size.to_string());
+    set_checked(hwnd, ID_CH_MOVE_TOP, config.move_to_top);
+    // 空白を含む名前は " で囲む（読むときに 1 つの名前として読めるように）。
+    let exclude: Vec<String> = config
+        .exclude_apps
+        .iter()
+        .map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a.clone() })
+        .collect();
+    set_text(hwnd, ID_CH_EXCLUDE, &exclude.join(" "));
     let theme_index = HistoryTheme::ALL.iter().position(|(t, _, _)| *t == config.theme).unwrap_or(0);
     set_combo_index(hwnd, ID_CH_THEME, theme_index);
     update_history_fields(hwnd);
@@ -361,6 +374,8 @@ unsafe fn update_history_fields(hwnd: HWND) {
         ID_CH_OPACITY,
         ID_CH_PAGE,
         ID_CH_THEME,
+        ID_CH_MOVE_TOP,
+        ID_CH_EXCLUDE,
     ] {
         ui::set_enabled(hwnd, id, on);
     }
@@ -457,6 +472,8 @@ unsafe fn read_history(hwnd: HWND) -> Result<ClipboardHistorySettings, (i32, Str
             .and_then(|i| HistoryTheme::ALL.get(i))
             .map_or("system", |(t, _, _)| t.as_setting())
             .to_string(),
+        move_to_top: is_checked(hwnd, ID_CH_MOVE_TOP),
+        exclude_apps: remap_logic::normalize_apps([get_text(hwnd, ID_CH_EXCLUDE).as_str()]),
     })
 }
 

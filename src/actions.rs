@@ -103,6 +103,8 @@ pub struct HistoryConfig {
     pub max_items: usize,
     /// アプリを終了しても残すか（暗号化してファイルに保存する）。
     pub keep: bool,
+    /// 一覧から貼り付けたものを、いちばん上に移すか。
+    pub move_to_top: bool,
     /// 一覧の出し方（位置・幅・不透明度・1 ページの件数）。
     pub view: history_window::View,
 }
@@ -111,6 +113,7 @@ static HISTORY_CONFIG: Mutex<HistoryConfig> = Mutex::new(HistoryConfig {
     record: false,
     max_items: clip_history::DEFAULT_ITEMS,
     keep: false,
+    move_to_top: true,
     view: history_window::View {
         position: MenuPosition::Caret,
         width: clip_history::DEFAULT_WIDTH,
@@ -308,7 +311,11 @@ unsafe fn apply_history_setting(window: HWND) {
         if config.keep {
             match clip_store::load() {
                 Ok(saved) => {
-                    log::debug!("保存していたクリップボードの履歴を読みました（{} 件）", saved.len());
+                    log::debug!(
+                        "保存していたクリップボードの履歴を読みました（{} 件、ピン留め {} 件）",
+                        saved.items.len(),
+                        saved.pinned.len()
+                    );
                     HISTORY.with(|h| *h.borrow_mut() = History::from_saved(saved, config.max_items));
                     HISTORY_STORE_UNREADABLE.with(|u| u.set(false));
                 }
@@ -374,18 +381,50 @@ fn save_history_now() {
     if HISTORY_STORE_UNREADABLE.with(Cell::get) {
         return;
     }
-    let items: Vec<String> = HISTORY.with(|h| h.borrow().items().cloned().collect());
-    if let Err(e) = clip_store::save(&items) {
+    let saved = HISTORY.with(|h| h.borrow().to_saved());
+    if let Err(e) = clip_store::save(&saved) {
         log::warn!("クリップボードの履歴を保存できませんでした: {e}");
     }
 }
 
-/// 覚えている履歴と、保存した履歴を消す。
-fn clear_all_history() {
-    HISTORY.with(|h| h.borrow_mut().clear());
-    HISTORY_DIRTY.with(|d| d.set(false));
-    clip_store::delete();
-    log::debug!("クリップボードの履歴を消しました");
+/// 覚えている履歴と、保存した履歴を消す（ピン留めしたものは残す）。
+unsafe fn clear_all_history() {
+    let remaining = HISTORY.with(|h| {
+        let mut h = h.borrow_mut();
+        h.clear_unpinned();
+        h.len()
+    });
+    if remaining == 0 {
+        HISTORY_DIRTY.with(|d| d.set(false));
+        clip_store::delete();
+    } else {
+        mark_history_changed();
+        save_history_now();
+    }
+    log::debug!("クリップボードの履歴を消しました（ピン留め {remaining} 件は残します）");
+}
+
+/// 記録しないアプリ（大文字のプロセス名）。
+static EXCLUDE_APPS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// 記録しないアプリを決める（起動時と、設定を保存したとき）。
+pub fn set_history_exclude_apps(apps: Vec<String>) {
+    *EXCLUDE_APPS.lock().unwrap_or_else(|p| p.into_inner()) = apps;
+}
+
+/// 記録しないアプリでコピーされたものか。コピーしたアプリは、クリップボードの持ち主の
+/// ウィンドウから調べる（持ち主がいないときは、前面のアプリとみなす）。
+unsafe fn copied_in_excluded_app() -> bool {
+    let apps = EXCLUDE_APPS.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    if apps.is_empty() {
+        return false;
+    }
+    let owner = GetClipboardOwner().ok().filter(|w| !w.is_invalid());
+    let process = match owner {
+        Some(window) => crate::excel_check::process_name_of_window(window),
+        None => crate::excel_check::foreground_process_name(),
+    };
+    process.is_some_and(|name| remap_logic::is_target_app(&name, &apps))
 }
 
 /// クリップボードが変わった。記録してよい文字なら履歴に加える。
@@ -399,7 +438,10 @@ unsafe fn record_clipboard() {
     if owner.is_some() && owner == Some(clip_window()) {
         return;
     }
-    if IsClipboardFormatAvailable(CF_UNICODETEXT).is_err() || excluded_from_history() {
+    if IsClipboardFormatAvailable(CF_UNICODETEXT).is_err()
+        || excluded_from_history()
+        || copied_in_excluded_app()
+    {
         return;
     }
     if let Some(text) = read_clipboard_text() {
@@ -496,6 +538,7 @@ unsafe fn execute(request: Request) {
         Action::PastePlain => paste_plain(&held),
         Action::PasteTransform(transforms) => paste_transformed(&held, &transforms),
         Action::ClipboardHistory => paste_from_history(&held),
+        Action::PasteSnippet(name) => paste_snippet(&held, &name),
         Action::ShowList => {
             sendinput::suppress_menu(&held);
             show_assignment_list();
@@ -594,7 +637,7 @@ unsafe fn paste_from_history(held: &Hotkey) {
     if !config.record {
         return;
     }
-    let items: Vec<String> = HISTORY.with(|h| h.borrow().items().cloned().collect());
+    let items = HISTORY.with(|h| h.borrow().entries());
     let snippets = snippets();
     if items.is_empty() && snippets.is_empty() {
         ime_indicator::notify("空");
@@ -626,6 +669,18 @@ unsafe fn paste_from_history(held: &Hotkey) {
             mark_history_changed();
         }
     }
+    if !outcome.pin_changes.is_empty() {
+        let changed = HISTORY.with(|h| {
+            let mut h = h.borrow_mut();
+            outcome.pin_changes.iter().fold(false, |changed, (text, pin)| {
+                let done = if *pin { h.pin(text) } else { h.unpin(text) };
+                done || changed
+            })
+        });
+        if changed {
+            mark_history_changed();
+        }
+    }
     if !outcome.registered.is_empty() {
         register_snippets(&outcome.registered);
     }
@@ -633,7 +688,13 @@ unsafe fn paste_from_history(held: &Hotkey) {
         snippet_window::open();
     }
     let text = match outcome.chosen {
-        Some(history_window::Pick::History(text)) => text,
+        Some(history_window::Pick::History(text)) => {
+            // 貼り付けたものを、いちばん上に移す（設定で選べる。ピン留めしたものは動かさない）。
+            if config.move_to_top && HISTORY.with(|h| h.borrow_mut().move_to_top(&text)) {
+                mark_history_changed();
+            }
+            text
+        }
         // 定型文は {date} などを置き換えてから貼り付ける。
         Some(history_window::Pick::Snippet(text)) => {
             hotkey_rules::expand_placeholders(&text, &local_time())
@@ -644,6 +705,22 @@ unsafe fn paste_from_history(held: &Hotkey) {
     pump_messages_until(MENU_REFOCUS_WAIT, || false);
     log::debug!("クリップボードの履歴・定型文から貼り付けます（{} 文字）", text.chars().count());
     paste_text(&Hotkey::unpack(0), &text);
+}
+
+/// 名前で選んだ定型文を貼り付ける（キー割り当て「定型文を貼り付け」）。
+unsafe fn paste_snippet(held: &Hotkey, name: &str) {
+    let found = snippets()
+        .into_iter()
+        .find(|s| crate::snippets::display_name(s) == name.trim());
+    let Some(snippet) = found else {
+        log::warn!("キー割り当て: 定型文「{name}」が見つかりません");
+        sendinput::release_modifiers(held);
+        ime_indicator::notify("なし");
+        return;
+    };
+    let text = hotkey_rules::expand_placeholders(&snippet.text, &local_time());
+    log::debug!("キー割り当て: 定型文「{name}」を貼り付けます（{} 文字）", text.chars().count());
+    paste_text(held, &text);
 }
 
 /// 定型文（[`crate::snippets`]）。起動時・設定の読み込み・定型文の画面で保存したときに差し替える。

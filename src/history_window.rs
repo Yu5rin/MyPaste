@@ -99,6 +99,9 @@ const MENU_REGISTER: usize = 2;
 const MENU_DELETE: usize = 3;
 const MENU_EDIT_SNIPPETS: usize = 4;
 const MENU_CLOSE: usize = 5;
+const MENU_PIN: usize = 6;
+/// ピン留めした行の左端に引く線の太さ（96 DPI 基準）。
+const PIN_BAR_W: i32 = 3;
 
 /// 画面の部品（位置と大きさは、幅と件数に合わせて [`layout`] で決める）。見出しは自分で描く
 /// ウィンドウなので、ここには一覧だけを書く。
@@ -135,6 +138,8 @@ pub struct Outcome {
     pub removed: Vec<String>,
     /// 履歴から定型文に登録したもの。
     pub registered: Vec<String>,
+    /// ピン留めを変えたもの（文字, ピン留めしたか）。同じものを何度も変えたら、最後のものが効く。
+    pub pin_changes: Vec<(String, bool)>,
     /// 「定型文の編集...」を選んだ。
     pub edit_snippets: bool,
     /// Shift+ホイールで変えた不透明度（変えなければ `None`）。
@@ -177,8 +182,9 @@ impl Tab {
 
 /// 画面を開いている間の状態。
 struct State {
-    /// 履歴（新しい順。一覧で消したものは除いていく）。
-    history: Vec<String>,
+    /// 履歴（ピン留めしたものが先、続けて新しい順）と、ピン留めしているか。一覧で消したものは
+    /// 除いていく。
+    history: Vec<(String, bool)>,
     snippets: Vec<Snippet>,
     tab: Tab,
     /// タブごとの (選んでいる位置, 出しているページ)。
@@ -225,17 +231,18 @@ impl State {
         self.places[self.tab.index()] = (selected, page);
     }
 
-    /// 位置 `index` の行に出すもの: (番号, 出す文, 行数)。
-    fn row(&self, index: usize) -> Option<(usize, String, usize)> {
+    /// 位置 `index` の行に出すもの: (番号, 出す文, 行数, ピン留めしているか)。
+    fn row(&self, index: usize) -> Option<(usize, String, usize, bool)> {
         match self.tab {
             Tab::History => {
-                let (text, lines) = clip_history::row_text(self.history.get(index)?);
-                Some((index + 1, text, lines))
+                let (text, pinned) = self.history.get(index)?;
+                let (shown, lines) = clip_history::row_text(text);
+                Some((index + 1, shown, lines, *pinned))
             }
             Tab::Snippets => {
                 let snippet = self.snippets.get(index)?;
                 let lines = clip_history::row_text(&snippet.text).1;
-                Some((index + 1, snippets::display_name(snippet), lines))
+                Some((index + 1, snippets::display_name(snippet), lines, false))
             }
         }
     }
@@ -243,7 +250,7 @@ impl State {
     /// 位置 `index` の全文。
     fn full_text(&self, index: usize) -> Option<String> {
         match self.tab {
-            Tab::History => self.history.get(index).cloned(),
+            Tab::History => self.history.get(index).map(|(t, _)| t.clone()),
             Tab::Snippets => self.snippets.get(index).map(|s| s.text.clone()),
         }
     }
@@ -260,7 +267,7 @@ fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
 /// 一覧の画面を出し、閉じるまで待つ。画面を前面にできなかったときは `None`
 /// （前面にできないまま出すと、キーで操作できず、閉じられなくなるため）。
 pub unsafe fn choose(
-    history: Vec<String>,
+    history: Vec<(String, bool)>,
     snippets: Vec<Snippet>,
     view: View,
     target: HWND,
@@ -624,7 +631,7 @@ unsafe fn remove_current(hwnd: HWND) {
         if pos >= st.history.len() {
             return None;
         }
-        let text = st.history.remove(pos);
+        let (text, _) = st.history.remove(pos);
         st.outcome.removed.push(text);
         let count = st.history.len();
         let selected = (count > 0).then(|| pos.min(count - 1));
@@ -643,7 +650,7 @@ unsafe fn register_current(hwnd: HWND) {
         if st.tab != Tab::History {
             return None;
         }
-        let text = st.selected().and_then(|pos| st.history.get(pos).cloned())?;
+        let text = st.selected().and_then(|pos| st.history.get(pos).map(|(t, _)| t.clone()))?;
         let snippet = snippets::make("", &text).ok()?;
         if st.snippets.iter().any(|s| s.text == snippet.text)
             || st.snippets.len() >= snippets::MAX_SNIPPETS
@@ -663,9 +670,32 @@ unsafe fn register_current(hwnd: HWND) {
     }
 }
 
+/// 選んでいる履歴のピン留めを切り替える。ピン留めしたものは、件数の上限で消えない。
+unsafe fn toggle_pin_current(hwnd: HWND) {
+    let changed = with_state(|st| {
+        if st.tab != Tab::History {
+            return None;
+        }
+        let pos = st.selected()?;
+        let (text, pinned) = st.history.get_mut(pos)?;
+        *pinned = !*pinned;
+        let change = (text.clone(), *pinned);
+        st.outcome.pin_changes.push(change);
+        Some(())
+    })
+    .flatten();
+    if changed.is_some() {
+        let _ = InvalidateRect(control(hwnd, ID_LIST), None, true);
+    }
+}
+
 /// 右クリックのメニューを出す。
 unsafe fn context_menu(hwnd: HWND, point: POINT) {
-    let Some((tab, has_row)) = with_state(|st| (st.tab, st.selected().is_some())) else {
+    let Some((tab, has_row, pinned)) = with_state(|st| {
+        let pinned = st.tab == Tab::History
+            && st.selected().and_then(|p| st.history.get(p)).is_some_and(|(_, p)| *p);
+        (st.tab, st.selected().is_some(), pinned)
+    }) else {
         return;
     };
     let Ok(menu) = CreatePopupMenu() else {
@@ -674,6 +704,12 @@ unsafe fn context_menu(hwnd: HWND, point: POINT) {
     let row_flag = if has_row { MF_STRING } else { MF_STRING | MF_GRAYED };
     let _ = AppendMenuW(menu, row_flag, MENU_PASTE, w!("貼り付け(&P)"));
     if tab == Tab::History {
+        let pin_label = if pinned {
+            w!("ピン留めを外す(&I)")
+        } else {
+            w!("ピン留めする(&I)")
+        };
+        let _ = AppendMenuW(menu, row_flag, MENU_PIN, pin_label);
         let _ = AppendMenuW(menu, row_flag, MENU_REGISTER, w!("定型文に登録(&T)"));
         let _ = AppendMenuW(menu, row_flag, MENU_DELETE, w!("この履歴を消す(&D)"));
     }
@@ -693,6 +729,7 @@ unsafe fn context_menu(hwnd: HWND, point: POINT) {
     match chosen {
         MENU_PASTE => choose_current(),
         MENU_REGISTER => register_current(hwnd),
+        MENU_PIN => toggle_pin_current(hwnd),
         MENU_DELETE => remove_current(hwnd),
         MENU_EDIT_SNIPPETS => {
             with_state(|st| st.outcome.edit_snippets = true);
@@ -792,10 +829,11 @@ unsafe fn draw_row(item: &DRAWITEMSTRUCT) {
     let Ok(row) = usize::try_from(item.itemID) else {
         return;
     };
-    let Some(Some((number, text, lines, dpi, font, colors))) = with_state(|st| {
+    let Some(Some((number, text, lines, pinned, dpi, font, colors))) = with_state(|st| {
         let index = st.page() * st.page_size + row;
-        st.row(index)
-            .map(|(number, text, lines)| (number, text, lines, st.dpi, st.font, st.colors))
+        st.row(index).map(|(number, text, lines, pinned)| {
+            (number, text, lines, pinned, st.dpi, st.font, st.colors)
+        })
     }) else {
         return;
     };
@@ -810,6 +848,14 @@ unsafe fn draw_row(item: &DRAWITEMSTRUCT) {
         colors.back
     };
     fill(hdc, &rect, background);
+    if pinned {
+        // ピン留めしたものは、左端に色の線を引いて分かるようにする。
+        let bar = RECT {
+            right: rect.left + ui::scale(PIN_BAR_W, dpi),
+            ..rect
+        };
+        fill(hdc, &bar, if selected { colors.sel_text } else { colors.sel_back });
+    }
     let old_font = SelectObject(hdc, font);
     SetBkMode(hdc, TRANSPARENT);
     let (main, sub) = if selected {
@@ -940,7 +986,7 @@ unsafe fn update_tip(hwnd: HWND) {
         Some((st.full_text(pos)?, st.row(pos)?))
     })
     .flatten();
-    let (Some(row), Some((full, (_, shown, lines)))) = (row, content) else {
+    let (Some(row), Some((full, (_, shown, lines, _)))) = (row, content) else {
         let _ = ShowWindow(tip, SW_HIDE);
         return;
     };
