@@ -388,7 +388,12 @@ fn configure_hotkeys(settings: &config::Settings) {
         record: history.enabled || assigned,
         max_items: history.max_items,
         keep: history.keep_after_exit,
-        position: history.position,
+        view: history_window::View {
+            position: history.position,
+            width: history.width,
+            opacity: history.opacity,
+            page_size: history.page_size,
+        },
     });
 }
 

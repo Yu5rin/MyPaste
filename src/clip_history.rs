@@ -25,8 +25,18 @@ pub const DOUBLE_TAP_MS_MAX: u32 = 1000;
 pub const DEFAULT_DOUBLE_TAP_MS: u32 = 400;
 /// 一覧の 1 行に出す文字数の上限（実際には欄の幅に合わせて「…」で切る）。
 const ROW_CHARS: usize = 200;
-/// 一覧の 1 ページに並べる件数。
-pub const PAGE_SIZE: usize = 20;
+/// 一覧の 1 ページに並べる件数の範囲と既定値。
+pub const MIN_PAGE_SIZE: usize = 10;
+pub const MAX_PAGE_SIZE: usize = 40;
+pub const DEFAULT_PAGE_SIZE: usize = 20;
+/// 一覧の画面の幅（96 DPI 基準のピクセル）の範囲と既定値。
+pub const MIN_WIDTH: u32 = 200;
+pub const MAX_WIDTH: u32 = 600;
+pub const DEFAULT_WIDTH: u32 = 260;
+/// 一覧の画面の不透明度（%）の範囲と既定値。
+pub const MIN_OPACITY: u32 = 30;
+pub const MAX_OPACITY: u32 = 100;
+pub const DEFAULT_OPACITY: u32 = 90;
 /// 全文の吹き出しに出す行数と、1 行の文字数の上限。
 const TIP_LINES: usize = 20;
 const TIP_LINE_CHARS: usize = 200;
@@ -228,6 +238,10 @@ pub struct Config {
     pub max_items: usize,
     pub keep_after_exit: bool,
     pub position: MenuPosition,
+    /// 一覧の画面の幅（96 DPI 基準）・不透明度（%）・1 ページの件数。
+    pub width: u32,
+    pub opacity: u32,
+    pub page_size: usize,
     /// 使えない値があったときの理由（記録用）。
     pub problem: Option<String>,
 }
@@ -257,6 +271,9 @@ impl Config {
             max_items: clamp_items(settings.max_items),
             keep_after_exit: settings.keep_after_exit,
             position: MenuPosition::from_setting(&settings.position),
+            width: settings.width.clamp(MIN_WIDTH, MAX_WIDTH),
+            opacity: settings.opacity.clamp(MIN_OPACITY, MAX_OPACITY),
+            page_size: settings.page_size.clamp(MIN_PAGE_SIZE, MAX_PAGE_SIZE),
             problem,
         }
     }
@@ -357,55 +374,25 @@ pub fn tip_text(text: &str) -> String {
     shown.join("\r\n")
 }
 
-/// ページの数（0 件でも 1 ページ）。
-pub fn page_count(len: usize) -> usize {
-    len.div_ceil(PAGE_SIZE).max(1)
+/// ページの数（0 件でも 1 ページ）。`size` は 1 ページの件数。
+pub fn page_count(len: usize, size: usize) -> usize {
+    len.div_ceil(size.max(1)).max(1)
 }
 
 /// `page` ページ目（0 から）に並べる位置の範囲。
-pub fn page_range(page: usize, len: usize) -> std::ops::Range<usize> {
-    let start = (page * PAGE_SIZE).min(len);
-    start..(start + PAGE_SIZE).min(len)
+pub fn page_range(page: usize, len: usize, size: usize) -> std::ops::Range<usize> {
+    let size = size.max(1);
+    let start = (page * size).min(len);
+    start..(start + size).min(len)
 }
 
-/// ページの見出し（例 `1〜20 件目 / 100 件`、絞り込み中は `1〜3 件目 / 3 件（絞り込み）`）。
-pub fn page_label(page: usize, len: usize, filtered: bool) -> String {
-    let range = page_range(page, len);
-    let tail = if filtered { "（絞り込み）" } else { "" };
+/// 一覧の上に出す見出し（例 `履歴 1〜20 / 100`）。
+pub fn page_label(page: usize, len: usize, size: usize) -> String {
+    let range = page_range(page, len, size);
     if range.is_empty() {
-        return format!("0 件{tail}");
+        return "履歴 0 件".to_string();
     }
-    format!("{}〜{} 件目 / {len} 件{tail}", range.start + 1, range.end)
-}
-
-/// 絞り込み。`query` を空白で区切った語を**すべて**含むものの位置を返す（大文字・小文字、
-/// 全角・半角の英数字は区別しない）。`query` が空ならすべて。
-pub fn filter<'a>(items: impl IntoIterator<Item = &'a String>, query: &str) -> Vec<usize> {
-    let words: Vec<String> = query.split_whitespace().map(normalize).collect();
-    items
-        .into_iter()
-        .enumerate()
-        .filter(|(_, text)| {
-            if words.is_empty() {
-                return true;
-            }
-            let text = normalize(text);
-            words.iter().all(|w| text.contains(w.as_str()))
-        })
-        .map(|(i, _)| i)
-        .collect()
-}
-
-/// 絞り込み用に、全角の英数字・記号を半角に、英字を小文字にそろえる。
-fn normalize(text: &str) -> String {
-    text.chars()
-        .map(|c| match c {
-            '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
-            '\u{3000}' => ' ',
-            _ => c,
-        })
-        .flat_map(char::to_lowercase)
-        .collect()
+    format!("履歴 {}〜{} / {len}", range.start + 1, range.end)
 }
 
 #[cfg(test)]
@@ -484,14 +471,19 @@ mod tests {
         assert_eq!(config.hotkey, Some(Hotkey::parse("Ctrl+Alt+H").unwrap()));
         assert_eq!(config.max_items, 100);
         assert!(config.keep_after_exit);
+        assert_eq!((config.width, config.opacity, config.page_size), (260, 90, 20));
         settings.trigger = "double_ctrl".into();
         settings.max_items = 500;
         settings.double_tap_ms = 50;
+        settings.width = 5000;
+        settings.opacity = 0;
+        settings.page_size = 1;
         let config = Config::from_settings(&settings);
         assert_eq!(config.trigger, Trigger::DoubleCtrl);
         assert_eq!(config.hotkey, None);
         assert_eq!(config.max_items, 100);
         assert_eq!(config.double_tap_ms, DOUBLE_TAP_MS_MIN);
+        assert_eq!((config.width, config.opacity, config.page_size), (600, 30, 10));
         settings.trigger = "hotkey".into();
         settings.hotkey = "H".into();
         let config = Config::from_settings(&settings);
@@ -560,29 +552,15 @@ mod tests {
 
     #[test]
     fn pages() {
-        assert_eq!(page_count(0), 1);
-        assert_eq!(page_count(20), 1);
-        assert_eq!(page_count(21), 2);
-        assert_eq!(page_count(100), 5);
-        assert_eq!(page_range(1, 25), 20..25);
-        assert_eq!(page_range(3, 25), 25..25);
-        assert_eq!(page_label(0, 100, false), "1〜20 件目 / 100 件");
-        assert_eq!(page_label(1, 25, true), "21〜25 件目 / 25 件（絞り込み）");
-        assert_eq!(page_label(0, 0, true), "0 件（絞り込み）");
-    }
-
-    #[test]
-    fn filters() {
-        let items: Vec<String> = ["Hello World", "ＡＢＣ商事", "見積書 2026", "hello"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(filter(&items, ""), [0, 1, 2, 3]);
-        assert_eq!(filter(&items, "HELLO"), [0, 3]);
-        assert_eq!(filter(&items, "abc"), [1]);
-        assert_eq!(filter(&items, "見積　２０２６"), [2]);
-        assert_eq!(filter(&items, "hello world"), [0]);
-        assert!(filter(&items, "なし").is_empty());
+        assert_eq!(page_count(0, 20), 1);
+        assert_eq!(page_count(20, 20), 1);
+        assert_eq!(page_count(21, 20), 2);
+        assert_eq!(page_count(100, 30), 4);
+        assert_eq!(page_range(1, 25, 20), 20..25);
+        assert_eq!(page_range(3, 25, 20), 25..25);
+        assert_eq!(page_label(0, 100, 20), "履歴 1〜20 / 100");
+        assert_eq!(page_label(1, 25, 20), "履歴 21〜25 / 25");
+        assert_eq!(page_label(0, 0, 20), "履歴 0 件");
     }
 
     #[test]

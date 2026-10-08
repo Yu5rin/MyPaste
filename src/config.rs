@@ -61,6 +61,12 @@ pub struct ClipboardHistorySettings {
     pub keep_after_exit: bool,
     /// 一覧を出す位置（`"caret"` / `"mouse"`）。
     pub position: String,
+    /// 一覧の画面の幅（96 DPI 基準のピクセル。200〜600）。
+    pub width: u32,
+    /// 一覧の画面の不透明度（%。30〜100）。一覧の上で Shift+ホイールでも変えられる。
+    pub opacity: u32,
+    /// 一覧の 1 ページに並べる件数（10〜40）。
+    pub page_size: usize,
 }
 
 impl Default for ClipboardHistorySettings {
@@ -73,6 +79,9 @@ impl Default for ClipboardHistorySettings {
             max_items: crate::clip_history::DEFAULT_ITEMS,
             keep_after_exit: true,
             position: "caret".to_string(),
+            width: crate::clip_history::DEFAULT_WIDTH,
+            opacity: crate::clip_history::DEFAULT_OPACITY,
+            page_size: crate::clip_history::DEFAULT_PAGE_SIZE,
         }
     }
 }
@@ -299,6 +308,11 @@ pub fn save_from_settings_window(settings: &Settings) -> Result<(), String> {
         },
         "clipboard_history": settings.clipboard_history,
     }))
+}
+
+/// クリップボードの履歴の一覧の不透明度だけを書き込む（一覧の上で Shift+ホイールで変えたとき）。
+pub fn save_clipboard_history_opacity(opacity: u32) -> Result<(), String> {
+    save_patch(&serde_json::json!({ "clipboard_history": { "opacity": opacity } }))
 }
 
 /// キー割り当ての一覧を `settings.json` に書き込む（キー割り当て画面から使う）。

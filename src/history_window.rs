@@ -1,19 +1,19 @@
-//! クリップボードの履歴の一覧（Clibor のような、小さな一覧の画面）。
+//! クリップボードの履歴の一覧（Clibor のような、小さな半透明の一覧の画面）。
 //!
-//! 一覧を出す操作をすると、入力位置（またはマウス）の近くに細長い画面を出す。
+//! 一覧を出す操作をすると、入力位置（またはマウス）の近くに、細長い枠だけの画面を出す。
 //!
-//! - 上: 検索の欄。文字を打つと、その語を含むものだけに絞る（空白で区切ると、すべてを含むもの）。
-//! - その下: ページの見出し（`1〜20 件目 / 100 件`）と、前後のページへ移るボタン。
-//! - 一覧: 1 ページ 20 件。1 行に 1 件、番号・最初の行・行数を出し、1 行おきに色を変える。
-//!   マウスを乗せた行・矢印キーで選んだ行が選ばれる。
-//! - 選んだものが 1 行に収まらないときは、横に全文の吹き出しを出す。
+//! - 上: 見出し（`履歴 1〜20 / 100`）。
+//! - 一覧: 1 ページに決めた件数（既定 20 件）。1 行に 1 件、番号・最初の行・行数を出し、1 行おきに
+//!   色を変える。マウスを乗せた行・矢印キーで選んだ行が選ばれる。
+//! - 選んだものが 1 行に収まらないときは、選んだ行の横に全文の吹き出しを出す。
 //!
-//! クリックか Enter で、選んだものを貼り付ける（[`crate::actions`] が行う）。左右の矢印キーと
-//! マウスのホイールでページを移る。Esc か、ほかの場所をクリックすると何もせずに閉じる。
-//! Shift+Delete で、選んでいる 1 件を履歴から消す。
+//! 画面は半透明（不透明度は設定で決め、一覧の上で Shift+ホイールでも変えられる）。
+//! クリックか Enter で、選んだものを貼り付ける（[`crate::actions`] が行う）。PageUp / PageDown・
+//! 左右の矢印キー・ホイールでページを移る。Esc か、ほかの場所をクリックすると何もせずに閉じる。
+//! Delete で、選んでいる 1 件を履歴から消す。
 //!
 //! 実行スレッド（[`crate::actions`]）で、閉じるまで専用のメッセージループを回す。
-//! ページ分け・絞り込み・表示する文の整え方は [`crate::clip_history`] にあり、Linux でもテストできる。
+//! ページ分けと表示する文の整え方は [`crate::clip_history`] にあり、Linux でもテストできる。
 
 use std::cell::RefCell;
 use std::time::Duration;
@@ -31,65 +31,71 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, EM_SETCUEBANNER, ODS_SELECTED};
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN,
-    VK_RIGHT, VK_SHIFT, VK_UP,
+    SetFocus, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR,
+    VK_RETURN, VK_RIGHT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
     GetDlgItem, GetForegroundWindow, GetGUIThreadInfo, GetMessageW, GetWindowRect,
     GetWindowThreadProcessId, IsChild, PostQuitMessage, RegisterClassW, SendMessageW,
-    SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, GUITHREADINFO, HWND_TOPMOST,
-    LB_GETITEMRECT, LB_ITEMFROMPOINT, LB_SETCOUNT, LB_SETCURSEL, LB_SETITEMHEIGHT, MA_NOACTIVATE,
-    MSG, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND,
-    WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE,
-    WM_PAINT, WM_QUIT, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP, WS_SYSMENU,
+    SetForegroundWindow, SetLayeredWindowAttributes, SetWindowPos, ShowWindow, TranslateMessage,
+    GUITHREADINFO, HWND_TOPMOST, LB_GETITEMRECT, LB_ITEMFROMPOINT, LB_SETCOUNT, LB_SETCURSEL,
+    LB_SETITEMHEIGHT, LWA_ALPHA, MA_NOACTIVATE, MSG, SWP_NOACTIVATE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SW_HIDE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_DRAWITEM,
+    WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_QUIT,
+    WNDCLASSW, WS_BORDER, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 
-use crate::clip_history::{self, MenuPosition, PAGE_SIZE};
+use crate::clip_history::{self, MenuPosition};
 use crate::ime_indicator;
-use crate::ui::{self, item, set_text, wide, Item, Kind};
+use crate::ui::{self, item, set_text, Item, Kind};
 
-const ID_SEARCH: i32 = 1;
-const ID_PREV: i32 = 2;
-const ID_PAGE: i32 = 3;
-const ID_NEXT: i32 = 4;
-const ID_LIST: i32 = 5;
+const ID_PAGE: i32 = 1;
+const ID_LIST: i32 = 2;
 
-/// 一覧の 1 行の高さ（96 DPI 基準）。
-const ROW_H: i32 = 20;
-/// 画面の中身の大きさ（96 DPI 基準）。1 ページ分の行がちょうど入る高さにする。
-const CLIENT_W: i32 = 300;
-const LIST_Y: i32 = 56;
-const LIST_H: i32 = ROW_H * PAGE_SIZE as i32 + 4;
-const CLIENT_H: i32 = LIST_Y + LIST_H + 4;
+/// 一覧の 1 行の高さと、見出しの高さ（96 DPI 基準）。
+const ROW_H: i32 = 18;
+const HEADER_H: i32 = 18;
 /// 番号の欄と、行数の欄の幅（96 DPI 基準）。
-const NUMBER_W: i32 = 26;
-const LINES_W: i32 = 34;
-const PAD: i32 = 5;
+const NUMBER_W: i32 = 24;
+const LINES_W: i32 = 30;
+const PAD: i32 = 4;
+/// ホイールのとき Shift が押されていたか（WM_MOUSEWHEEL の MK_SHIFT）。
+const MK_SHIFT: usize = 0x0004;
+/// Shift+ホイール 1 目盛りで変える不透明度（%）。
+const OPACITY_STEP: u32 = 5;
 /// 全文の吹き出しの幅の上限と高さの上限（96 DPI 基準）。
 const TIP_MAX_W: i32 = 380;
 const TIP_MAX_H: i32 = 340;
 const TIP_PAD: i32 = 6;
-/// 検索の欄が書き換わった（EN_CHANGE）、ボタンが押された（BN_CLICKED）。
-const EN_CHANGE: u32 = 0x0300;
-const BN_CLICKED: u32 = 0;
-/// 画面の枠。小さなタイトルバー（ドラッグで動かせる）と閉じるボタンを付ける。タイトルバーの
-/// 無い画面は、環境によってはキー入力を受け取れないことがあるため。
-const WINDOW_FRAME: WINDOW_STYLE = WINDOW_STYLE(WS_POPUP.0 | WS_CAPTION.0 | WS_SYSMENU.0);
+/// 画面の枠（タイトルバーの無い、細い枠だけの画面）。
+const WINDOW_FRAME: WINDOW_STYLE = WINDOW_STYLE(WS_POPUP.0 | WS_BORDER.0);
+const WINDOW_EX: WINDOW_EX_STYLE =
+    WINDOW_EX_STYLE(WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0 | WS_EX_LAYERED.0);
 /// 前面にするまで待つ時間。
 const SHOW_WAIT: Duration = Duration::from_millis(30);
 
+/// 画面の部品（位置と大きさは、幅と件数に合わせて [`layout`] で決める）。
 const ITEMS: &[Item] = &[
-    item(ID_SEARCH, Kind::Edit, "", 4, 4, 292, 24),
-    item(ID_PREV, Kind::Button, "◀", 4, 32, 28, 22),
-    item(ID_PAGE, Kind::Label, "", 38, 32, 224, 22),
-    item(ID_NEXT, Kind::Button, "▶", 268, 32, 28, 22),
-    item(ID_LIST, Kind::OwnerList, "", 4, LIST_Y, 292, LIST_H),
+    item(ID_PAGE, Kind::Label, "", 0, 0, 0, 0),
+    item(ID_LIST, Kind::OwnerList, "", 0, 0, 0, 0),
 ];
+
+/// 画面の出し方（設定の値）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct View {
+    pub position: MenuPosition,
+    /// 幅（96 DPI 基準）。
+    pub width: u32,
+    /// 不透明度（%）。
+    pub opacity: u32,
+    /// 1 ページの件数。
+    pub page_size: usize,
+}
 
 /// 一覧の画面の結果。
 #[derive(Debug, Default)]
@@ -98,19 +104,20 @@ pub struct Outcome {
     pub chosen: Option<String>,
     /// 一覧で消したもの。
     pub removed: Vec<String>,
+    /// Shift+ホイールで変えた不透明度（変えなければ `None`）。
+    pub opacity: Option<u32>,
 }
 
 /// 画面を開いている間の状態。
 struct State {
     /// 履歴（新しい順。一覧で消したものは除いていく）。
     items: Vec<String>,
-    /// 絞り込んだ結果（`items` の位置）。
-    visible: Vec<usize>,
-    /// 選んでいる位置（`visible` の中の位置）。
+    /// 選んでいる位置。
     selected: Option<usize>,
     /// 出しているページ（0 から）。
     page: usize,
-    filtered: bool,
+    page_size: usize,
+    opacity: u32,
     dpi: u32,
     font: HFONT,
     /// 全文の吹き出しと、そこに出している文。
@@ -130,8 +137,8 @@ fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
 
 /// 一覧の画面を出し、閉じるまで待つ。画面を前面にできなかったときは `None`
 /// （前面にできないまま出すと、キーで操作できず、閉じられなくなるため）。
-pub unsafe fn choose(items: Vec<String>, position: MenuPosition, target: HWND) -> Option<Outcome> {
-    let anchor = anchor_point(target, position);
+pub unsafe fn choose(items: Vec<String>, view: View, target: HWND) -> Option<Outcome> {
+    let anchor = anchor_point(target, view.position);
     let monitor = MonitorFromPoint(anchor, MONITOR_DEFAULTTONEAREST);
     let mut dpi = 96;
     let mut dpi_y = 96;
@@ -145,11 +152,11 @@ pub unsafe fn choose(items: Vec<String>, position: MenuPosition, target: HWND) -
     let count = items.len();
     STATE.with(|s| {
         *s.borrow_mut() = Some(State {
-            visible: (0..count).collect(),
             items,
             selected: (count > 0).then_some(0),
             page: 0,
-            filtered: false,
+            page_size: view.page_size.max(1),
+            opacity: view.opacity,
             dpi,
             font,
             tip,
@@ -158,20 +165,12 @@ pub unsafe fn choose(items: Vec<String>, position: MenuPosition, target: HWND) -
             done: false,
         })
     });
+    set_opacity(hwnd, view.opacity);
     ui::create_controls(hwnd, ITEMS, font);
-    ui::layout(hwnd, ITEMS, dpi);
-    let list = control(hwnd, ID_LIST);
-    SendMessageW(list, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(ui::scale(ROW_H, dpi) as isize));
-    let cue = wide("検索（Enter で貼り付け・Esc で閉じる）");
-    SendMessageW(
-        control(hwnd, ID_SEARCH),
-        EM_SETCUEBANNER,
-        WPARAM(1),
-        LPARAM(cue.as_ptr() as isize),
-    );
+    let (client_w, client_h) = layout(hwnd, view, dpi);
 
     // 置く場所: 基準の位置の下（入らなければ上）。モニターの作業領域に収める。
-    let (width, height) = window_size(dpi);
+    let (width, height) = window_size(client_w, client_h, dpi);
     let work = work_area(monitor);
     let mut x = anchor.x;
     let mut y = anchor.y + ui::scale(4, dpi);
@@ -187,13 +186,42 @@ pub unsafe fn choose(items: Vec<String>, position: MenuPosition, target: HWND) -
         close(hwnd);
         return None;
     }
-    let _ = SetFocus(control(hwnd, ID_SEARCH));
+    let _ = SetFocus(control(hwnd, ID_LIST));
     show_page(hwnd);
 
     run_loop(hwnd);
     let outcome = with_state(|st| std::mem::take(&mut st.outcome));
     close(hwnd);
     outcome
+}
+
+/// 見出しと一覧を、幅と件数に合わせて置く。中身の大きさ（幅, 高さ）を返す。
+unsafe fn layout(hwnd: HWND, view: View, dpi: u32) -> (i32, i32) {
+    let width = ui::scale(view.width as i32, dpi);
+    let header_h = ui::scale(HEADER_H, dpi);
+    let row_h = ui::scale(ROW_H, dpi);
+    // 一覧は枠（左右・上下に約 2 ピクセル）の分だけ高くして、1 ページの行がちょうど入るようにする。
+    let list_h = row_h * view.page_size as i32 + ui::scale(4, dpi);
+    let pad = ui::scale(PAD, dpi);
+    let _ = SetWindowPos(
+        control(hwnd, ID_PAGE),
+        None,
+        pad,
+        0,
+        width - pad * 2,
+        header_h,
+        SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+    let list = control(hwnd, ID_LIST);
+    let _ = SetWindowPos(list, None, 0, header_h, width, list_h, SWP_NOZORDER | SWP_NOACTIVATE);
+    SendMessageW(list, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(row_h as isize));
+    (width, header_h + list_h)
+}
+
+/// 画面の不透明度を変える。
+unsafe fn set_opacity(hwnd: HWND, opacity: u32) {
+    let alpha = (opacity.clamp(clip_history::MIN_OPACITY, 100) * 255 / 100) as u8;
+    let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
 }
 
 /// 画面を閉じ、状態を片付ける。
@@ -205,8 +233,7 @@ unsafe fn close(hwnd: HWND) {
     let _ = DestroyWindow(hwnd);
 }
 
-/// 閉じるまでメッセージを処理する。キー操作は、検索の欄に入力しながらでも一覧を動かせる
-/// よう、ここで先に受け取る。
+/// 閉じるまでメッセージを処理する。キー操作とホイールはここで先に受け取る。
 unsafe fn run_loop(hwnd: HWND) {
     let list = control(hwnd, ID_LIST);
     let mut msg = MSG::default();
@@ -223,15 +250,21 @@ unsafe fn run_loop(hwnd: HWND) {
             continue;
         }
         if ours && msg.message == WM_MOUSEWHEEL {
-            // ホイールはページを移る（手前に回すと次のページ）。
             let delta = ((msg.wParam.0 >> 16) & 0xFFFF) as u16 as i16;
-            turn_page(hwnd, if delta < 0 { 1 } else { -1 });
+            let shift = msg.wParam.0 & MK_SHIFT != 0;
+            if shift {
+                // Shift+ホイールで不透明度を変える（奥に回すと濃く）。
+                change_opacity(hwnd, delta > 0);
+            } else {
+                // ホイールはページを移る（手前に回すと次のページ）。
+                turn_page(hwnd, if delta < 0 { 1 } else { -1 });
+            }
             continue;
         }
         if msg.hwnd == list && msg.message == WM_MOUSEMOVE {
             // マウスを乗せた行を選ぶ。
             if let Some(row) = row_at(list, msg.lParam) {
-                let page_start = with_state(|st| st.page * PAGE_SIZE).unwrap_or(0);
+                let page_start = with_state(|st| st.page * st.page_size).unwrap_or(0);
                 select(hwnd, page_start + row);
             }
         }
@@ -255,9 +288,27 @@ fn finish(chosen: Option<String>) {
     });
 }
 
-/// キー操作。処理したら `true`（検索の欄には渡さない）。
+/// 不透明度を 1 段階変える。
+unsafe fn change_opacity(hwnd: HWND, up: bool) {
+    let Some(opacity) = with_state(|st| {
+        st.opacity = if up {
+            (st.opacity + OPACITY_STEP).min(clip_history::MAX_OPACITY)
+        } else {
+            st.opacity.saturating_sub(OPACITY_STEP).max(clip_history::MIN_OPACITY)
+        };
+        st.outcome.opacity = Some(st.opacity);
+        st.opacity
+    }) else {
+        return;
+    };
+    set_opacity(hwnd, opacity);
+}
+
+/// キー操作。処理したら `true`。
 unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
-    let Some((current, count)) = with_state(|st| (st.selected, st.visible.len())) else {
+    let Some((current, count, page_size, page)) =
+        with_state(|st| (st.selected, st.items.len(), st.page_size, st.page))
+    else {
         return false;
     };
     let current = current.map_or(-1, |c| c as isize);
@@ -266,14 +317,17 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
             select(hwnd, pos.clamp(0, count as isize - 1) as usize);
         }
     };
+    let range = clip_history::page_range(page, count, page_size);
     match vk {
         v if v == VK_ESCAPE.0 => finish(None),
         v if v == VK_RETURN.0 => choose_current(),
         v if v == VK_UP.0 => move_to(current - 1),
         v if v == VK_DOWN.0 => move_to(current + 1),
+        v if v == VK_HOME.0 => move_to(range.start as isize),
+        v if v == VK_END.0 => move_to(range.end as isize - 1),
         v if v == VK_PRIOR.0 || v == VK_LEFT.0 => turn_page(hwnd, -1),
         v if v == VK_NEXT.0 || v == VK_RIGHT.0 => turn_page(hwnd, 1),
-        v if v == VK_DELETE.0 && GetKeyState(VK_SHIFT.0 as i32) < 0 => remove_current(hwnd),
+        v if v == VK_DELETE.0 => remove_current(hwnd),
         _ => return false,
     }
     true
@@ -281,31 +335,24 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
 
 /// 前後のページへ移る（ページの中での行の位置はそのまま。足りなければ最後の行）。
 unsafe fn turn_page(hwnd: HWND, delta: isize) {
-    let Some((page, row, count)) = with_state(|st| {
-        let row = st.selected.map_or(0, |s| s % PAGE_SIZE);
-        (st.page, row, st.visible.len())
+    let Some((page, row, count, size)) = with_state(|st| {
+        let row = st.selected.map_or(0, |s| s % st.page_size);
+        (st.page, row, st.items.len(), st.page_size)
     }) else {
         return;
     };
-    let pages = clip_history::page_count(count) as isize;
+    let pages = clip_history::page_count(count, size) as isize;
     let next = page as isize + delta;
     if count == 0 || next < 0 || next >= pages {
         return;
     }
-    let next = next as usize;
-    let range = clip_history::page_range(next, count);
-    let pos = (range.start + row).min(range.end - 1);
-    select(hwnd, pos);
+    let range = clip_history::page_range(next as usize, count, size);
+    select(hwnd, (range.start + row).min(range.end - 1));
 }
 
 /// 選んでいるものを貼り付けるために閉じる。
 fn choose_current() {
-    let chosen = with_state(|st| {
-        st.selected
-            .and_then(|pos| st.visible.get(pos))
-            .and_then(|&i| st.items.get(i).cloned())
-    })
-    .flatten();
+    let chosen = with_state(|st| st.selected.and_then(|pos| st.items.get(pos).cloned())).flatten();
     if chosen.is_some() {
         finish(chosen);
     }
@@ -315,70 +362,60 @@ fn choose_current() {
 unsafe fn remove_current(hwnd: HWND) {
     let removed = with_state(|st| {
         let pos = st.selected?;
-        let index = *st.visible.get(pos)?;
-        let text = st.items.remove(index);
+        if pos >= st.items.len() {
+            return None;
+        }
+        let text = st.items.remove(pos);
         st.outcome.removed.push(text);
-        Some(pos)
+        let count = st.items.len();
+        st.selected = (count > 0).then(|| pos.min(count - 1));
+        st.page = st.selected.map_or(0, |s| s / st.page_size);
+        Some(())
     })
     .flatten();
-    if let Some(pos) = removed {
-        refilter(hwnd, pos);
+    if removed.is_some() {
+        show_page(hwnd);
     }
-}
-
-/// 検索をやり直す。`keep` の位置を選ぶ（無ければ最後）。
-unsafe fn refilter(hwnd: HWND, keep: usize) {
-    let query = ui::get_text(hwnd, ID_SEARCH);
-    with_state(|st| {
-        st.visible = clip_history::filter(&st.items, &query);
-        st.filtered = !query.trim().is_empty();
-        let count = st.visible.len();
-        st.selected = (count > 0).then(|| keep.min(count - 1));
-        st.page = st.selected.map_or(0, |s| s / PAGE_SIZE);
-    });
-    show_page(hwnd);
 }
 
 /// 位置 `pos` を選ぶ。別のページなら、そのページを出す。
 unsafe fn select(hwnd: HWND, pos: usize) {
-    let Some(changed_page) = with_state(|st| {
-        if st.selected == Some(pos) && st.page == pos / PAGE_SIZE {
+    let Some(change) = with_state(|st| {
+        let page = pos / st.page_size;
+        if st.selected == Some(pos) && st.page == page {
             return None;
         }
         st.selected = Some(pos);
-        let page = pos / PAGE_SIZE;
         let changed = page != st.page;
         st.page = page;
-        Some(changed)
+        Some((changed, pos % st.page_size))
     })
     .flatten() else {
         return;
     };
-    if changed_page {
-        show_page(hwnd);
-    } else {
-        let row = pos % PAGE_SIZE;
-        SendMessageW(control(hwnd, ID_LIST), LB_SETCURSEL, WPARAM(row), LPARAM(0));
-        update_tip(hwnd);
+    match change {
+        (true, _) => show_page(hwnd),
+        (false, row) => {
+            SendMessageW(control(hwnd, ID_LIST), LB_SETCURSEL, WPARAM(row), LPARAM(0));
+            update_tip(hwnd);
+        }
     }
 }
 
-/// 今のページを一覧に出し、見出しとボタンを合わせる。
+/// 今のページを一覧に出し、見出しを合わせる。
 unsafe fn show_page(hwnd: HWND) {
-    let Some((page, count, selected, filtered)) =
-        with_state(|st| (st.page, st.visible.len(), st.selected, st.filtered))
+    let Some((page, count, selected, size)) =
+        with_state(|st| (st.page, st.items.len(), st.selected, st.page_size))
     else {
         return;
     };
-    let range = clip_history::page_range(page, count);
+    let range = clip_history::page_range(page, count, size);
     let list = control(hwnd, ID_LIST);
     SendMessageW(list, LB_SETCOUNT, WPARAM(range.len()), LPARAM(0));
     let row = selected.filter(|s| range.contains(s)).map(|s| s - range.start);
     SendMessageW(list, LB_SETCURSEL, WPARAM(row.map_or(usize::MAX, |r| r)), LPARAM(0));
     let _ = InvalidateRect(list, None, true);
-    set_text(hwnd, ID_PAGE, &clip_history::page_label(page, count, filtered));
-    ui::set_enabled(hwnd, ID_PREV, page > 0);
-    ui::set_enabled(hwnd, ID_NEXT, page + 1 < clip_history::page_count(count));
+    set_text(hwnd, ID_PAGE, &clip_history::page_label(page, count, size));
     update_tip(hwnd);
 }
 
@@ -390,7 +427,8 @@ unsafe fn row_at(list: HWND, lparam: LPARAM) -> Option<usize> {
         return None;
     }
     let row = result & 0xFFFF;
-    let on_page = with_state(|st| clip_history::page_range(st.page, st.visible.len()).len())?;
+    let on_page =
+        with_state(|st| clip_history::page_range(st.page, st.items.len(), st.page_size).len())?;
     (row < on_page).then_some(row)
 }
 
@@ -401,9 +439,9 @@ unsafe fn control(hwnd: HWND, id: i32) -> HWND {
 /// ページの中の行 `row` に出すもの: (番号, 最初の行, 行数)。
 fn row_content(row: usize) -> Option<(usize, String, usize)> {
     with_state(|st| {
-        let index = *st.visible.get(st.page * PAGE_SIZE + row)?;
+        let index = st.page * st.page_size + row;
         let (text, lines) = clip_history::row_text(st.items.get(index)?);
-        // 番号は、履歴の中での位置（新しいものから 1, 2, …）。絞り込んでも変わらない。
+        // 番号は、履歴の中での位置（新しいものから 1, 2, …）。
         Some((index + 1, text, lines))
     })
     .flatten()
@@ -494,11 +532,11 @@ fn blend(a: u32, b: u32, percent: u32) -> u32 {
     mix(0) | mix(8) | mix(16)
 }
 
-/// 選んでいるものが 1 行に収まらない（複数行か、途中で切れている）ときは、一覧の横に全文の
+/// 選んでいるものが 1 行に収まらない（複数行か、途中で切れている）ときは、選んだ行の横に全文の
 /// 吹き出しを出す。収まるときは隠す。
 unsafe fn update_tip(hwnd: HWND) {
-    let Some((tip, dpi, font, selected, page)) =
-        with_state(|st| (st.tip, st.dpi, st.font, st.selected, st.page))
+    let Some((tip, dpi, font, selected, page, size)) =
+        with_state(|st| (st.tip, st.dpi, st.font, st.selected, st.page, st.page_size))
     else {
         return;
     };
@@ -506,13 +544,8 @@ unsafe fn update_tip(hwnd: HWND) {
         return;
     }
     let list = control(hwnd, ID_LIST);
-    let row = selected.and_then(|s| s.checked_sub(page * PAGE_SIZE)).filter(|r| *r < PAGE_SIZE);
-    let full = with_state(|st| {
-        selected
-            .and_then(|s| st.visible.get(s))
-            .and_then(|&i| st.items.get(i).cloned())
-    })
-    .flatten();
+    let row = selected.and_then(|s| s.checked_sub(page * size)).filter(|r| *r < size);
+    let full = with_state(|st| selected.and_then(|s| st.items.get(s).cloned())).flatten();
     let (Some(row), Some(full)) = (row, full) else {
         let _ = ShowWindow(tip, SW_HIDE);
         return;
@@ -597,27 +630,6 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             draw_row(&*(lparam.0 as *const DRAWITEMSTRUCT));
             LRESULT(1)
         }
-        WM_COMMAND => {
-            let id = (wparam.0 & 0xFFFF) as i32;
-            let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
-            match (id, code) {
-                (ID_SEARCH, EN_CHANGE) => refilter(hwnd, 0),
-                (ID_PREV | ID_NEXT, BN_CLICKED) => {
-                    turn_page(hwnd, if id == ID_PREV { -1 } else { 1 });
-                    // 押したあとも、続けて検索の文字を打てるようにする。
-                    let _ = SetFocus(control(hwnd, ID_SEARCH));
-                }
-                _ => {}
-            }
-            LRESULT(0)
-        }
-        // 画面を動かしたら、吹き出しも付いていく。
-        WM_MOVE => {
-            if STATE.with(|s| s.borrow().is_some()) {
-                update_tip(hwnd);
-            }
-            LRESULT(0)
-        }
         // ほかのウィンドウに移ったら（ほかの場所をクリックしたら）、何もせずに閉じる。
         WM_ACTIVATE if wparam.0 & 0xFFFF == 0 => {
             if !is_done() {
@@ -684,7 +696,7 @@ unsafe fn create_window() -> Option<HWND> {
     // 2 回目以降は登録済みで失敗するが、そのまま使える。
     RegisterClassW(&class);
     CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        WINDOW_EX,
         class_name,
         &HSTRING::from("クリップボードの履歴"),
         WINDOW_FRAME,
@@ -731,20 +743,14 @@ unsafe fn create_tip_window(owner: HWND) -> HWND {
 }
 
 /// 枠を含めた画面の大きさ。
-unsafe fn window_size(dpi: u32) -> (i32, i32) {
+unsafe fn window_size(client_w: i32, client_h: i32, dpi: u32) -> (i32, i32) {
     let mut rect = RECT {
         left: 0,
         top: 0,
-        right: ui::scale(CLIENT_W, dpi),
-        bottom: ui::scale(CLIENT_H, dpi),
+        right: client_w,
+        bottom: client_h,
     };
-    let _ = AdjustWindowRectExForDpi(
-        &mut rect,
-        WINDOW_FRAME,
-        false,
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-        dpi,
-    );
+    let _ = AdjustWindowRectExForDpi(&mut rect, WINDOW_FRAME, false, WINDOW_EX, dpi);
     (rect.right - rect.left, rect.bottom - rect.top)
 }
 

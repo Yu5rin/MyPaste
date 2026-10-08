@@ -90,13 +90,16 @@ const ID_CH_MAX: i32 = 148;
 const ID_CH_POSITION: i32 = 149;
 const ID_CH_KEEP: i32 = 150;
 const ID_CH_CLEAR: i32 = 151;
+const ID_CH_WIDTH: i32 = 152;
+const ID_CH_OPACITY: i32 = 153;
+const ID_CH_PAGE: i32 = 154;
 const ID_EXPORT: i32 = 160;
 const ID_IMPORT: i32 = 161;
 
 
 /// 画面の中身の大きさ（96 DPI 基準）。
 const CLIENT_W: i32 = 948;
-const CLIENT_H: i32 = 569;
+const CLIENT_H: i32 = 578;
 
 /// 画面の構成。並び順がそのまま Tab キーで移る順になる。
 /// 見出しや枠など、ID で触らないものは 200 番台の通し番号にしている。
@@ -139,7 +142,7 @@ const ITEMS: &[Item] = &[
     item(ID_LOG, Kind::Check, "トラブル調査用に動作を記録する（log.txt）", 24, 485, 330, 22),
     item(ID_OPEN_LOG, Kind::Button, "記録を開く", 362, 482, 90, 28),
     // クリップボードの履歴（右の列）
-    item(230, Kind::Group, "クリップボードの履歴", 480, 8, 456, 334),
+    item(230, Kind::Group, "クリップボードの履歴", 480, 8, 456, 394),
     item(ID_CH_ENABLED, Kind::Check, "コピーした文字を記録して、一覧から選んで貼り付ける", 492, 30, 432, 22),
     item(231, Kind::Label, "一覧を出す操作", 492, 60, 120, 24),
     item(ID_CH_TRIGGER, Kind::Combo, "", 616, 60, 308, 200),
@@ -158,19 +161,28 @@ const ITEMS: &[Item] = &[
     item(237, Kind::Label, "件（10〜100）", 692, 186, 200, 24),
     item(238, Kind::Label, "一覧を出す位置", 492, 218, 120, 24),
     item(ID_CH_POSITION, Kind::Combo, "", 616, 218, 200, 200),
-    item(ID_CH_KEEP, Kind::Check, "アプリを終了しても履歴を残す（暗号化して保存）", 492, 249, 432, 22),
-    item(239, Kind::Note, "一覧はクリックか矢印キーと Enter で選び、文字を入力すると絞り込めます。パスワード管理ソフトなどの内容は記録しません。", 492, 276, 334, 54),
-    item(ID_CH_CLEAR, Kind::Button, "履歴を消す", 834, 282, 90, 28),
+    item(242, Kind::Label, "一覧の幅", 492, 250, 120, 24),
+    item(ID_CH_WIDTH, Kind::NumberEdit, "", 616, 250, 54, 24),
+    item(243, Kind::Label, "px", 674, 250, 30, 24),
+    item(244, Kind::Label, "不透明度", 712, 250, 70, 24),
+    item(ID_CH_OPACITY, Kind::NumberEdit, "", 784, 250, 46, 24),
+    item(245, Kind::Label, "%", 834, 250, 30, 24),
+    item(246, Kind::Label, "1 ページの件数", 492, 282, 120, 24),
+    item(ID_CH_PAGE, Kind::NumberEdit, "", 616, 282, 54, 24),
+    item(247, Kind::Label, "件（10〜40）", 674, 282, 160, 24),
+    item(ID_CH_KEEP, Kind::Check, "アプリを終了しても履歴を残す（暗号化して保存）", 492, 312, 432, 22),
+    item(239, Kind::Note, "一覧はクリックか矢印キーと Enter で選びます。一覧の上で Shift+ホイールを回すと不透明度を変えられます。パスワード管理ソフトなどの内容は記録しません。", 492, 338, 334, 58),
+    item(ID_CH_CLEAR, Kind::Button, "履歴を消す", 834, 344, 90, 28),
     // 設定の書き出し・読み込み（右の列）
-    item(240, Kind::Group, "設定の書き出し・読み込み（PC の引っ越しに）", 480, 350, 456, 116),
-    item(241, Kind::Note, "保存済みの設定・キー割り当て・自動起動の状態を 1 つのファイルにまとめます。新しい PC では、このアプリを置いてから「読み込む」を押します（履歴の中身は含めません）。", 492, 372, 432, 52),
-    item(ID_EXPORT, Kind::Button, "設定を書き出す...", 492, 428, 150, 28),
-    item(ID_IMPORT, Kind::Button, "設定を読み込む...", 650, 428, 150, 28),
+    item(240, Kind::Group, "設定の書き出し・読み込み（PC の引っ越しに）", 480, 410, 456, 116),
+    item(241, Kind::Note, "保存済みの設定・キー割り当て・自動起動の状態を 1 つのファイルにまとめます。新しい PC では、このアプリを置いてから「読み込む」を押します（履歴の中身は含めません）。", 492, 432, 432, 52),
+    item(ID_EXPORT, Kind::Button, "設定を書き出す...", 492, 488, 150, 28),
+    item(ID_IMPORT, Kind::Button, "設定を読み込む...", 650, 488, 150, 28),
     // 操作ボタン
-    item(ID_OPEN_FOLDER, Kind::Button, "設定ファイルの場所を開く", 12, 529, 178, 28),
-    item(ID_DEFAULTS, Kind::Button, "既定に戻す", 198, 529, 86, 28),
-    item(ID_SAVE, Kind::DefaultButton, "保存", 758, 529, 86, 28),
-    item(ID_CANCEL, Kind::Button, "キャンセル", 850, 529, 86, 28),
+    item(ID_OPEN_FOLDER, Kind::Button, "設定ファイルの場所を開く", 12, 538, 178, 28),
+    item(ID_DEFAULTS, Kind::Button, "既定に戻す", 198, 538, 86, 28),
+    item(ID_SAVE, Kind::DefaultButton, "保存", 758, 538, 86, 28),
+    item(ID_CANCEL, Kind::Button, "キャンセル", 850, 538, 86, 28),
 ];
 
 /// 画面に表示する値。
@@ -317,6 +329,9 @@ unsafe fn fill_history(hwnd: HWND, settings: &ClipboardHistorySettings) {
         .unwrap_or(0);
     set_combo_index(hwnd, ID_CH_POSITION, position_index);
     set_checked(hwnd, ID_CH_KEEP, config.keep_after_exit);
+    set_text(hwnd, ID_CH_WIDTH, &config.width.to_string());
+    set_text(hwnd, ID_CH_OPACITY, &config.opacity.to_string());
+    set_text(hwnd, ID_CH_PAGE, &config.page_size.to_string());
     update_history_fields(hwnd);
 }
 
@@ -331,7 +346,15 @@ unsafe fn update_history_fields(hwnd: HWND) {
         ui::set_enabled(hwnd, id, uses_key);
     }
     ui::set_enabled(hwnd, ID_CH_INTERVAL, on && trigger != Trigger::Hotkey);
-    for id in [ID_CH_TRIGGER, ID_CH_MAX, ID_CH_POSITION, ID_CH_KEEP] {
+    for id in [
+        ID_CH_TRIGGER,
+        ID_CH_MAX,
+        ID_CH_POSITION,
+        ID_CH_KEEP,
+        ID_CH_WIDTH,
+        ID_CH_OPACITY,
+        ID_CH_PAGE,
+    ] {
         ui::set_enabled(hwnd, id, on);
     }
 }
@@ -384,6 +407,31 @@ unsafe fn read_history(hwnd: HWND) -> Result<ClipboardHistorySettings, (i32, Str
             ),
         )
     })? as usize;
+    let number = |id: i32, min: u64, max: u64, name: &str, unit: &str| {
+        parse_in_range(&get_text(hwnd, id), min, max)
+            .ok_or_else(|| (id, format!("{name}は {min}〜{max} の数で入力してください（{unit}）。")))
+    };
+    let width = number(
+        ID_CH_WIDTH,
+        u64::from(clip_history::MIN_WIDTH),
+        u64::from(clip_history::MAX_WIDTH),
+        "一覧の幅",
+        "ピクセル",
+    )? as u32;
+    let opacity = number(
+        ID_CH_OPACITY,
+        u64::from(clip_history::MIN_OPACITY),
+        u64::from(clip_history::MAX_OPACITY),
+        "不透明度",
+        "%",
+    )? as u32;
+    let page_size = number(
+        ID_CH_PAGE,
+        clip_history::MIN_PAGE_SIZE as u64,
+        clip_history::MAX_PAGE_SIZE as u64,
+        "1 ページの件数",
+        "件",
+    )? as usize;
     let position = combo_index(hwnd, ID_CH_POSITION)
         .and_then(|i| MenuPosition::ALL.get(i))
         .map_or(MenuPosition::Caret, |(p, _, _)| *p);
@@ -395,6 +443,9 @@ unsafe fn read_history(hwnd: HWND) -> Result<ClipboardHistorySettings, (i32, Str
         max_items,
         keep_after_exit: is_checked(hwnd, ID_CH_KEEP),
         position: position.as_setting().to_string(),
+        width,
+        opacity,
+        page_size,
     })
 }
 

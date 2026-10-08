@@ -93,15 +93,20 @@ pub struct HistoryConfig {
     pub max_items: usize,
     /// アプリを終了しても残すか（暗号化してファイルに保存する）。
     pub keep: bool,
-    /// 一覧を出す位置。
-    pub position: MenuPosition,
+    /// 一覧の出し方（位置・幅・不透明度・1 ページの件数）。
+    pub view: history_window::View,
 }
 
 static HISTORY_CONFIG: Mutex<HistoryConfig> = Mutex::new(HistoryConfig {
     record: false,
     max_items: clip_history::DEFAULT_ITEMS,
     keep: false,
-    position: MenuPosition::Caret,
+    view: history_window::View {
+        position: MenuPosition::Caret,
+        width: clip_history::DEFAULT_WIDTH,
+        opacity: clip_history::DEFAULT_OPACITY,
+        page_size: clip_history::DEFAULT_PAGE_SIZE,
+    },
 });
 
 fn history_config() -> HistoryConfig {
@@ -543,12 +548,19 @@ unsafe fn paste_from_history(held: &Hotkey) {
         return;
     }
     let target = GetForegroundWindow();
-    let Some(outcome) = history_window::choose(items, config.position, target) else {
+    let Some(outcome) = history_window::choose(items, config.view, target) else {
         ime_indicator::notify("不可");
         return;
     };
     if !target.is_invalid() {
         let _ = SetForegroundWindow(target);
+    }
+    if let Some(opacity) = outcome.opacity {
+        // 一覧の上で Shift+ホイールで変えた不透明度を、次からも使う。
+        HISTORY_CONFIG.lock().unwrap_or_else(|p| p.into_inner()).view.opacity = opacity;
+        if let Err(e) = config::save_clipboard_history_opacity(opacity) {
+            log::warn!("クリップボードの履歴の不透明度を保存できませんでした: {e}");
+        }
     }
     if !outcome.removed.is_empty() {
         let changed = HISTORY.with(|h| {
