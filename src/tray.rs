@@ -39,6 +39,8 @@ const LABEL_IME_INDICATOR: &str = "入力モードを表示";
 const LABEL_SETTINGS: &str = "設定...";
 /// キー割り当て画面のメニュー文言。
 const LABEL_HOTKEY_WINDOW: &str = "キー割り当て...";
+/// キー割り当ての一覧を表示する項目の文言。
+const LABEL_LIST: &str = "キー割り当ての一覧";
 /// 更新確認のメニュー文言。
 const LABEL_CHECK_UPDATE: &str = "更新を確認";
 
@@ -208,6 +210,12 @@ pub fn build(
     let tx_hotkey_window = tx.clone();
     tray.add_menu_item(LABEL_HOTKEY_WINDOW, move || {
         let _ = tx_hotkey_window.send(TrayMessage::OpenHotkeys);
+    })?;
+
+    // キー割り当ての一覧
+    let tx_list = tx.clone();
+    tray.add_menu_item(LABEL_LIST, move || {
+        let _ = tx_list.send(TrayMessage::ShowList);
     })?;
 
     // 更新の確認（押したときだけ通信する）

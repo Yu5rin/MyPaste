@@ -5,6 +5,9 @@
 //! 書き換える。「保存」を押すと `settings.json` の `hotkeys` に書き込み、メインスレッドへ
 //! [`TrayMessage::HotkeysSaved`] を送って、その場で使えるようにする（再起動は要らない）。
 //!
+//! 「書き出す...」「読み込む...」で、割り当てをファイル（JSON）に書き出したり、ほかの PC で
+//! 書き出したものを読み込んだりできる（読み込んだものも「保存」を押すまでは使わない）。
+//!
 //! 割り当ての解釈と検証は [`crate::hotkey_rules`] にあり、Linux でもテストできる。
 //! 画面の部品は設定画面と共通（[`crate::ui`]）。
 
@@ -16,13 +19,15 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HFONT};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DestroyWindow, PostQuitMessage, SetForegroundWindow, ShowWindow,
-    MB_ICONERROR, MB_ICONWARNING, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
+    DefWindowProcW, DestroyWindow, MessageBoxW, PostQuitMessage, SetForegroundWindow,
+    ShowWindow, IDCANCEL, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION,
+    MB_ICONWARNING, MB_YESNOCANCEL, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
 };
 
 use crate::config::{self, HotkeyRuleSetting};
 use crate::hotkey_rules::{self, ActionKind, Field, Rule, ACTIONS};
 use crate::remap_logic::{self, Hotkey, KEYS};
+use crate::text_transform::{self, TRANSFORMS};
 use crate::ui::{
     self, combo_index, get_text, is_checked, item, set_checked, set_combo_index, set_text,
     show_message, Item, Kind, SingleWindow, BN_CLICKED, CBN_CLOSEUP, CBN_SELCHANGE, LBN_SELCHANGE,
@@ -53,6 +58,10 @@ const ID_APPS: i32 = 323;
 const ID_ADD: i32 = 324;
 const ID_UPDATE: i32 = 325;
 const ID_PASTE: i32 = 326;
+const ID_EXPORT: i32 = 327;
+const ID_IMPORT: i32 = 328;
+/// 整え方のチェック（[`TRANSFORMS`] の順に 330〜339）。
+const ID_TRANSFORM_FIRST: i32 = 330;
 
 /// 画面の中身の大きさ（96 DPI 基準）。
 const CLIENT_W: i32 = 680;
@@ -68,6 +77,8 @@ const ITEMS: &[Item] = &[
     item(ID_UP, Kind::Button, "上へ", 12, 408, 70, 28),
     item(ID_DOWN, Kind::Button, "下へ", 86, 408, 70, 28),
     item(ID_DELETE, Kind::Button, "削除", 234, 408, 82, 28),
+    item(ID_EXPORT, Kind::Button, "書き出す...", 12, 444, 148, 28),
+    item(ID_IMPORT, Kind::Button, "読み込む...", 168, 444, 148, 28),
     // 内容
     item(401, Kind::Group, "割り当ての内容", 324, 8, 344, 428),
     item(ID_ENABLED, Kind::Check, "この割り当てを使う", 336, 30, 320, 22),
@@ -83,6 +94,17 @@ const ITEMS: &[Item] = &[
     item(ID_VALUE_LABEL, Kind::Label, "", 336, 152, 320, 22),
     item(ID_VALUE, Kind::MultiEdit, "", 336, 176, 320, 64),
     item(ID_HINT, Kind::Note, "", 336, 246, 320, 62),
+    // 整え方（「文字を整えて貼り付け」のときだけ、内容の欄と説明の代わりに出す）
+    transform_item(0, 336, 176),
+    transform_item(1, 336, 200),
+    transform_item(2, 336, 224),
+    transform_item(3, 336, 248),
+    transform_item(4, 336, 272),
+    transform_item(5, 498, 176),
+    transform_item(6, 498, 200),
+    transform_item(7, 498, 224),
+    transform_item(8, 498, 248),
+    transform_item(9, 498, 272),
     item(ID_PASTE, Kind::Check, "まとめて貼り付ける（クリップボードを一時的に使う）", 336, 312, 320, 22),
     item(405, Kind::Label, "引数", 336, 340, 48, 24),
     item(ID_ARGS, Kind::Edit, "", 388, 340, 268, 24),
@@ -96,6 +118,11 @@ const ITEMS: &[Item] = &[
     item(ID_SAVE, Kind::DefaultButton, "保存", 496, 484, 82, 28),
     item(ID_CANCEL, Kind::Button, "キャンセル", 586, 484, 82, 28),
 ];
+
+/// 整え方のチェック 1 つ分。
+const fn transform_item(index: usize, x: i32, y: i32) -> Item {
+    item(ID_TRANSFORM_FIRST + index as i32, Kind::Check, TRANSFORMS[index].2, x, y, 158, 22)
+}
 
 /// 画面のスレッドが持つ状態。
 struct Context {
@@ -219,6 +246,14 @@ unsafe fn load_editor(hwnd: HWND, rule: &HotkeyRuleSetting) {
     // 複数行の欄は改行を \r\n で渡す。
     set_text(hwnd, ID_VALUE, &rule.value.replace("\r\n", "\n").replace('\n', "\r\n"));
     set_text(hwnd, ID_ARGS, &rule.args);
+    let transforms = if ActionKind::from_setting(&rule.action) == Some(ActionKind::PasteTransform) {
+        text_transform::parse_list(&rule.value).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    for (i, (transform, _, _)) in TRANSFORMS.iter().enumerate() {
+        set_checked(hwnd, ID_TRANSFORM_FIRST + i as i32, transforms.contains(transform));
+    }
     set_checked(hwnd, ID_PASTE, hotkey_rules::input_is_paste(&rule.input));
     let apps = remap_logic::normalize_apps(rule.apps.iter().map(String::as_str));
     set_combo_index(hwnd, ID_SCOPE, usize::from(!apps.is_empty()));
@@ -249,6 +284,12 @@ unsafe fn update_fields(hwnd: HWND) {
         info.value_label.unwrap_or("（この動作には内容はありません）"),
     );
     set_text(hwnd, ID_HINT, info.hint);
+    // 「文字を整えて貼り付け」では、内容の欄と説明の代わりに整え方のチェックを出す。
+    ui::set_visible(hwnd, ID_VALUE, !info.uses_transforms);
+    ui::set_visible(hwnd, ID_HINT, !info.uses_transforms);
+    for i in 0..TRANSFORMS.len() {
+        ui::set_visible(hwnd, ID_TRANSFORM_FIRST + i as i32, info.uses_transforms);
+    }
     ui::set_enabled(hwnd, ID_VALUE, info.value_label.is_some());
     ui::set_enabled(hwnd, ID_ARGS, info.uses_args);
     ui::set_enabled(hwnd, ID_PASTE, info.kind == ActionKind::TypeText);
@@ -286,7 +327,15 @@ unsafe fn read_editor(hwnd: HWND) -> Result<HotkeyRuleSetting, (i32, String)> {
         hotkey: hotkey.format(),
         action: info.key.to_string(),
         // 改行は \n にそろえて保存する。内容を使わない動作では空にする。
-        value: if info.value_label.is_some() {
+        value: if info.uses_transforms {
+            let checked: Vec<_> = TRANSFORMS
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| is_checked(hwnd, ID_TRANSFORM_FIRST + *i as i32))
+                .map(|(_, (transform, _, _))| *transform)
+                .collect();
+            text_transform::format_list(&checked)
+        } else if info.value_label.is_some() {
             get_text(hwnd, ID_VALUE).replace("\r\n", "\n")
         } else {
             String::new()
@@ -308,6 +357,7 @@ unsafe fn read_editor(hwnd: HWND) -> Result<HotkeyRuleSetting, (i32, String)> {
         let id = match e.field {
             Field::Hotkey => ID_KEY,
             Field::Action => ID_ACTION,
+            Field::Value if info.uses_transforms => ID_TRANSFORM_FIRST,
             Field::Value => ID_VALUE,
         };
         return Err((id, format!("{}。", e.message.trim_end_matches('。'))));
@@ -328,6 +378,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 (ID_DELETE, BN_CLICKED) => on_delete(hwnd),
                 (ID_UP, BN_CLICKED) => on_move(hwnd, -1),
                 (ID_DOWN, BN_CLICKED) => on_move(hwnd, 1),
+                (ID_EXPORT, BN_CLICKED) => on_export(hwnd),
+                (ID_IMPORT, BN_CLICKED) => on_import(hwnd),
                 (ID_SAVE, BN_CLICKED) => on_save(hwnd),
                 (ID_CANCEL, BN_CLICKED) => on_close(hwnd),
                 _ => {}
@@ -499,6 +551,114 @@ unsafe fn on_save(hwnd: HWND) {
     let _ = DestroyWindow(hwnd);
 }
 
+/// 書き出し・読み込みで選べるファイルの種類。
+const FILE_FILTER: &str = "キー割り当て (*.json)\0*.json\0すべてのファイル (*.*)\0*.*\0";
+
+/// 「書き出す...」: 一覧にある割り当て（保存前のものも含む）をファイルに書き出す。
+unsafe fn on_export(hwnd: HWND) {
+    let rules = CONTEXT.with(|c| c.borrow().as_ref().map(|ctx| ctx.rules.clone()));
+    let Some(rules) = rules.filter(|r| !r.is_empty()) else {
+        show_message(hwnd, "書き出す割り当てがありません。", MB_ICONWARNING);
+        return;
+    };
+    let Some(path) = ui::choose_file(hwnd, true, FILE_FILTER, "json", "キー割り当て.json") else {
+        return;
+    };
+    let result = config::hotkeys_to_json(&rules)
+        .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()));
+    match result {
+        Ok(()) => {
+            log::info!("キー割り当てを書き出しました（{} 件、{}）", rules.len(), path.display());
+            show_message(
+                hwnd,
+                &format!("{} 件の割り当てを書き出しました。\n\n{}", rules.len(), path.display()),
+                MB_ICONINFORMATION,
+            );
+        }
+        Err(e) => show_message(
+            hwnd,
+            &format!("書き出せませんでした。\n\n{}\n{e}", path.display()),
+            MB_ICONERROR,
+        ),
+    }
+}
+
+/// 「読み込む...」: 書き出したファイル（または settings.json）から割り当てを読み、今の一覧の
+/// 後ろに足すか、今の一覧と置き換える。「保存」を押すまでは使わない。
+unsafe fn on_import(hwnd: HWND) {
+    let Some(path) = ui::choose_file(hwnd, false, FILE_FILTER, "json", "") else {
+        return;
+    };
+    let read = std::fs::metadata(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|m| {
+            if m.len() > config::HOTKEYS_FILE_MAX_BYTES {
+                Err("ファイルが大きすぎます".to_string())
+            } else {
+                std::fs::read_to_string(&path).map_err(|e| e.to_string())
+            }
+        })
+        .and_then(|text| config::hotkeys_from_json(&text));
+    let imported = match read {
+        Ok(imported) if !imported.is_empty() => imported,
+        Ok(_) => {
+            show_message(hwnd, "このファイルには割り当てがありません。", MB_ICONWARNING);
+            return;
+        }
+        Err(e) => {
+            show_message(
+                hwnd,
+                &format!("読み込めませんでした。\n\n{}\n{e}", path.display()),
+                MB_ICONERROR,
+            );
+            return;
+        }
+    };
+    let current = CONTEXT.with(|c| c.borrow().as_ref().map_or(0, |ctx| ctx.rules.len()));
+    let append = if current == 0 {
+        true
+    } else {
+        let text = ui::wide(&format!(
+            "{} 件の割り当てを読み込みます。\n\n\
+             「はい」: 今の {current} 件の後ろに足す\n\
+             「いいえ」: 今の割り当てを消して、読み込んだものに置き換える",
+            imported.len()
+        ));
+        match MessageBoxW(
+            hwnd,
+            windows::core::PCWSTR(text.as_ptr()),
+            w!("アタイの貼り付け"),
+            MB_YESNOCANCEL | MB_ICONQUESTION,
+        ) {
+            IDCANCEL => return,
+            answer => answer == IDYES,
+        }
+    };
+    let count = imported.len();
+    let unusable = imported.iter().filter(|r| Rule::from_setting(r).is_err()).count();
+    let first = CONTEXT.with(|c| {
+        let mut c = c.borrow_mut();
+        let ctx = c.as_mut()?;
+        if !append {
+            ctx.rules.clear();
+        }
+        let first = ctx.rules.len();
+        ctx.rules.extend(imported);
+        ctx.dirty = true;
+        Some(first)
+    });
+    refresh_list(hwnd, first);
+    on_select(hwnd);
+    log::info!("キー割り当てを読み込みました（{count} 件、{}）", path.display());
+    let mut message = format!("{count} 件の割り当てを読み込みました。「保存」を押すと使えるようになります。");
+    if unusable > 0 {
+        message.push_str(&format!(
+            "\n\nこのうち {unusable} 件は、このままでは使えません（一覧に［誤りあり］と出ます）。選んで直してください。"
+        ));
+    }
+    show_message(hwnd, &message, MB_ICONINFORMATION);
+}
+
 /// 2 つの割り当てが同じ内容か（書き方の揺れ。例えばキーの大文字小文字や、アプリ名の
 /// `.exe` の有無は区別しない）。
 fn same_rule(a: &HotkeyRuleSetting, b: &HotkeyRuleSetting) -> bool {
@@ -509,10 +669,15 @@ fn same_rule(a: &HotkeyRuleSetting, b: &HotkeyRuleSetting) -> bool {
     let uses_value = info.is_some_and(|i| i.value_label.is_some());
     let uses_args = info.is_some_and(|i| i.uses_args);
     let is_text = kind(a) == Some(ActionKind::TypeText);
+    let same_value = if info.is_some_and(|i| i.uses_transforms) {
+        text_transform::parse_list(&a.value).ok() == text_transform::parse_list(&b.value).ok()
+    } else {
+        !uses_value || a.value.replace("\r\n", "\n") == b.value.replace("\r\n", "\n")
+    };
     a.enabled == b.enabled
         && key(a) == key(b)
         && kind(a) == kind(b)
-        && (!uses_value || a.value.replace("\r\n", "\n") == b.value.replace("\r\n", "\n"))
+        && same_value
         && (!uses_args || a.args.trim() == b.args.trim())
         && apps(a) == apps(b)
         && (!is_text

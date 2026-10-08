@@ -9,6 +9,7 @@
 
 use crate::config::HotkeyRuleSetting;
 use crate::remap_logic::{self, Hotkey};
+use crate::text_transform::{self, Transform};
 
 /// 1 つの割り当てで送れるキー操作の数の上限（誤って長大な列を書いた場合に備える）。
 const MAX_KEY_SEQUENCE: usize = 32;
@@ -22,7 +23,10 @@ pub enum ActionKind {
     TypeText,
     Run,
     PastePlain,
+    PasteTransform,
+    ClipboardHistory,
     ToggleTopmost,
+    ShowList,
     Block,
 }
 
@@ -39,10 +43,12 @@ pub struct ActionInfo {
     pub hint: &'static str,
     /// 引数の欄を使うか。
     pub uses_args: bool,
+    /// 内容を、文字の欄ではなく「整え方」のチェックで選ぶか（文字を整えて貼り付け）。
+    pub uses_transforms: bool,
 }
 
 /// 動作の一覧（設定画面の一覧もこの順に並べる）。
-pub const ACTIONS: [ActionInfo; 6] = [
+pub const ACTIONS: [ActionInfo; 9] = [
     ActionInfo {
         kind: ActionKind::SendKeys,
         key: "send_keys",
@@ -50,6 +56,7 @@ pub const ACTIONS: [ActionInfo; 6] = [
         value_label: Some("送るキー（例: Ctrl+Alt+V, V, Enter）"),
         hint: "カンマで区切ると、左から順に送ります。使えるキーは A〜Z、0〜9、F1〜F24、Space、Enter、Tab、Esc、Backspace、Delete、Insert、Home、End、PageUp、PageDown、Left、Up、Right、Down です。",
         uses_args: false,
+        uses_transforms: false,
     },
     ActionInfo {
         kind: ActionKind::TypeText,
@@ -58,6 +65,7 @@ pub const ACTIONS: [ActionInfo; 6] = [
         value_label: Some("入力する文字（改行もそのまま入力します）"),
         hint: "{date} は今日の日付（2026/10/05）、{time} は今の時刻（13:45）、{datetime} は両方に置き換えます。{ そのものは {{、} は }} と書きます。",
         uses_args: false,
+        uses_transforms: false,
     },
     ActionInfo {
         kind: ActionKind::Run,
@@ -66,6 +74,7 @@ pub const ACTIONS: [ActionInfo; 6] = [
         value_label: Some("開くもの（例: notepad.exe、C:\\資料\\一覧.xlsx、https://...）"),
         hint: "エクスプローラーでダブルクリックしたときと同じように開きます。プログラムに渡す引数があれば、下の「引数」に書きます。",
         uses_args: true,
+        uses_transforms: false,
     },
     ActionInfo {
         kind: ActionKind::PastePlain,
@@ -74,6 +83,25 @@ pub const ACTIONS: [ActionInfo; 6] = [
         value_label: None,
         hint: "クリップボードの文字だけを貼り付けます（文字の色や太字、表の書式などは付きません）。貼り付けたあとのクリップボードも文字だけになります。",
         uses_args: false,
+        uses_transforms: false,
+    },
+    ActionInfo {
+        kind: ActionKind::PasteTransform,
+        key: "paste_transform",
+        name: "文字を整えて貼り付け",
+        value_label: Some("整え方（チェックしたものを、左の列の上から順に当てます）"),
+        hint: "",
+        uses_args: false,
+        uses_transforms: true,
+    },
+    ActionInfo {
+        kind: ActionKind::ClipboardHistory,
+        key: "clipboard_history",
+        name: "クリップボードの履歴から貼り付け",
+        value_label: None,
+        hint: "最近コピーした文字（20 件まで）の一覧を出し、選んだものを書式なしで貼り付けます。数字キーか矢印キーと Enter で選びます。履歴はこの割り当てがあるときだけ記録し、アプリを終了すると消えます。パスワード管理ソフトなどが記録しないよう求めた内容は記録しません。",
+        uses_args: false,
+        uses_transforms: false,
     },
     ActionInfo {
         kind: ActionKind::ToggleTopmost,
@@ -82,6 +110,16 @@ pub const ACTIONS: [ActionInfo; 6] = [
         value_label: None,
         hint: "押すたびに、いま使っているウィンドウを常に手前に表示する・やめるを切り替えます。管理者として実行しているアプリのウィンドウには効きません。",
         uses_args: false,
+        uses_transforms: false,
+    },
+    ActionInfo {
+        kind: ActionKind::ShowList,
+        key: "show_list",
+        name: "キー割り当ての一覧を表示",
+        value_label: None,
+        hint: "いま使える値貼り付けのキーとキー割り当てを、一覧で表示します（トレイメニューの「キー割り当ての一覧」と同じ）。",
+        uses_args: false,
+        uses_transforms: false,
     },
     ActionInfo {
         kind: ActionKind::Block,
@@ -90,6 +128,7 @@ pub const ACTIONS: [ActionInfo; 6] = [
         value_label: None,
         hint: "押しても何も起きないようにします（うっかり押しやすいキーを止めるときに使います）。",
         uses_args: false,
+        uses_transforms: false,
     },
 ];
 
@@ -119,7 +158,11 @@ pub enum Action {
     TypeText { text: String, paste: bool },
     Run { target: String, args: String },
     PastePlain,
+    /// クリップボードの文字を整えて貼り付ける（クリップボードの中身は変えない）。
+    PasteTransform(Vec<Transform>),
+    ClipboardHistory,
     ToggleTopmost,
+    ShowList,
     Block,
 }
 
@@ -194,7 +237,17 @@ impl Rule {
                 }
             }
             ActionKind::PastePlain => Action::PastePlain,
+            ActionKind::PasteTransform => {
+                let transforms =
+                    text_transform::parse_list(value).map_err(|e| error(Field::Value, e))?;
+                if transforms.is_empty() {
+                    return Err(error(Field::Value, "整え方を 1 つ以上選んでください"));
+                }
+                Action::PasteTransform(transforms)
+            }
+            ActionKind::ClipboardHistory => Action::ClipboardHistory,
             ActionKind::ToggleTopmost => Action::ToggleTopmost,
+            ActionKind::ShowList => Action::ShowList,
             ActionKind::Block => Action::Block,
         };
         Ok(Rule {
@@ -327,7 +380,11 @@ pub fn describe(setting: &HotkeyRuleSetting) -> String {
         Some(kind) => {
             text.push_str(kind.info().name);
             let value = setting.value.trim();
-            if kind.info().value_label.is_some() && !value.is_empty() {
+            if kind.info().uses_transforms {
+                if let Ok(transforms) = text_transform::parse_list(value) {
+                    text.push_str(&format!("（{} 種類）", transforms.len()));
+                }
+            } else if kind.info().value_label.is_some() && !value.is_empty() {
                 // 長い内容や改行は一覧では短くする。
                 let one_line: String = value.lines().next().unwrap_or("").chars().take(24).collect();
                 let cut = value.chars().count() > one_line.chars().count();
@@ -341,6 +398,35 @@ pub fn describe(setting: &HotkeyRuleSetting) -> String {
         text.push_str(&format!("（{}）", apps.join("、")));
     }
     text
+}
+
+/// 「キー割り当ての一覧」に出す文。値貼り付けのキーと、すべてのキー割り当て（停止中・誤りありも
+/// 印を付けて）を並べる。`remap_apps` は実際に効く対象アプリ。
+pub fn list_text(
+    remap: (Hotkey, &[String], bool),
+    rules_on: bool,
+    settings: &[HotkeyRuleSetting],
+) -> String {
+    let (remap_key, remap_apps, remap_on) = remap;
+    let mut text = String::from("値貼り付け\n");
+    text.push_str(&format!(
+        "    {}{} → 値貼り付け（Ctrl+Shift+V）（{}）\n",
+        if remap_on { "" } else { "［停止中］" },
+        remap_key.format(),
+        remap_apps.join("、")
+    ));
+    text.push_str(if rules_on {
+        "\nキー割り当て\n"
+    } else {
+        "\nキー割り当て（すべて停止中）\n"
+    });
+    if settings.is_empty() {
+        text.push_str("    （ありません）\n");
+    }
+    for setting in settings {
+        text.push_str(&format!("    {}\n", describe(setting)));
+    }
+    text.trim_end().to_string()
 }
 
 /// 2 つの範囲（空はすべてのアプリ）が重なるか。
@@ -516,6 +602,48 @@ mod tests {
         assert_eq!(expand_placeholders("{datetime}", &now), "2026/10/05 09:07");
         assert_eq!(expand_placeholders("{{date}} {x} }{", &now), "{date} {x} }{");
         assert_eq!(expand_placeholders("改行\nそのまま", &now), "改行\nそのまま");
+    }
+
+    #[test]
+    fn reads_new_actions() {
+        let r = Rule::from_setting(&setting("Ctrl+Alt+H", "clipboard_history", "")).unwrap();
+        assert_eq!(r.action, Action::ClipboardHistory);
+        let r = Rule::from_setting(&setting("Ctrl+Alt+L", "show_list", "")).unwrap();
+        assert_eq!(r.action, Action::ShowList);
+        let r = Rule::from_setting(&setting("Ctrl+Alt+T", "paste_transform", "trim,zen_to_han"))
+            .unwrap();
+        assert_eq!(
+            r.action,
+            Action::PasteTransform(vec![Transform::ZenToHan, Transform::Trim])
+        );
+        let e = Rule::from_setting(&setting("Ctrl+Alt+T", "paste_transform", "")).unwrap_err();
+        assert_eq!(e.field, Field::Value);
+        let e = Rule::from_setting(&setting("Ctrl+Alt+T", "paste_transform", "fly")).unwrap_err();
+        assert_eq!(e.field, Field::Value);
+        assert_eq!(
+            describe(&setting("Ctrl+Alt+T", "paste_transform", "trim,zen_to_han")),
+            "Ctrl+Alt+T → 文字を整えて貼り付け（2 種類）"
+        );
+    }
+
+    #[test]
+    fn list_shows_remap_and_rules() {
+        let apps = vec!["EXCEL.EXE".to_string()];
+        let mut stopped = setting("F9", "block", "");
+        stopped.enabled = false;
+        let text = list_text(
+            (Hotkey::parse("Ctrl+B").unwrap(), &apps, true),
+            true,
+            &[setting("Ctrl+Alt+V", "paste_plain", ""), stopped],
+        );
+        assert_eq!(
+            text,
+            "値貼り付け\n    Ctrl+B → 値貼り付け（Ctrl+Shift+V）（EXCEL.EXE）\n\n\
+             キー割り当て\n    Ctrl+Alt+V → 書式なしで貼り付け\n    ［停止中］F9 → 何もしない（キーを無効にする）"
+        );
+        let text = list_text((Hotkey::parse("Ctrl+B").unwrap(), &apps, false), false, &[]);
+        assert!(text.contains("［停止中］Ctrl+B"));
+        assert!(text.ends_with("キー割り当て（すべて停止中）\n    （ありません）"));
     }
 
     #[test]

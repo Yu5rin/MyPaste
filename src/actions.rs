@@ -10,42 +10,56 @@
 //! 実行スレッドは、クリップボードの持ち主になるための見えないウィンドウ（メッセージ専用）を
 //! 持つ。「文字をまとめて貼り付ける」では、このウィンドウで遅延レンダリング（中身は
 //! 求められたときに渡す）を使い、貼り付け先が本当に読みに来たかどうかを確かめる。
+//!
+//! 「クリップボードの履歴から貼り付け」の割り当てがあるときは、同じウィンドウでクリップボードの
+//! 変化（WM_CLIPBOARDUPDATE）を受け取り、コピーされた文字を [`crate::clip_history`] に覚える。
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{
+    GlobalFree, COLORREF, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, POINT, WPARAM,
+};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardOwner,
-    OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    AddClipboardFormatListener, CloseClipboard, EmptyClipboard, EnumClipboardFormats,
+    GetClipboardData, GetClipboardOwner, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
-use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
+use windows::Win32::System::Threading::{
+    AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId,
+};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetAncestor,
-    GetForegroundWindow, GetShellWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
-    GetMessageW, PeekMessageW, PostMessageW, PostQuitMessage, PostThreadMessageW,
-    RegisterClassW, SetWindowPos, TranslateMessage, GA_ROOT, GWL_EXSTYLE, WM_APP, WM_QUIT,
-    HWND_MESSAGE, HWND_NOTOPMOST, HWND_TOPMOST, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROYCLIPBOARD,
-    WM_RENDERALLFORMATS, WM_RENDERFORMAT, WNDCLASSW, WS_EX_TOPMOST,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
+    DispatchMessageW, GetAncestor, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo,
+    GetMessageW, GetShellWindow, GetWindowLongPtrW, GetWindowThreadProcessId, MessageBoxW,
+    PeekMessageW, PostMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW,
+    SetForegroundWindow, SetLayeredWindowAttributes, SetWindowPos, TrackPopupMenuEx,
+    TranslateMessage, GA_ROOT, GUITHREADINFO, GWL_EXSTYLE, HWND_MESSAGE, HWND_NOTOPMOST,
+    HWND_TOPMOST, LWA_ALPHA, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+    MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_SHOWWINDOW, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLIPBOARDUPDATE, WM_DESTROYCLIPBOARD, WM_NULL,
+    WM_QUIT, WM_RENDERALLFORMATS, WM_RENDERFORMAT, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
+use crate::clip_history::{self, History};
 use crate::hotkey_rules::{self, Action, LocalTime};
 use crate::remap_logic::Hotkey;
-use crate::{ime_indicator, sendinput};
+use crate::{config, ime_indicator, keyboard, remap_logic, sendinput, text_transform};
 
 /// クリップボードの文字（`CF_UNICODETEXT`）。
 const CF_UNICODETEXT: u32 = 13;
@@ -67,7 +81,14 @@ thread_local! {
     static PENDING_TEXT: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
     /// 貼り付け先が文字を読みに来たか。
     static RENDERED: Cell<bool> = const { Cell::new(false) };
+    /// 動作を実行している途中か（履歴の一覧を出している間も、届いた依頼を割り込ませない）。
+    static BUSY: Cell<bool> = const { Cell::new(false) };
+    /// コピーされた文字の履歴（アプリが動いている間だけ。ファイルには書かない）。
+    static HISTORY: RefCell<History> = RefCell::new(History::default());
 }
+
+/// クリップボードの履歴を記録するか（「クリップボードの履歴から貼り付け」の割り当てがあるときだけ）。
+static HISTORY_WANTED: AtomicBool = AtomicBool::new(false);
 
 /// 実行の依頼。
 struct Request {
@@ -83,6 +104,15 @@ static WORKER_WINDOW: AtomicIsize = AtomicIsize::new(0);
 
 /// 依頼が積まれたことを、実行スレッドの見えないウィンドウへ知らせるメッセージ。
 const WM_APP_REQUEST: u32 = WM_APP + 1;
+/// 履歴を記録するかが変わったことを知らせるメッセージ。
+const WM_APP_HISTORY: u32 = WM_APP + 2;
+
+/// 履歴の一覧の「履歴を消す」の番号（履歴の番号 1〜20 と重ならないもの）。
+const MENU_CLEAR_HISTORY: usize = 1000;
+/// 履歴の一覧の持ち主のウィンドウを出してから、前面にするまでの待ち時間。
+const MENU_SHOW_WAIT: Duration = Duration::from_millis(30);
+/// 履歴の一覧を閉じてから、元のウィンドウに入力が戻るのを待つ時間。
+const MENU_REFOCUS_WAIT: Duration = Duration::from_millis(80);
 
 /// 実行スレッドのハンドル。[`Worker::stop`] で止める。
 ///
@@ -127,6 +157,7 @@ pub fn start() -> Worker {
         let window = create_clipboard_window();
         CLIP_WINDOW.with(|w| w.set(window));
         WORKER_WINDOW.store(window.0 as isize, Ordering::SeqCst);
+        apply_history_setting(window);
         let _ = tx.send(GetCurrentThreadId());
 
         let mut msg = MSG::default();
@@ -142,6 +173,7 @@ pub fn start() -> Worker {
 
         WORKER_WINDOW.store(0, Ordering::SeqCst);
         if !window.is_invalid() {
+            let _ = RemoveClipboardFormatListener(window);
             let _ = DestroyWindow(window);
         }
         if com {
@@ -175,9 +207,106 @@ pub fn dispatch(action: Action, held: Hotkey) {
     }
 }
 
-/// 積まれている依頼を順に実行する。実行中（貼り付けの待ち時間）に届いた知らせからは
-/// 呼ばれないようにしてあるので、同時に 2 つ実行することはない。
+/// クリップボードの履歴を記録するかを決める（キー割り当てを読み直したとき）。
+/// 記録しないときは、覚えている履歴も消す。
+pub fn set_history_enabled(enabled: bool) {
+    HISTORY_WANTED.store(enabled, Ordering::SeqCst);
+    let window = WORKER_WINDOW.load(Ordering::SeqCst);
+    if window != 0 {
+        unsafe {
+            let _ = PostMessageW(
+                HWND(window as *mut core::ffi::c_void),
+                WM_APP_HISTORY,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
+/// 履歴を記録するかに合わせて、クリップボードの変化の知らせを受け取る・やめる。
+unsafe fn apply_history_setting(window: HWND) {
+    if window.is_invalid() {
+        return;
+    }
+    // 二重に登録しないよう、いったん外してから必要なら登録し直す。
+    let _ = RemoveClipboardFormatListener(window);
+    if HISTORY_WANTED.load(Ordering::SeqCst) {
+        if let Err(e) = AddClipboardFormatListener(window) {
+            log::warn!("クリップボードの履歴を記録できません: {e}");
+        } else {
+            log::debug!("クリップボードの履歴を記録します");
+        }
+    } else {
+        HISTORY.with(|h| h.borrow_mut().clear());
+    }
+}
+
+/// クリップボードが変わった。記録してよい文字なら履歴に加える。
+unsafe fn record_clipboard() {
+    // 貼り付けのために自分で一時的に置いたもの・元に戻したものは記録しない。
+    let owner = GetClipboardOwner().ok();
+    if owner.is_some() && owner == Some(clip_window()) {
+        return;
+    }
+    if IsClipboardFormatAvailable(CF_UNICODETEXT).is_err() || excluded_from_history() {
+        return;
+    }
+    if let Some(text) = read_clipboard_text() {
+        HISTORY.with(|h| h.borrow_mut().push(&text));
+    }
+}
+
+/// パスワード管理ソフトなどが「記録しないで」と印を付けた内容か。
+unsafe fn excluded_from_history() -> bool {
+    for name in [
+        w!("ExcludeClipboardContentFromMonitorProcessing"),
+        w!("Clipboard Viewer Ignore"),
+    ] {
+        let format = RegisterClipboardFormatW(name);
+        if format != 0 && IsClipboardFormatAvailable(format).is_ok() {
+            return true;
+        }
+    }
+    // 「クリップボードの履歴（Win+V）に入れてよいか」が 0（入れない）なら記録しない。
+    let format = RegisterClipboardFormatW(w!("CanIncludeInClipboardHistory"));
+    if format != 0 && IsClipboardFormatAvailable(format).is_ok() {
+        return read_clipboard_u32(format) == Some(0);
+    }
+    false
+}
+
+/// クリップボードの、4 バイトの数値の形式を読む。
+unsafe fn read_clipboard_u32(format: u32) -> Option<u32> {
+    if !open_clipboard() {
+        return None;
+    }
+    let value = (|| {
+        let handle = GetClipboardData(format).ok()?;
+        let memory = HGLOBAL(handle.0);
+        if GlobalSize(memory) < 4 {
+            return None;
+        }
+        let ptr = GlobalLock(memory) as *const u8;
+        if ptr.is_null() {
+            return None;
+        }
+        let mut bytes = [0u8; 4];
+        std::ptr::copy_nonoverlapping(ptr, bytes.as_mut_ptr(), 4);
+        let _ = GlobalUnlock(memory);
+        Some(u32::from_le_bytes(bytes))
+    })();
+    let _ = CloseClipboard();
+    value
+}
+
+/// 積まれている依頼を順に実行する。実行中（貼り付けの待ち時間や履歴の一覧を出している間）に
+/// 届いた知らせからは実行しないので、同時に 2 つ実行することはない。
 unsafe fn run_queued_requests() {
+    if BUSY.with(Cell::get) {
+        return;
+    }
+    BUSY.with(|b| b.set(true));
     loop {
         let request = QUEUE.lock().unwrap_or_else(|p| p.into_inner()).pop_front();
         match request {
@@ -185,6 +314,7 @@ unsafe fn run_queued_requests() {
             None => break,
         }
     }
+    BUSY.with(|b| b.set(false));
 }
 
 unsafe fn execute(request: Request) {
@@ -212,6 +342,12 @@ unsafe fn execute(request: Request) {
             run(&target, &args);
         }
         Action::PastePlain => paste_plain(&held),
+        Action::PasteTransform(transforms) => paste_transformed(&held, &transforms),
+        Action::ClipboardHistory => paste_from_history(&held),
+        Action::ShowList => {
+            sendinput::suppress_menu(&held);
+            show_assignment_list();
+        }
         Action::ToggleTopmost => {
             sendinput::suppress_menu(&held);
             toggle_topmost();
@@ -273,6 +409,242 @@ unsafe fn paste_plain(held: &Hotkey) {
     }
     log::debug!("キー割り当て: 書式なしで貼り付けます（{} 文字）", text.chars().count());
     sendinput::send_key_sequence(held, &[ctrl_v()]);
+}
+
+/// クリップボードの文字を整えて貼り付ける。クリップボードの中身は変えない
+/// （貼り付けたあと、元の内容に戻る）。
+unsafe fn paste_transformed(held: &Hotkey, transforms: &[text_transform::Transform]) {
+    let Some(text) = read_clipboard_text() else {
+        log::debug!("キー割り当て: クリップボードに文字が無いため、整えて貼り付けをしません");
+        sendinput::release_modifiers(held);
+        ime_indicator::notify("空");
+        return;
+    };
+    let text = text_transform::apply(&text, transforms);
+    if text.is_empty() {
+        sendinput::release_modifiers(held);
+        ime_indicator::notify("空");
+        return;
+    }
+    log::debug!(
+        "キー割り当て: 文字を整えて貼り付けます（{}、{} 文字）",
+        text_transform::format_list(transforms),
+        text.chars().count()
+    );
+    paste_text(held, &text);
+}
+
+/// クリップボードの履歴を一覧で出し、選んだものを貼り付ける。
+unsafe fn paste_from_history(held: &Hotkey) {
+    // 一覧を数字キーで選べるよう、押されたままの修飾キーを先に離す。
+    sendinput::release_modifiers(held);
+    if !HISTORY_WANTED.load(Ordering::SeqCst) {
+        return;
+    }
+    let items: Vec<String> = HISTORY.with(|h| h.borrow().items().cloned().collect());
+    if items.is_empty() {
+        ime_indicator::notify("空");
+        return;
+    }
+    let Ok(menu) = CreatePopupMenu() else {
+        ime_indicator::notify("失敗");
+        return;
+    };
+    let owner = create_menu_window();
+    if owner.is_invalid() {
+        let _ = DestroyMenu(menu);
+        ime_indicator::notify("失敗");
+        return;
+    }
+    for (i, text) in items.iter().enumerate() {
+        let label = HSTRING::from(clip_history::menu_label(i, text));
+        let _ = AppendMenuW(menu, MF_STRING, i + 1, &label);
+    }
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let _ = AppendMenuW(menu, MF_STRING, MENU_CLEAR_HISTORY, w!("履歴を消す(&X)"));
+
+    let target = GetForegroundWindow();
+    let point = menu_point(target);
+    // 持ち主のウィンドウを、一覧を出す位置に 1 ピクセルの透明なウィンドウとして出して前面にする
+    // （隠したままだと、環境によっては一覧がキー入力を受け取れない）。使い回すと 2 回目以降に
+    // 前面にならない環境があるので、毎回作って閉じる。
+    let _ = SetWindowPos(
+        owner,
+        HWND_TOPMOST,
+        point.x,
+        point.y,
+        1,
+        1,
+        SWP_SHOWWINDOW | SWP_NOACTIVATE,
+    );
+    pump_messages_until(MENU_SHOW_WAIT, || false);
+    if !bring_to_front(owner, target) {
+        // 前面にできないまま一覧を出すと、キーでもほかの場所のクリックでも閉じられなくなる。
+        log::warn!(
+            "キー割り当て: 履歴の一覧を出せませんでした（前面のアプリ: {}）",
+            crate::excel_check::foreground_process_name().unwrap_or_else(|| "不明".into())
+        );
+        let _ = DestroyWindow(owner);
+        let _ = DestroyMenu(menu);
+        ime_indicator::notify("不可");
+        return;
+    }
+    // TPM_RETURNCMD では、選ばれた項目の番号が返る（選ばずに閉じたら 0）。
+    let chosen = TrackPopupMenuEx(
+        menu,
+        (TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN).0,
+        point.x,
+        point.y,
+        owner,
+        None,
+    )
+    .0 as usize;
+    // メニューをきちんと閉じるための決まりごと（TrackPopupMenu の説明にある）。
+    let _ = PostMessageW(owner, WM_NULL, WPARAM(0), LPARAM(0));
+    let _ = DestroyMenu(menu);
+    let _ = DestroyWindow(owner);
+    if !target.is_invalid() {
+        let _ = SetForegroundWindow(target);
+    }
+
+    match chosen {
+        0 => {}
+        MENU_CLEAR_HISTORY => {
+            HISTORY.with(|h| h.borrow_mut().clear());
+            log::debug!("キー割り当て: クリップボードの履歴を消しました");
+            ime_indicator::notify("消去");
+        }
+        n => {
+            let Some(text) = items.get(n - 1) else {
+                return;
+            };
+            // 元のウィンドウに入力が戻ってから貼り付ける。
+            pump_messages_until(MENU_REFOCUS_WAIT, || false);
+            log::debug!(
+                "キー割り当て: 履歴の {n} 番目を貼り付けます（{} 文字）",
+                text.chars().count()
+            );
+            paste_text(&Hotkey::unpack(0), text);
+        }
+    }
+}
+
+/// 履歴の一覧を出す位置。入力位置（キャレット）が分かればその下、分からなければマウスの位置。
+unsafe fn menu_point(target: HWND) -> POINT {
+    if !target.is_invalid() {
+        let thread_id = GetWindowThreadProcessId(target, None);
+        let mut info = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if thread_id != 0 && GetGUIThreadInfo(thread_id, &mut info).is_ok() {
+            if let Some(caret) = ime_indicator::caret_rect(&info) {
+                return POINT {
+                    x: caret.left,
+                    y: caret.bottom,
+                };
+            }
+        }
+    }
+    let mut point = POINT::default();
+    let _ = GetCursorPos(&mut point);
+    point
+}
+
+/// 一覧を出すウィンドウを前面にする（一覧をキーで操作できるように）。前面にできたら `true`。
+/// Windows は、ほかのアプリが前面のときに前面を奪うことを制限しているので、通らなければ
+/// 前面のアプリの入力の流れに一時的に加わってから前面にする。
+unsafe fn bring_to_front(window: HWND, current: HWND) -> bool {
+    let _ = SetForegroundWindow(window);
+    if GetForegroundWindow() == window {
+        return true;
+    }
+    let ours = GetCurrentThreadId();
+    let theirs = if current.is_invalid() {
+        0
+    } else {
+        GetWindowThreadProcessId(current, None)
+    };
+    if theirs != 0 && theirs != ours && AttachThreadInput(ours, theirs, true).as_bool() {
+        let _ = SetForegroundWindow(window);
+        let _ = AttachThreadInput(ours, theirs, false);
+    }
+    GetForegroundWindow() == window
+}
+
+/// 一覧（メニュー）の持ち主にする透明なウィンドウを作る。作れなければ無効なハンドル。
+unsafe fn create_menu_window() -> HWND {
+    let Ok(instance) = GetModuleHandleW(None) else {
+        return HWND::default();
+    };
+    let class_name = w!("AtaiPasteHistoryMenu");
+    let class = WNDCLASSW {
+        lpfnWndProc: Some(menu_wnd_proc),
+        hInstance: instance.into(),
+        lpszClassName: class_name,
+        ..Default::default()
+    };
+    RegisterClassW(&class);
+    // 透明で、タスクバーにも出ない。一覧（メニュー）の持ち主にするだけ。
+    let window = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TOPMOST,
+        class_name,
+        w!(""),
+        WS_POPUP,
+        0,
+        0,
+        0,
+        0,
+        None,
+        None,
+        instance,
+        None,
+    )
+    .unwrap_or_default();
+    if !window.is_invalid() {
+        let _ = SetLayeredWindowAttributes(window, COLORREF(0), 0, LWA_ALPHA);
+    }
+    window
+}
+
+unsafe extern "system" fn menu_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // 一覧を出している間に依頼が届いても、ここでは実行しない（一覧を閉じてから順に実行する）。
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// 開いている一覧の表示（2 つ以上同時に開かない）。
+static LIST_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// 値貼り付けのキーと、キー割り当ての一覧を表示する（トレイメニューとキー割り当てから使う）。
+/// 閉じるまで待たない。
+pub fn show_assignment_list() {
+    if LIST_OPEN.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let settings = config::Settings::load();
+        let apps = remap_logic::effective_target_apps(&settings.remap.target_apps);
+        let text = hotkey_rules::list_text(
+            (keyboard::hotkey(), &apps, keyboard::is_enabled()),
+            keyboard::rules_enabled(),
+            &settings.hotkeys,
+        );
+        let text = HSTRING::from(text);
+        unsafe {
+            MessageBoxW(
+                None,
+                &text,
+                w!("アタイの貼り付け - キー割り当ての一覧"),
+                MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST,
+            );
+        }
+        LIST_OPEN.store(false, Ordering::SeqCst);
+    });
 }
 
 /// 文字をまとめて（一度に）貼り付ける。貼り付けを受け付けない入力欄では 1 文字ずつ入力する。
@@ -435,6 +807,16 @@ unsafe extern "system" fn clip_wnd_proc(
         // 依頼が積まれた。
         WM_APP_REQUEST => {
             run_queued_requests();
+            LRESULT(0)
+        }
+        // 履歴を記録するかが変わった。
+        WM_APP_HISTORY => {
+            apply_history_setting(hwnd);
+            LRESULT(0)
+        }
+        // クリップボードが変わった（履歴を記録しているときだけ届く）。
+        WM_CLIPBOARDUPDATE => {
+            record_clipboard();
             LRESULT(0)
         }
         // 別のものがコピーされた（または自分で空にした）。予約は無効になる。

@@ -32,6 +32,7 @@
 mod config;
 mod excel_check;
 mod actions;
+mod clip_history;
 mod hotkey_rules;
 mod hotkey_window;
 mod http;
@@ -43,6 +44,7 @@ mod sendinput;
 mod settings_window;
 mod single_instance;
 mod startup;
+mod text_transform;
 mod tray;
 mod ui;
 mod update;
@@ -76,6 +78,8 @@ pub enum TrayMessage {
     ToggleHotkeys,
     /// キー割り当て画面を開く
     OpenHotkeys,
+    /// 値貼り付けのキーとキー割り当ての一覧を表示する
+    ShowList,
     /// キー割り当て画面で保存された（settings.json への書き込みは済んでいる。反映だけ行う）
     HotkeysSaved(Vec<config::HotkeyRuleSetting>),
     /// 更新を確認（メニューからの手動操作）
@@ -284,6 +288,7 @@ fn main() {
                 let remap_apps = remap_logic::effective_target_apps(&settings.remap.target_apps);
                 hotkey_window::open(tx.clone(), settings.hotkeys.clone(), (remap, remap_apps));
             }
+            TrayMessage::ShowList => actions::show_assignment_list(),
             TrayMessage::HotkeysSaved(hotkeys) => {
                 settings.hotkeys = hotkeys;
                 configure_hotkeys(&settings.hotkeys);
@@ -352,6 +357,11 @@ fn configure_hotkeys(hotkeys: &[config::HotkeyRuleSetting]) {
         log::warn!("{problem}");
     }
     log::info!("キー割り当て: {} 件を使います", rules.len());
+    actions::set_history_enabled(
+        rules
+            .iter()
+            .any(|r| r.action == hotkey_rules::Action::ClipboardHistory),
+    );
     keyboard::set_rules(rules);
 }
 

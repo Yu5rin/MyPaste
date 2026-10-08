@@ -268,6 +268,31 @@ pub fn save_hotkeys(hotkeys: &[HotkeyRuleSetting]) -> Result<(), String> {
     save_patch(&serde_json::json!({ "hotkeys": value }))
 }
 
+/// 書き出し・読み込みで扱うファイルの大きさの上限（誤って大きなファイルを選んだときに備える）。
+pub const HOTKEYS_FILE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// キー割り当てを、書き出し用の JSON にする。形は `settings.json` と同じ
+/// （`{ "hotkeys": [...] }`）なので、ほかの PC の settings.json もそのまま読み込める。
+pub fn hotkeys_to_json(hotkeys: &[HotkeyRuleSetting]) -> Result<String, String> {
+    let value = serde_json::json!({ "hotkeys": hotkeys });
+    serde_json::to_string_pretty(&value).map_err(|e| e.to_string())
+}
+
+/// 書き出したファイル（または settings.json）から、キー割り当てを読む。
+/// `{ "hotkeys": [...] }` のほか、割り当ての配列そのものも受け付ける。
+pub fn hotkeys_from_json(text: &str) -> Result<Vec<HotkeyRuleSetting>, String> {
+    let value: serde_json::Value = serde_json::from_str(strip_bom(text))
+        .map_err(|e| format!("JSON として読めません（{e}）"))?;
+    let list = match value {
+        serde_json::Value::Object(mut root) => root
+            .remove("hotkeys")
+            .ok_or("キー割り当て（hotkeys）が書かれていません")?,
+        list @ serde_json::Value::Array(_) => list,
+        _ => return Err("キー割り当ての形が想定と違います".into()),
+    };
+    serde_json::from_value(list).map_err(|e| format!("キー割り当ての形が想定と違います（{e}）"))
+}
+
 /// `patch` に書かれた項目だけを `settings.json` に上書きする。
 ///
 /// ファイル全体を [`Settings`] で書き直すと、利用者が書いた未知の項目が
@@ -428,7 +453,10 @@ pub fn is_writable(dir: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_due, merge_json, strip_bom, Settings};
+    use super::{
+        hotkeys_from_json, hotkeys_to_json, is_due, merge_json, strip_bom, HotkeyRuleSetting,
+        Settings,
+    };
 
     const HOUR: u64 = 3600;
 
@@ -563,5 +591,30 @@ mod tests {
     fn huge_interval_does_not_overflow() {
         // 極端な設定値でも panic しないこと（saturating 演算）。
         assert!(!is_due(1_000_000, 999_999, u64::MAX));
+    }
+
+    #[test]
+    fn hotkeys_round_trip() {
+        let rules = vec![HotkeyRuleSetting {
+            hotkey: "Ctrl+Alt+V".into(),
+            action: "paste_plain".into(),
+            apps: vec!["EXCEL.EXE".into()],
+            ..Default::default()
+        }];
+        let text = hotkeys_to_json(&rules).unwrap();
+        assert_eq!(hotkeys_from_json(&text).unwrap(), rules);
+        // 配列そのもの・BOM 付き・settings.json 全体も読める。
+        let array = serde_json::to_string(&rules).unwrap();
+        assert_eq!(hotkeys_from_json(&format!("\u{feff}{array}")).unwrap(), rules);
+        let whole = format!(r#"{{"remap":{{"hotkey":"Ctrl+B"}},"hotkeys":{array}}}"#);
+        assert_eq!(hotkeys_from_json(&whole).unwrap(), rules);
+    }
+
+    #[test]
+    fn hotkeys_from_bad_json() {
+        assert!(hotkeys_from_json("not json").is_err());
+        assert!(hotkeys_from_json(r#"{"remap":{}}"#).is_err());
+        assert!(hotkeys_from_json("3").is_err());
+        assert!(hotkeys_from_json(r#"{"hotkeys":"x"}"#).is_err());
     }
 }

@@ -50,6 +50,8 @@ features = [
     "Win32_UI_HiDpi",
     # 設定画面（標準コントロール）
     "Win32_UI_Controls",
+    # キー割り当ての書き出し・読み込み（ファイルを選ぶ画面）
+    "Win32_UI_Controls_Dialogs",
     # 動作の記録の日時（GetLocalTime）
     "Win32_System_SystemInformation",
     # キー割り当ての「書式なしで貼り付け」（クリップボード）

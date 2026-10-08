@@ -550,7 +550,7 @@ unsafe fn query_foreground_ime() -> Option<Observed> {
 }
 
 /// 入力位置（キャレット）を画面座標で返す。キャレットを使っていないアプリでは `None`。
-unsafe fn caret_rect(info: &GUITHREADINFO) -> Option<RECT> {
+pub(crate) unsafe fn caret_rect(info: &GUITHREADINFO) -> Option<RECT> {
     if info.hwndCaret.is_invalid() {
         return None;
     }

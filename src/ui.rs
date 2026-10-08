@@ -503,6 +503,64 @@ pub unsafe fn set_enabled(hwnd: HWND, id: i32, enabled: bool) {
     }
 }
 
+/// コントロールを表示する・隠す。
+pub unsafe fn set_visible(hwnd: HWND, id: i32, visible: bool) {
+    use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNA};
+    if let Ok(control) = GetDlgItem(hwnd, id) {
+        let _ = ShowWindow(control, if visible { SW_SHOWNA } else { SW_HIDE });
+    }
+}
+
+/// ファイルを選ぶ画面を出す（`save` が真なら保存先を選ぶ）。選ばれなければ `None`。
+///
+/// `filter` は「表示名\0パターン\0」の並び（例 `"JSON ファイル (*.json)\0*.json\0"`）、
+/// `default_ext` は拡張子を書かなかったときに付ける拡張子（`.` なし）。
+pub unsafe fn choose_file(
+    owner: HWND,
+    save: bool,
+    filter: &str,
+    default_ext: &str,
+    default_name: &str,
+) -> Option<std::path::PathBuf> {
+    use windows::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, GetSaveFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
+        OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+    // 選ばれたパスを受け取る場所（長いパスにも足りる大きさ）。
+    let mut buffer = vec![0u16; 32 * 1024];
+    let name: Vec<u16> = default_name.encode_utf16().collect();
+    buffer[..name.len().min(260)].copy_from_slice(&name[..name.len().min(260)]);
+    let filter: Vec<u16> = filter.encode_utf16().chain([0, 0]).collect();
+    let default_ext = wide(default_ext);
+    let mut flags = OFN_NOCHANGEDIR | OFN_HIDEREADONLY | OFN_PATHMUSTEXIST;
+    flags |= if save {
+        OFN_OVERWRITEPROMPT
+    } else {
+        OFN_FILEMUSTEXIST
+    };
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: owner,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        nFilterIndex: 1,
+        lpstrFile: windows::core::PWSTR(buffer.as_mut_ptr()),
+        nMaxFile: buffer.len() as u32,
+        lpstrDefExt: PCWSTR(default_ext.as_ptr()),
+        Flags: flags,
+        ..Default::default()
+    };
+    let chosen = if save {
+        GetSaveFileNameW(&mut ofn)
+    } else {
+        GetOpenFileNameW(&mut ofn)
+    };
+    if !chosen.as_bool() {
+        return None;
+    }
+    let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+    Some(std::path::PathBuf::from(String::from_utf16_lossy(&buffer[..len])))
+}
+
 pub unsafe fn focus(hwnd: HWND, id: i32) {
     if let Ok(control) = GetDlgItem(hwnd, id) {
         let _ = SetFocus(control);
