@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-08
+
 ### 追加
 - キー割り当ての動作「文字を整えて貼り付け」。クリップボードの文字を、選んだ整え方（全角英数・記号を
   半角に、半角カタカナを全角に、▲ △ (123) をマイナスに、桁区切りの , を除く、空白・空の行・改行の
@@ -406,6 +408,7 @@ UX と品質の総点検で見つかった問題への対応。
 - ON/OFF 切替は右クリックメニューから行う（左クリックによるトグルは `tray-item` の制約により非対応）。
 - 他ソフトとのキー競合は対象外。
 
+[1.6.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.6.0
 [1.5.1]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.5.1
 [1.5.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.5.0
 [1.4.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.4.0
