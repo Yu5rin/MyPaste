@@ -8,7 +8,8 @@
 
 use windows::core::w;
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0,
+    CloseHandle, GetLastError, E_ACCESSDENIED, ERROR_ALREADY_EXISTS, HANDLE, WAIT_ABANDONED,
+    WAIT_OBJECT_0,
 };
 use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 
@@ -39,6 +40,12 @@ pub fn acquire() -> Option<Guard> {
     unsafe {
         let handle = match CreateMutexW(None, true, w!("Local\\AtaiPaste.SingleInstance")) {
             Ok(handle) => handle,
+            Err(e) if e.code() == E_ACCESSDENIED => {
+                // 管理者として実行したものが先に動いていると、通常の権限からは開けない。
+                // これも「すでに起動している」なので、そのまま終わる。
+                log::info!("すでに（管理者として）起動しているため、終了します");
+                return None;
+            }
             Err(e) => {
                 // 作れない（まず無い）場合は、防止せずに起動を続ける。
                 log::warn!("二重起動の確認ができませんでした: {e}");

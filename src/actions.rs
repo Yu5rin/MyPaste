@@ -12,7 +12,9 @@
 //! 求められたときに渡す）を使い、貼り付け先が本当に読みに来たかどうかを確かめる。
 
 use std::cell::{Cell, RefCell};
-use std::sync::mpsc::{self, Sender};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::mpsc;
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -29,12 +31,13 @@ use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
-use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetAncestor,
     GetForegroundWindow, GetShellWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
-    PeekMessageW, RegisterClassW, SetWindowPos, TranslateMessage, GA_ROOT, GWL_EXSTYLE,
+    GetMessageW, PeekMessageW, PostMessageW, PostQuitMessage, PostThreadMessageW,
+    RegisterClassW, SetWindowPos, TranslateMessage, GA_ROOT, GWL_EXSTYLE, WM_APP, WM_QUIT,
     HWND_MESSAGE, HWND_NOTOPMOST, HWND_TOPMOST, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOSIZE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROYCLIPBOARD,
     WM_RENDERALLFORMATS, WM_RENDERFORMAT, WNDCLASSW, WS_EX_TOPMOST,
@@ -73,12 +76,22 @@ struct Request {
     held: Hotkey,
 }
 
-/// 実行スレッドへの送り口。フックから使う。
-static SENDER: Mutex<Option<Sender<Request>>> = Mutex::new(None);
+/// 実行を待っている依頼。フックが積み、実行スレッドが取り出す。
+static QUEUE: Mutex<VecDeque<Request>> = Mutex::new(VecDeque::new());
+/// 実行スレッドの見えないウィンドウ（依頼の知らせ先）。0 は未作成。
+static WORKER_WINDOW: AtomicIsize = AtomicIsize::new(0);
+
+/// 依頼が積まれたことを、実行スレッドの見えないウィンドウへ知らせるメッセージ。
+const WM_APP_REQUEST: u32 = WM_APP + 1;
 
 /// 実行スレッドのハンドル。[`Worker::stop`] で止める。
+///
+/// 実行スレッドは普段から `GetMessageW` でメッセージを処理し続ける。クリップボードの持ち主に
+/// なっていると、ほかのアプリがコピーしたときに Windows から知らせ（WM_DESTROYCLIPBOARD など）が
+/// 送られてきて、相手はその処理が終わるのを待つため、止まって待っていてはいけない。
 pub struct Worker {
     thread: Option<JoinHandle<()>>,
+    thread_id: u32,
 }
 
 impl Worker {
@@ -88,9 +101,12 @@ impl Worker {
     }
 
     fn shutdown(&mut self) {
-        // 送り口を閉じると、実行スレッドの受信が終わってループを抜ける。
-        SENDER.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(thread) = self.thread.take() {
+            if self.thread_id != 0 {
+                unsafe {
+                    let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+                }
+            }
             let _ = thread.join();
         }
     }
@@ -104,16 +120,27 @@ impl Drop for Worker {
 
 /// 実行スレッドを始める。
 pub fn start() -> Worker {
-    let (tx, rx) = mpsc::channel::<Request>();
-    *SENDER.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
+    let (tx, rx) = mpsc::channel::<u32>();
     let thread = std::thread::spawn(move || unsafe {
         // ShellExecuteW のために COM を初期化しておく（関連付けによっては COM を使う）。
         let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
         let window = create_clipboard_window();
         CLIP_WINDOW.with(|w| w.set(window));
-        for request in rx {
-            execute(request);
+        WORKER_WINDOW.store(window.0 as isize, Ordering::SeqCst);
+        let _ = tx.send(GetCurrentThreadId());
+
+        let mut msg = MSG::default();
+        loop {
+            let ret = GetMessageW(&mut msg, None, 0, 0);
+            // 0 = WM_QUIT、-1 = エラー。どちらも抜ける。
+            if ret.0 <= 0 {
+                break;
+            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
         }
+
+        WORKER_WINDOW.store(0, Ordering::SeqCst);
         if !window.is_invalid() {
             let _ = DestroyWindow(window);
         }
@@ -121,15 +148,42 @@ pub fn start() -> Worker {
             CoUninitialize();
         }
     });
+    let thread_id = rx.recv().unwrap_or(0);
     Worker {
         thread: Some(thread),
+        thread_id,
     }
 }
 
 /// 動作の実行を依頼する（キーボードフックから呼ぶ。すぐに戻る）。
 pub fn dispatch(action: Action, held: Hotkey) {
-    if let Some(tx) = SENDER.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-        let _ = tx.send(Request { action, held });
+    let window = WORKER_WINDOW.load(Ordering::SeqCst);
+    if window == 0 {
+        return;
+    }
+    QUEUE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push_back(Request { action, held });
+    unsafe {
+        let _ = PostMessageW(
+            HWND(window as *mut core::ffi::c_void),
+            WM_APP_REQUEST,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
+}
+
+/// 積まれている依頼を順に実行する。実行中（貼り付けの待ち時間）に届いた知らせからは
+/// 呼ばれないようにしてあるので、同時に 2 つ実行することはない。
+unsafe fn run_queued_requests() {
+    loop {
+        let request = QUEUE.lock().unwrap_or_else(|p| p.into_inner()).pop_front();
+        match request {
+            Some(request) => execute(request),
+            None => break,
+        }
     }
 }
 
@@ -232,7 +286,7 @@ unsafe fn paste_plain(held: &Hotkey) {
 ///
 /// 待っている間に利用者が別のものをコピーした場合は、それを消さないよう元に戻さない。
 unsafe fn paste_text(held: &Hotkey, text: &str) {
-    let saved = snapshot_clipboard();
+    let saved = save_clipboard();
     if let Err(e) = offer_text(text) {
         // クリップボードが使えないときは、1 文字ずつ入力する。
         log::warn!("キー割り当て: クリップボードを使えないため 1 文字ずつ入力します: {e}");
@@ -250,12 +304,16 @@ unsafe fn paste_text(held: &Hotkey, text: &str) {
     // 自分が持ち主のままなら元に戻す（別のものがコピーされていたら戻さない）。
     if GetClipboardOwner().ok() == Some(clip_window()) {
         match &saved {
-            Some(saved) => {
+            Saved::Contents(Some(saved)) => {
                 if let Err(e) = restore_clipboard(saved) {
                     log::warn!("キー割り当て: クリップボードを元に戻せませんでした: {e}");
                 }
             }
-            None => {
+            Saved::Unavailable => {
+                // 元の内容を控えられなかったので、空にして消してしまわないよう、そのままにする。
+                log::warn!("キー割り当て: 元のクリップボードを控えられなかったため、元に戻しません");
+            }
+            Saved::Contents(None) => {
                 // もともと空（または控えられなかった）なら、空に戻す。
                 if open_clipboard() {
                     let _ = EmptyClipboard();
@@ -305,11 +363,22 @@ unsafe fn offer_text(text: &str) -> Result<(), String> {
 /// メッセージを処理しながら、`done` が真になるか `timeout` が過ぎるまで待つ。
 /// 貼り付け先からの「文字を渡して」（WM_RENDERFORMAT）は、ここで処理される。
 /// `done` が真になったら `true`。
+///
+/// 次の依頼の知らせ（WM_APP_REQUEST）はここでは取り出さない（今の動作が終わってから
+/// 順に実行する）。WM_QUIT を取り出してしまった場合は、置き直して元のループに任せる。
 unsafe fn pump_messages_until(timeout: Duration, done: impl Fn() -> bool) -> bool {
     let start = Instant::now();
     let mut msg = MSG::default();
     loop {
-        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+        // WM_APP_REQUEST の前後の範囲だけを取り出す（送られてきたメッセージは、
+        // 範囲にかかわらず PeekMessageW の中で処理される）。
+        while PeekMessageW(&mut msg, None, 0, WM_APP_REQUEST - 1, PM_REMOVE).as_bool()
+            || PeekMessageW(&mut msg, None, WM_APP_REQUEST + 1, u32::MAX, PM_REMOVE).as_bool()
+        {
+            if msg.message == WM_QUIT {
+                PostQuitMessage(msg.wParam.0 as i32);
+                return done();
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -361,6 +430,11 @@ unsafe extern "system" fn clip_wnd_proc(
                 }
                 let _ = CloseClipboard();
             }
+            LRESULT(0)
+        }
+        // 依頼が積まれた。
+        WM_APP_REQUEST => {
+            run_queued_requests();
             LRESULT(0)
         }
         // 別のものがコピーされた（または自分で空にした）。予約は無効になる。
@@ -439,6 +513,23 @@ fn copyable_format(format: u32) -> bool {
     !matches!(format, 2 | 3 | 9 | 14 | 0x80..=0x8E | 0x300..=0x3FF)
 }
 
+/// 控えた結果。
+enum Saved {
+    /// 控えられた（空だった場合は中身が空）。
+    Contents(Option<ClipboardSnapshot>),
+    /// ほかのアプリが使っていて開けず、控えられなかった。
+    Unavailable,
+}
+
+/// 今のクリップボードの内容を控える。
+unsafe fn save_clipboard() -> Saved {
+    if !open_clipboard() {
+        return Saved::Unavailable;
+    }
+    let _ = CloseClipboard();
+    Saved::Contents(snapshot_clipboard())
+}
+
 /// 今のクリップボードの内容を控える。空なら `None`。
 unsafe fn snapshot_clipboard() -> Option<ClipboardSnapshot> {
     if !open_clipboard() {
@@ -472,7 +563,9 @@ unsafe fn snapshot_clipboard() -> Option<ClipboardSnapshot> {
 
 /// 控えた内容をクリップボードに戻す。
 unsafe fn restore_clipboard(saved: &ClipboardSnapshot) -> Result<(), String> {
-    if !open_clipboard() {
+    // 貼り付けたアプリが、読み終えたあともしばらくクリップボードを開いたままのことがある。
+    // 元に戻せないと利用者のクリップボードが失われるので、ほかより長く（約 1 秒）待つ。
+    if !open_clipboard_with_retries(CLIPBOARD_RETRIES * 5) {
         return Err("ほかのアプリがクリップボードを使っています".into());
     }
     let _ = EmptyClipboard();
@@ -502,7 +595,12 @@ unsafe fn global_copy(data: &[u8]) -> Result<HGLOBAL, String> {
 
 /// クリップボードを開く。ほかのアプリが使っている間は少し待って開き直す。
 unsafe fn open_clipboard() -> bool {
-    for _ in 0..CLIPBOARD_RETRIES {
+    open_clipboard_with_retries(CLIPBOARD_RETRIES)
+}
+
+/// クリップボードを開く（開き直す回数を指定する）。
+unsafe fn open_clipboard_with_retries(retries: u32) -> bool {
+    for _ in 0..retries {
         // 持ち主のウィンドウを渡して開く（None だと EmptyClipboard 後の持ち主が無くなり、
         // SetClipboardData が失敗することがある）。
         if OpenClipboard(clip_window()).is_ok() {
@@ -525,8 +623,10 @@ unsafe fn read_clipboard_text() -> Option<String> {
         if ptr.is_null() {
             return None;
         }
+        // 終わりの 0 を探す。相手のデータに 0 が無くても、確保された大きさを超えて読まない。
+        let max = GlobalSize(memory) / std::mem::size_of::<u16>();
         let mut len = 0usize;
-        while *ptr.add(len) != 0 {
+        while len < max && *ptr.add(len) != 0 {
             len += 1;
         }
         let text = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));

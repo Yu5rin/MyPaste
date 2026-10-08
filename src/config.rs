@@ -294,7 +294,19 @@ fn save_patch(patch: &serde_json::Value) -> Result<(), String> {
     }
     merge_json(&mut root, patch);
     let text = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
-    std::fs::write(&path, text).map_err(|e| format!("settings.json に書き込めませんでした: {e}"))
+    write_replacing(&path, text.as_bytes())
+        .map_err(|e| format!("settings.json に書き込めませんでした: {e}"))
+}
+
+/// ファイルを書き換える。いったん隣の一時ファイルに書いてから置き換えるので、書き込みの
+/// 途中で電源が切れたりしても、元のファイルが壊れた中途半端な状態で残らない。
+fn write_replacing(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, data)?;
+    // Windows でも、既にあるファイルを置き換えられる（MoveFileExW の置き換え指定）。
+    std::fs::rename(&temp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp);
+    })
 }
 
 /// `patch` を `base` に重ねる。オブジェクト同士は項目ごとに再帰的に重ね、

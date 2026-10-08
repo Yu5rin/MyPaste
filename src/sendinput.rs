@@ -38,14 +38,14 @@ const VK_MENU_MASK: u16 = 0xE8;
 
 /// Ctrl+Shift+V を送出する。`held` は押されたままの修飾キー（設定したキーの組み合わせ）。
 pub fn send_paste_values(held: &Hotkey) {
-    unsafe {
-        SendInput(&paste_values_inputs(held), std::mem::size_of::<INPUT>() as i32);
-    }
+    send(&paste_values_inputs(held));
 }
 
 /// 送出する入力の並びを組み立てる。
 fn paste_values_inputs(held: &Hotkey) -> Vec<INPUT> {
     let mut inputs = Vec::with_capacity(12);
+    // Alt と Win は離すので、利用者が実際に離すまでは押されているものとして扱ってもらう。
+    crate::keyboard::mark_released_by_us(false, false, held.alt, held.win);
     if held.alt || held.win {
         inputs.push(key(VK_MENU_MASK, false));
         inputs.push(key(VK_MENU_MASK, true));
@@ -133,14 +133,23 @@ fn send(inputs: &[INPUT]) {
     if inputs.is_empty() {
         return;
     }
-    unsafe {
-        SendInput(inputs, std::mem::size_of::<INPUT>() as i32);
+    let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
+    if (sent as usize) < inputs.len() {
+        // 管理者として実行しているアプリが前面にあるときなど、Windows が受け付けない。
+        log::warn!(
+            "キーを送れませんでした（{} 件中 {} 件。前面のアプリ: {}）",
+            inputs.len(),
+            sent,
+            crate::excel_check::foreground_process_name().unwrap_or_else(|| "不明".into())
+        );
     }
 }
 
 /// 押されたままの修飾キーを離す入力。Alt と Win は、離したときにメニューやスタートが
 /// 開かないよう、先に何も割り当てられていないキーを打鍵する。
 fn release_inputs(held: &Hotkey) -> Vec<INPUT> {
+    // 利用者が修飾キーを押したまま、同じ割り当てをもう一度押せるように知らせておく。
+    crate::keyboard::mark_released_by_us(held.ctrl, held.shift, held.alt, held.win);
     let mut inputs = Vec::new();
     if held.alt || held.win {
         inputs.push(key(VK_MENU_MASK, false));

@@ -35,6 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::{self, Settings};
+use crate::hotkey_rules;
 use crate::ime_indicator::{Params, Timing};
 use crate::ime_logic::{
     self, Position, Theme, FADE_MS_MAX, FADE_MS_MIN, HOLD_MS_MAX, HOLD_MS_MIN, OPACITY_MAX,
@@ -409,6 +410,17 @@ unsafe fn on_save(hwnd: HWND) {
     }) else {
         return;
     };
+    // 値貼り付けのキーが、キー割り当てと重なっていないか確かめる（値貼り付けが先に効くので、
+    // 重なった割り当ては使われなくなる）。割り当ては、この画面を開いたあとにキー割り当て画面で
+    // 保存されていることもあるので、settings.json から読み直す。
+    let hotkeys = config::Settings::load().hotkeys;
+    if let Some(message) =
+        hotkey_rules::find_conflict(&hotkeys, (form.hotkey, &form.target_apps))
+    {
+        show_message(hwnd, &message, MB_ICONWARNING);
+        ui::focus(hwnd, ID_KEY);
+        return;
+    }
     settings.remap.hotkey = form.hotkey.format();
     settings.remap.target_apps = form.target_apps;
     settings.ime_indicator.enabled = form.ime_enabled;

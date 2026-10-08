@@ -47,6 +47,41 @@ static HOTKEY: AtomicU32 = AtomicU32::new(0x0142);
 /// 対象アプリのプロセス名（大文字）。
 static TARGET_APPS: RwLock<Vec<String>> = RwLock::new(Vec::new());
 
+/// アプリが「離した」を送った（[`mark_released_by_us`]）が、利用者はまだ押したままの
+/// 修飾キー（[`MOD_CTRL`] などのビット）。`GetAsyncKeyState` はアプリが送った「離した」も
+/// 反映するので、修飾キーを押したまま割り当てたキーを続けて押したときに、2 回目が一致しなく
+/// なる。それを防ぐため、利用者が実際に離す（または押し直す）までは押されているとみなす。
+static RELEASED_BY_US: AtomicU32 = AtomicU32::new(0);
+const MOD_CTRL: u32 = 1;
+const MOD_SHIFT: u32 = 2;
+const MOD_ALT: u32 = 4;
+const MOD_WIN: u32 = 8;
+
+/// アプリが修飾キーの「離した」を送ることを知らせる（[`crate::sendinput`] が、送る直前に呼ぶ）。
+///
+/// その時点で実際に押されているものだけに印を付ける。利用者がすでに離していた修飾キーに
+/// 印を付けると、次に押すまで「押されている」と誤解し続けてしまうため。
+pub fn mark_released_by_us(ctrl: bool, shift: bool, alt: bool, win: bool) {
+    let bits = (u32::from(ctrl && is_down(VK_CONTROL)) * MOD_CTRL)
+        | (u32::from(shift && is_down(VK_SHIFT)) * MOD_SHIFT)
+        | (u32::from(alt && is_down(VK_MENU)) * MOD_ALT)
+        | (u32::from(win && (is_down(VK_LWIN) || is_down(VK_RWIN))) * MOD_WIN);
+    if bits != 0 {
+        RELEASED_BY_US.fetch_or(bits, Ordering::SeqCst);
+    }
+}
+
+/// 修飾キーの仮想キーコードを、[`MOD_CTRL`] などのビットにする。修飾キーでなければ 0。
+fn modifier_bit(vk: u32) -> u32 {
+    match vk {
+        0x11 | 0xA2 | 0xA3 => MOD_CTRL,
+        0x10 | 0xA0 | 0xA1 => MOD_SHIFT,
+        0x12 | 0xA4 | 0xA5 => MOD_ALT,
+        0x5B | 0x5C => MOD_WIN,
+        _ => 0,
+    }
+}
+
 /// キー割り当て（有効で読めるものだけ）。
 static RULES: RwLock<Vec<Rule>> = RwLock::new(Vec::new());
 
@@ -173,11 +208,16 @@ fn is_down(vk: VIRTUAL_KEY) -> bool {
 }
 
 /// 押されている修飾キーが、設定した組み合わせとちょうど一致するか。
+///
+/// アプリが「離した」を送ったが利用者はまだ押している修飾キー（[`RELEASED_BY_US`]）も、
+/// 押されているものとして数える。
 fn modifiers_match(hotkey: &Hotkey) -> bool {
-    is_down(VK_CONTROL) == hotkey.ctrl
-        && is_down(VK_SHIFT) == hotkey.shift
-        && is_down(VK_MENU) == hotkey.alt
-        && (is_down(VK_LWIN) || is_down(VK_RWIN)) == hotkey.win
+    let ours = RELEASED_BY_US.load(Ordering::SeqCst);
+    let held = |vk_down: bool, bit: u32| vk_down || ours & bit != 0;
+    held(is_down(VK_CONTROL), MOD_CTRL) == hotkey.ctrl
+        && held(is_down(VK_SHIFT), MOD_SHIFT) == hotkey.shift
+        && held(is_down(VK_MENU), MOD_ALT) == hotkey.alt
+        && held(is_down(VK_LWIN) || is_down(VK_RWIN), MOD_WIN) == hotkey.win
 }
 
 /// 低レベルキーボードフックのコールバック。
@@ -193,6 +233,15 @@ unsafe extern "system" fn low_level_keyboard_proc(
 
         let injected = (kb.flags.0 & LLKHF_INJECTED.0) != 0;
         let is_self = kb.dwExtraInfo == sendinput::EXTRA_INFO_SIGNATURE;
+
+        // 利用者が修飾キーを実際に離した・押し直したら、「アプリが離した」の印を消す
+        // （ここからは GetAsyncKeyState が正しい状態を表す）。
+        if !injected && !is_self {
+            let bit = modifier_bit(kb.vkCode);
+            if bit != 0 {
+                RELEASED_BY_US.fetch_and(!bit, Ordering::SeqCst);
+            }
+        }
 
         // 自分が送った入力・注入入力は対象外。
         if !injected && !is_self {

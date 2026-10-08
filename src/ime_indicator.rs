@@ -46,7 +46,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
-use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::UI::Shell::{
     SHQueryUserNotificationState, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
@@ -655,16 +655,12 @@ unsafe fn placement(caret: Option<RECT>, params: &Params) -> Option<(i32, i32, i
         _ => {}
     }
 
-    // 画面中央（入力位置が取れなかった場合も）。前面（最上位）ウィンドウのモニターと DPI に
-    // 合わせる。フォーカス先が子ウィンドウでも、前面ウィンドウと同じモニター・同じ DPI になる。
+    // 画面中央（入力位置が取れなかった場合も）。前面（最上位）ウィンドウのあるモニターの
+    // 中央に、そのモニターの拡大率で出す。前面ウィンドウ自身の DPI（GetDpiForWindow）は使わない。
+    // 高 DPI に対応していないアプリでは拡大率にかかわらず 96 を返し、表示が小さくなるため。
     let foreground = GetForegroundWindow();
     let monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
-    let (work, monitor_dpi) = monitor_info(monitor)?;
-    let dpi = if foreground.is_invalid() {
-        monitor_dpi
-    } else {
-        GetDpiForWindow(foreground)
-    };
+    let (work, dpi) = monitor_info(monitor)?;
     let size = ime_logic::scale_for_dpi(base, dpi);
     let (x, y) = ime_logic::centered_origin(work.left, work.top, work.right, work.bottom, size);
     Some((x, y, size))

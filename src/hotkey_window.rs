@@ -455,6 +455,24 @@ unsafe fn on_move(hwnd: HWND, delta: isize) {
 
 /// 「保存」: 同じキーの重なりを確かめて settings.json に書き、メインスレッドへ反映を頼んで閉じる。
 unsafe fn on_save(hwnd: HWND) {
+    // 右側を書き換えたまま「更新」を押し忘れていないか確かめる（押し忘れると、その変更は
+    // 保存されないため）。
+    if let Some(index) = ui::list_index(hwnd, ID_LIST) {
+        if let Ok(edited) = read_editor(hwnd) {
+            let current =
+                CONTEXT.with(|c| c.borrow().as_ref().and_then(|ctx| ctx.rules.get(index).cloned()));
+            if current.is_some_and(|current| !same_rule(&current, &edited))
+                && ui::ask_yes_no(
+                    hwnd,
+                    "右側で変更した内容が、まだ一覧に反映されていません。\n\
+                     選んでいる割り当てに反映してから保存しますか？\n\n\
+                     「いいえ」を選ぶと、右側の変更は保存しません。",
+                )
+            {
+                on_update(hwnd);
+            }
+        }
+    }
     let Some((tx, rules, remap)) = CONTEXT.with(|c| {
         c.borrow()
             .as_ref()
@@ -479,6 +497,26 @@ unsafe fn on_save(hwnd: HWND) {
         }
     });
     let _ = DestroyWindow(hwnd);
+}
+
+/// 2 つの割り当てが同じ内容か（書き方の揺れ。例えばキーの大文字小文字や、アプリ名の
+/// `.exe` の有無は区別しない）。
+fn same_rule(a: &HotkeyRuleSetting, b: &HotkeyRuleSetting) -> bool {
+    let key = |s: &HotkeyRuleSetting| Hotkey::parse(&s.hotkey).ok();
+    let kind = |s: &HotkeyRuleSetting| ActionKind::from_setting(&s.action);
+    let apps = |s: &HotkeyRuleSetting| remap_logic::normalize_apps(s.apps.iter().map(String::as_str));
+    let info = kind(a).map(|k| k.info());
+    let uses_value = info.is_some_and(|i| i.value_label.is_some());
+    let uses_args = info.is_some_and(|i| i.uses_args);
+    let is_text = kind(a) == Some(ActionKind::TypeText);
+    a.enabled == b.enabled
+        && key(a) == key(b)
+        && kind(a) == kind(b)
+        && (!uses_value || a.value.replace("\r\n", "\n") == b.value.replace("\r\n", "\n"))
+        && (!uses_args || a.args.trim() == b.args.trim())
+        && apps(a) == apps(b)
+        && (!is_text
+            || hotkey_rules::input_is_paste(&a.input) == hotkey_rules::input_is_paste(&b.input))
 }
 
 /// 「キャンセル」・閉じるボタン: 保存していない変更があれば確かめてから閉じる。
