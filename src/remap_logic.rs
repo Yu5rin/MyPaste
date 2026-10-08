@@ -270,6 +270,11 @@ pub fn apps_to_text(apps: &[String]) -> String {
         .join("\r\n")
 }
 
+/// アプリの一覧を、1 行の欄に入れる文字にする（空白で区切る。空白を含む名前は `"` で囲む）。
+pub fn apps_to_line(apps: &[String]) -> String {
+    apps_to_text(apps).replace("\r\n", " ")
+}
+
 /// 設定ファイルの対象アプリを、実際に使う一覧にする。
 ///
 /// 書き方の揺れ（小文字、`.exe` 抜け、フォルダ付き）を [`normalize_app`] で直す。
@@ -293,6 +298,57 @@ pub fn effective_target_apps(apps: &[String]) -> Vec<String> {
 /// プロセスのファイル名が対象アプリに含まれるか（大文字小文字は区別しない）。
 pub fn is_target_app(file_name: &str, apps: &[String]) -> bool {
     apps.iter().any(|a| a.eq_ignore_ascii_case(file_name))
+}
+
+/// 動いているアプリ 1 つ分（プロセス名を選ぶ画面の 1 行）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningApp {
+    /// プロセス名（[`normalize_app`] でそろえたもの。例 `EXCEL.EXE`）。
+    pub name: String,
+    /// そのアプリのいちばん手前のウィンドウの題名。
+    pub title: String,
+    /// そのアプリの（題名のある）ウィンドウの数。
+    pub windows: usize,
+}
+
+/// 開いているウィンドウ（プロセス名と題名。手前から順）を、アプリごとにまとめて名前順に並べる。
+pub fn running_apps<'a>(windows: impl IntoIterator<Item = (&'a str, &'a str)>) -> Vec<RunningApp> {
+    let mut apps: Vec<RunningApp> = Vec::new();
+    for (name, title) in windows {
+        let Some(name) = normalize_app(name) else {
+            continue;
+        };
+        match apps.iter_mut().find(|a| a.name == name) {
+            Some(app) => app.windows += 1,
+            None => apps.push(RunningApp {
+                name,
+                title: title.trim().to_string(),
+                windows: 1,
+            }),
+        }
+    }
+    apps.sort_by(|a, b| a.name.cmp(&b.name));
+    apps
+}
+
+/// 一覧に出す 1 行（例 `EXCEL.EXE　Book1 - Excel（ほか 2 つ）`）。
+pub fn running_app_row(app: &RunningApp) -> String {
+    let mut row = format!("{}\u{3000}{}", app.name, app.title);
+    if app.windows > 1 {
+        row.push_str(&format!("（ほか {} つ）", app.windows - 1));
+    }
+    row
+}
+
+/// アプリの一覧の欄の文字に 1 つ足す（すでにあれば何もしない）。そろえた一覧を返す。
+pub fn add_app(text: &str, name: &str) -> Vec<String> {
+    let mut apps = normalize_apps([text]);
+    if let Some(name) = normalize_app(name) {
+        if !apps.contains(&name) {
+            apps.push(name);
+        }
+    }
+    apps
 }
 
 #[cfg(test)]
@@ -453,5 +509,26 @@ mod tests {
         assert!(is_target_app("Excel.exe", &apps));
         assert!(!is_target_app("notepad.exe", &apps));
         assert!(!is_target_app("Excel.exe", &[]));
+    }
+
+    #[test]
+    fn running_apps_are_grouped() {
+        let apps = running_apps([
+            ("notepad.exe", "メモ"),
+            ("EXCEL.EXE", " Book1 - Excel "),
+            ("excel.exe", "Book2 - Excel"),
+            ("", "名前なし"),
+        ]);
+        assert_eq!(apps.len(), 2);
+        assert_eq!(apps[0], RunningApp { name: "EXCEL.EXE".into(), title: "Book1 - Excel".into(), windows: 2 });
+        assert_eq!(running_app_row(&apps[0]), "EXCEL.EXE\u{3000}Book1 - Excel（ほか 1 つ）");
+        assert_eq!(running_app_row(&apps[1]), "NOTEPAD.EXE\u{3000}メモ");
+    }
+
+    #[test]
+    fn adds_app_once() {
+        assert_eq!(add_app("EXCEL.EXE", "notepad.exe"), vec!["EXCEL.EXE", "NOTEPAD.EXE"]);
+        assert_eq!(add_app("excel notepad", "NOTEPAD.EXE"), vec!["EXCEL.EXE", "NOTEPAD.EXE"]);
+        assert_eq!(add_app("", "My App.exe"), vec!["MY APP.EXE"]);
     }
 }

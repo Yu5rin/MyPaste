@@ -32,6 +32,7 @@ use windows::Win32::Graphics::Gdi::{DeleteObject, HFONT};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
+    IsWindow,
     DefWindowProcW, DestroyWindow, PostQuitMessage, SetForegroundWindow, ShowWindow,
     MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, SW_SHOW, SW_SHOWNORMAL, WM_COMMAND,
     WM_DESTROY, WM_DPICHANGED,
@@ -51,7 +52,7 @@ use crate::ui::{
     set_combo_index, set_text, show_message, wide, Item, Kind, SingleWindow, BN_CLICKED,
     CBN_CLOSEUP, CBN_SELCHANGE,
 };
-use crate::{actions, ime_indicator, logging, startup, TrayMessage};
+use crate::{actions, ime_indicator, logging, process_picker, startup, TrayMessage};
 
 // --- コントロールの ID ---
 // 「保存」「キャンセル」は IDOK / IDCANCEL と同じ値にして、Enter / Esc で押せるようにする
@@ -98,6 +99,8 @@ const ID_CH_MOVE_TOP: i32 = 156;
 const ID_CH_EXCLUDE: i32 = 157;
 const ID_EXPORT: i32 = 160;
 const ID_IMPORT: i32 = 161;
+const ID_PICK_APP: i32 = 162;
+const ID_CH_PICK_EXCLUDE: i32 = 163;
 
 
 /// 画面の中身の大きさ（96 DPI 基準）。
@@ -115,8 +118,9 @@ const ITEMS: &[Item] = &[
     item(ID_ALT, Kind::Check, "Alt", 266, 31, 52, 22),
     item(202, Kind::Label, "+", 322, 30, 16, 24),
     item(ID_KEY, Kind::Combo, "", 342, 30, 110, 300),
-    item(203, Kind::Label, "対象アプリ（プロセス名を 1 行に 1 つ。例: EXCEL.EXE）", 24, 60, 428, 22),
+    item(203, Kind::Label, "対象アプリ（1 行に 1 つ。例: EXCEL.EXE）", 24, 58, 340, 24),
     item(ID_APPS, Kind::MultiEdit, "", 24, 84, 428, 58),
+    item(ID_PICK_APP, Kind::Button, "選ぶ...", 372, 55, 80, 26),
     // 入力モードの表示
     item(210, Kind::Group, "入力モードの表示", 12, 163, 456, 238),
     item(ID_IME_ENABLED, Kind::Check, "IME の入力モードを切り替えたら大きく表示する", 24, 185, 428, 22),
@@ -178,7 +182,8 @@ const ITEMS: &[Item] = &[
     item(ID_CH_KEEP, Kind::Check, "アプリを終了しても履歴を残す（暗号化して保存）", 492, 312, 432, 22),
     item(ID_CH_MOVE_TOP, Kind::Check, "一覧から貼り付けたものを、いちばん上に移す", 492, 338, 432, 22),
     item(249, Kind::Label, "記録しないアプリ", 492, 366, 120, 24),
-    item(ID_CH_EXCLUDE, Kind::Edit, "", 616, 366, 308, 24),
+    item(ID_CH_EXCLUDE, Kind::Edit, "", 616, 366, 222, 24),
+    item(ID_CH_PICK_EXCLUDE, Kind::Button, "選ぶ...", 844, 364, 80, 28),
     item(239, Kind::Note, "一覧はクリックか矢印キーと Enter で選び、右クリックでピン留めできます。記録しないアプリはプロセス名を空白で区切って書きます（例: KeePass.exe）。", 492, 398, 334, 58),
     item(ID_CH_CLEAR, Kind::Button, "履歴を消す", 834, 404, 90, 28),
     // 設定の書き出し・読み込み（右の列）
@@ -343,12 +348,7 @@ unsafe fn fill_history(hwnd: HWND, settings: &ClipboardHistorySettings) {
     set_text(hwnd, ID_CH_PAGE, &config.page_size.to_string());
     set_checked(hwnd, ID_CH_MOVE_TOP, config.move_to_top);
     // 空白を含む名前は " で囲む（読むときに 1 つの名前として読めるように）。
-    let exclude: Vec<String> = config
-        .exclude_apps
-        .iter()
-        .map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a.clone() })
-        .collect();
-    set_text(hwnd, ID_CH_EXCLUDE, &exclude.join(" "));
+    set_text(hwnd, ID_CH_EXCLUDE, &remap_logic::apps_to_line(&config.exclude_apps));
     let theme_index = HistoryTheme::ALL.iter().position(|(t, _, _)| *t == config.theme).unwrap_or(0);
     set_combo_index(hwnd, ID_CH_THEME, theme_index);
     update_history_fields(hwnd);
@@ -612,6 +612,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     ID_CH_CLEAR => on_clear_history(hwnd),
                     ID_EXPORT => on_export(hwnd),
                     ID_IMPORT => on_import(hwnd),
+                    ID_PICK_APP => on_pick_app(hwnd, ID_APPS),
+                    ID_CH_PICK_EXCLUDE => on_pick_app(hwnd, ID_CH_EXCLUDE),
                     _ => {}
                 }
             }
@@ -639,6 +641,24 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+/// 「選ぶ...」: 開いているアプリの一覧からプロセス名を選び、`id` の欄に足す。
+unsafe fn on_pick_app(hwnd: HWND, id: i32) {
+    let Some(name) = process_picker::choose(hwnd) else {
+        return;
+    };
+    if !IsWindow(hwnd).as_bool() {
+        return;
+    }
+    let apps = remap_logic::add_app(&get_text(hwnd, id), &name);
+    let text = if id == ID_APPS {
+        remap_logic::apps_to_text(&apps)
+    } else {
+        remap_logic::apps_to_line(&apps)
+    };
+    set_text(hwnd, id, &text);
+    ui::focus(hwnd, id);
 }
 
 /// 「保存」: 検証して settings.json に書き、メインスレッドへ反映を頼んで閉じる。

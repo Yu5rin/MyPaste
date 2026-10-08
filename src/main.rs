@@ -43,6 +43,7 @@ mod http;
 mod ime_indicator;
 mod ime_logic;
 mod keyboard;
+mod process_picker;
 mod remap_logic;
 mod sendinput;
 mod settings_window;

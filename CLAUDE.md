@@ -80,6 +80,7 @@ src/
  ├ history_window.rs // クリップボードの履歴と定型文の一覧の画面
  ├ snippets.rs      // 定型文の検証と CSV の読み書き（Win32 非依存）
  ├ snippet_window.rs // 定型文の画面
+ ├ process_picker.rs // プロセス名を選ぶ画面（開いているアプリの一覧）
  ├ ui.rs            // 画面の共通部品
  ├ single_instance.rs // 二重起動の防止
  ├ tray.rs          // タスクトレイ制御（tray-item）

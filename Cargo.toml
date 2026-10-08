@@ -61,6 +61,8 @@ features = [
     "Win32_Security",
     # クリップボードの履歴を暗号化して保存する（DPAPI）
     "Win32_Security_Cryptography",
+    # プロセス名を選ぶ画面（隠れているストアアプリのウィンドウを除く）
+    "Win32_Graphics_Dwm",
 ]
 
 [features]

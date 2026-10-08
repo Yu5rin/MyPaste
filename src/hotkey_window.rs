@@ -33,7 +33,7 @@ use crate::ui::{
     self, combo_index, get_text, is_checked, item, set_checked, set_combo_index, set_text,
     show_message, Item, Kind, SingleWindow, BN_CLICKED, CBN_CLOSEUP, CBN_SELCHANGE, LBN_SELCHANGE,
 };
-use crate::TrayMessage;
+use crate::{process_picker, TrayMessage};
 
 // --- コントロールの ID ---
 // 「保存」「キャンセル」は IDOK / IDCANCEL と同じ値（Enter / Esc で押せる）。
@@ -56,6 +56,7 @@ const ID_HINT: i32 = 319;
 const ID_ARGS: i32 = 321;
 const ID_SCOPE: i32 = 322;
 const ID_APPS: i32 = 323;
+const ID_PICK_APP: i32 = 329;
 const ID_ADD: i32 = 324;
 const ID_UPDATE: i32 = 325;
 const ID_PASTE: i32 = 326;
@@ -111,7 +112,8 @@ const ITEMS: &[Item] = &[
     item(ID_ARGS, Kind::Edit, "", 388, 340, 268, 24),
     item(406, Kind::Label, "効くアプリ", 336, 372, 80, 24),
     item(ID_SCOPE, Kind::Combo, "", 420, 372, 236, 200),
-    item(ID_APPS, Kind::Edit, "", 336, 402, 320, 24),
+    item(ID_APPS, Kind::Edit, "", 336, 402, 236, 24),
+    item(ID_PICK_APP, Kind::Button, "選ぶ...", 578, 400, 78, 28),
     item(ID_ADD, Kind::Button, "新しい割り当てとして追加", 324, 444, 172, 28),
     item(ID_UPDATE, Kind::Button, "選んだ割り当てを更新", 500, 444, 168, 28),
     // 操作ボタン
@@ -260,22 +262,8 @@ unsafe fn load_editor(hwnd: HWND, rule: &HotkeyRuleSetting) {
     set_checked(hwnd, ID_PASTE, hotkey_rules::input_is_paste(&rule.input));
     let apps = remap_logic::normalize_apps(rule.apps.iter().map(String::as_str));
     set_combo_index(hwnd, ID_SCOPE, usize::from(!apps.is_empty()));
-    set_text(hwnd, ID_APPS, &apps_to_line(&apps));
+    set_text(hwnd, ID_APPS, &remap_logic::apps_to_line(&apps));
     update_fields(hwnd);
-}
-
-/// 効くアプリを 1 行にする（空白を含む名前は " で囲む）。
-fn apps_to_line(apps: &[String]) -> String {
-    apps.iter()
-        .map(|a| {
-            if a.chars().any(char::is_whitespace) {
-                format!("\"{a}\"")
-            } else {
-                a.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// 動作に合わせて、内容の欄の見出し・説明と、使える欄を切り替える。
@@ -296,7 +284,9 @@ unsafe fn update_fields(hwnd: HWND) {
     ui::set_enabled(hwnd, ID_VALUE, info.value_label.is_some());
     ui::set_enabled(hwnd, ID_ARGS, info.uses_args);
     ui::set_enabled(hwnd, ID_PASTE, info.kind == ActionKind::TypeText);
-    ui::set_enabled(hwnd, ID_APPS, combo_index(hwnd, ID_SCOPE) == Some(1));
+    let some_apps = combo_index(hwnd, ID_SCOPE) == Some(1);
+    ui::set_enabled(hwnd, ID_APPS, some_apps);
+    ui::set_enabled(hwnd, ID_PICK_APP, some_apps);
 }
 
 /// 右側の欄を読み、検証する。誤りがあれば、直すべき欄の ID と理由を返す。
@@ -368,6 +358,19 @@ unsafe fn read_editor(hwnd: HWND) -> Result<HotkeyRuleSetting, (i32, String)> {
     Ok(setting)
 }
 
+/// 「選ぶ...」: 開いているアプリの一覧からプロセス名を選び、効くアプリの欄に足す。
+unsafe fn on_pick_app(hwnd: HWND) {
+    let Some(name) = process_picker::choose(hwnd) else {
+        return;
+    };
+    if !IsWindow(hwnd).as_bool() {
+        return;
+    }
+    let apps = remap_logic::add_app(&get_text(hwnd, ID_APPS), &name);
+    set_text(hwnd, ID_APPS, &remap_logic::apps_to_line(&apps));
+    ui::focus(hwnd, ID_APPS);
+}
+
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_COMMAND => {
@@ -383,6 +386,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 (ID_DOWN, BN_CLICKED) => on_move(hwnd, 1),
                 (ID_EXPORT, BN_CLICKED) => on_export(hwnd),
                 (ID_IMPORT, BN_CLICKED) => on_import(hwnd),
+                (ID_PICK_APP, BN_CLICKED) => on_pick_app(hwnd),
                 (ID_SAVE, BN_CLICKED) => on_save(hwnd),
                 (ID_CANCEL, BN_CLICKED) => on_close(hwnd),
                 _ => {}

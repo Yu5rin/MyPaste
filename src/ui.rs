@@ -227,6 +227,17 @@ pub unsafe fn init_common_controls() {
 /// 画面のウィンドウを作る（まだ表示しない。大きさと位置は DPI が分かってから
 /// [`place_window`] で決める）。
 pub unsafe fn create_top_window(class_name: PCWSTR, wnd_proc: WNDPROC, title: &str) -> Option<HWND> {
+    create_owned_window(class_name, wnd_proc, title, HWND::default())
+}
+
+/// [`create_top_window`] の、持ち主（`owner`）のある版。持ち主の手前に表示され、
+/// 持ち主を閉じると一緒に閉じる。
+pub unsafe fn create_owned_window(
+    class_name: PCWSTR,
+    wnd_proc: WNDPROC,
+    title: &str,
+    owner: HWND,
+) -> Option<HWND> {
     let instance = GetModuleHandleW(None).ok()?;
     let class = WNDCLASSW {
         lpfnWndProc: wnd_proc,
@@ -252,7 +263,7 @@ pub unsafe fn create_top_window(class_name: PCWSTR, wnd_proc: WNDPROC, title: &s
         work.top,
         100,
         100,
-        None,
+        owner,
         None,
         instance,
         None,
