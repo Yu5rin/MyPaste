@@ -212,24 +212,44 @@ fn add_mark(base: char, mark: u32) -> Option<char> {
 /// - `▲1,234` / `△1,234` → `-1,234`
 /// - `(1,234)` / `（1,234）` → `-1,234`（中身が数字だけのとき）
 fn negative_marks(text: &str) -> String {
-    let text = text.replace(['▲', '△'], "-");
     let chars: Vec<char> = text.chars().collect();
+    let is_digit = |c: char| c.is_ascii_digit() || ('０'..='９').contains(&c);
+    let is_word = |c: char| c.is_alphanumeric();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
-        if c == '(' || c == '（' {
+        // ▲・△ は、すぐあと（空白をはさんでも）に数字があるときだけ（見出しの記号などは残す）。
+        if c == '▲' || c == '△' {
+            let next = chars[i + 1..].iter().find(|c| !matches!(c, ' ' | '\u{3000}'));
+            if next.is_some_and(|&n| is_digit(n)) {
+                out.push('-');
+                i += 1;
+                continue;
+            }
+        }
+        // (123) は、前が文字や数字でなく（f(2) などを除く）、後ろが行末・タブ・空白のあとの
+        // 数字や行末・「円」のとき（「(1) 項目」のような箇条書きの番号を除く）。
+        if (c == '(' || c == '（') && !(i > 0 && is_word(chars[i - 1])) {
             let close = if c == '(' { ')' } else { '）' };
-            if let Some(len) = chars[i + 1..].iter().position(|&x| x == close) {
-                let inner: String = chars[i + 1..i + 1 + len].iter().collect();
-                let looks_numeric = !inner.is_empty()
-                    && inner.chars().any(|c| c.is_ascii_digit() || ('０'..='９').contains(&c))
-                    && inner
-                        .chars()
-                        .all(|c| c.is_ascii_digit() || ('０'..='９').contains(&c) || ",.，．".contains(c));
-                if looks_numeric {
+            // 閉じ括弧は近くだけを探す（長い文で何度も最後まで探さないように）。
+            let window = &chars[i + 1..chars.len().min(i + 1 + 32)];
+            if let Some(len) = window.iter().position(|&x| x == close) {
+                let inner = &chars[i + 1..i + 1 + len];
+                let looks_numeric = inner.iter().any(|&c| is_digit(c))
+                    && inner.iter().all(|&c| is_digit(c) || ",.，．".contains(c));
+                let after = &chars[i + 2 + len..];
+                let ends_cell = match after.first() {
+                    None | Some('\t' | '\r' | '\n' | '円') => true,
+                    Some(' ' | '\u{3000}') => {
+                        let rest = after.iter().find(|c| !matches!(c, ' ' | '\u{3000}'));
+                        rest.is_none_or(|&r| is_digit(r) || matches!(r, '\t' | '\r' | '\n' | '(' | '（' | '▲' | '△' | '-'))
+                    }
+                    _ => false,
+                };
+                if looks_numeric && ends_cell {
                     out.push('-');
-                    out.push_str(&inner);
+                    out.extend(inner);
                     i += len + 2;
                     continue;
                 }
@@ -297,6 +317,11 @@ mod tests {
         assert_eq!(run("(1,234) （５６）", "negative_marks"), "-1,234 -５６");
         // 数字でない括弧はそのまま
         assert_eq!(run("(注) (a1)", "negative_marks"), "(注) (a1)");
+        // 箇条書きの番号・関数の引数・数字の無い ▲ はそのまま
+        assert_eq!(run("(1) 項目", "negative_marks"), "(1) 項目");
+        assert_eq!(run("f(2)", "negative_marks"), "f(2)");
+        assert_eq!(run("▲ページ先頭", "negative_marks"), "▲ページ先頭");
+        assert_eq!(run("▲ 500\t(300)円", "negative_marks"), "- 500\t-300円");
     }
 
     #[test]

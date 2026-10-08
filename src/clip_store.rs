@@ -15,25 +15,24 @@ use windows::Win32::Security::Cryptography::{
 
 use crate::{clip_history, config};
 
-/// 保存しておいた履歴（新しい順）を読む。ファイルが無い・読めない・元に戻せないときは空。
-pub fn load() -> Vec<String> {
+/// 保存しておいた履歴（新しい順）を読む。ファイルが無いときや、別のユーザー・別の PC で
+/// 保存したもので元に戻せないときは空。ファイルがあるのに読めない（ほかのアプリが使っている など）
+/// ときは `Err`（呼び出し側は、その間は上書きしない）。
+pub fn load() -> Result<Vec<String>, String> {
     let Some(path) = config::clip_history_file() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let data = match std::fs::read(&path) {
         Ok(data) => data,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(e) => {
-            log::warn!("クリップボードの履歴を読めませんでした: {e}");
-            return Vec::new();
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
     };
     match unprotect(&data) {
-        Some(plain) => clip_history::from_json(&String::from_utf8_lossy(&plain)),
+        Some(plain) => Ok(clip_history::from_json(&String::from_utf8_lossy(&plain))),
         None => {
             // 別のユーザーや別の PC で保存したもの。読めないので使わない（次の保存で置き換わる）。
             log::warn!("クリップボードの履歴を元に戻せませんでした（別のユーザー・PC で保存したもの）");
-            Vec::new()
+            Ok(Vec::new())
         }
     }
 }

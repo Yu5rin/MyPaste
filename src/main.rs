@@ -251,47 +251,28 @@ fn main() {
                 // 念のため実際の状態を渡す。
                 let mut current = settings.clone();
                 current.ime_indicator.enabled = ime_indicator::is_enabled();
+                // 一覧の上で Shift+ホイールで変えた不透明度を出す（古い値で保存し直さないように）。
+                settings.clipboard_history.opacity = actions::history_opacity();
+                current.clipboard_history.opacity = settings.clipboard_history.opacity;
                 settings_window::open(tx.clone(), current, startup::is_enabled());
             }
             TrayMessage::SettingsSaved(saved) => {
-                // キー割り当ては設定画面では扱わない。設定画面を開いた後にキー割り当て画面で
-                // 保存していても戻らないよう、今の割り当てを残す。
-                let hotkeys = std::mem::take(&mut settings.hotkeys);
-                settings = *saved;
-                settings.hotkeys = hotkeys;
-                let hotkey = configure_remap(&settings);
-                configure_hotkeys(&settings);
-                let was_logging = logging::is_enabled();
-                logging::set_enabled(settings.log.enabled);
-                if logging::is_enabled() && !was_logging {
-                    // 記録を始めたので、調査に要る情報（版・設定）を最初に残す。
-                    log_startup(&settings);
-                }
-                ime_indicator::set_params(ime_indicator::Params::from_settings(
-                    &settings.ime_indicator,
-                ));
-                if ime_indicator.is_some() {
-                    ime_indicator::set_enabled(settings.ime_indicator.enabled);
-                }
-                if let Err(e) = tray.set_remap_hotkey(&hotkey, keyboard::is_enabled()) {
-                    log::warn!("メニュー更新失敗: {e}");
-                }
-                if let Err(e) = tray.set_ime_indicator_checked(
-                    ime_indicator.is_some() && ime_indicator::is_enabled(),
-                ) {
-                    log::warn!("メニュー更新失敗: {e}");
-                }
-                if let Err(e) = tray.set_startup_checked(startup::is_enabled()) {
-                    log::warn!("メニュー更新失敗: {e}");
-                }
-                log::info!("設定を反映しました（キー: {}）", hotkey.format());
+                // 設定画面で変えられる項目だけを入れ替える（キー割り当て・定型文や、画面を開いて
+                // いる間にトレイで切り替えたものを、画面を開いたときの古い値で戻さないように）。
+                let saved = *saved;
+                settings.remap = saved.remap;
+                settings.ime_indicator = saved.ime_indicator;
+                settings.log = saved.log;
+                settings.update.check_on_startup = saved.update.check_on_startup;
+                settings.clipboard_history = saved.clipboard_history;
+                apply_settings(&settings, &mut tray, ime_indicator.is_some());
             }
             TrayMessage::SettingsImported(imported) => {
-                actions::set_snippets(imported.snippets.clone());
-                // キー割り当ても読み込んだものにして、設定の保存と同じように反映する。
-                let hotkeys = imported.hotkeys.clone();
-                let _ = tx.send(TrayMessage::SettingsSaved(imported));
-                let _ = tx.send(TrayMessage::HotkeysSaved(hotkeys));
+                // 読み込んだ設定（キー割り当て・定型文を含む）を、まとめて一度に反映する
+                // （途中の状態で履歴の記録を止めて、保存した履歴を消してしまわないように）。
+                settings = *imported;
+                actions::set_snippets(settings.snippets.clone());
+                apply_settings(&settings, &mut tray, ime_indicator.is_some());
             }
             TrayMessage::ToggleHotkeys => {
                 let on = keyboard::toggle_rules();
@@ -301,14 +282,14 @@ fn main() {
                 log::info!("キー割り当て: {}", if on { "有効" } else { "無効" });
             }
             TrayMessage::OpenHotkeys => {
-                let (remap, _) = remap_logic::Hotkey::from_setting(&settings.remap.hotkey);
-                let remap_apps = remap_logic::effective_target_apps(&settings.remap.target_apps);
-                hotkey_window::open(tx.clone(), settings.hotkeys.clone(), (remap, remap_apps));
+                hotkey_window::open(tx.clone(), settings.hotkeys.clone());
             }
             TrayMessage::ShowList => actions::show_assignment_list(),
             TrayMessage::OpenSnippets => snippet_window::open(),
             TrayMessage::HotkeysSaved(hotkeys) => {
                 settings.hotkeys = hotkeys;
+                // 一覧の上で Shift+ホイールで変えた不透明度を、古い値で戻さない。
+                settings.clipboard_history.opacity = actions::history_opacity();
                 configure_hotkeys(&settings);
             }
             TrayMessage::CheckUpdate => {
@@ -367,6 +348,33 @@ fn log_startup(settings: &config::Settings) {
         if settings.ime_indicator.enabled { "ON" } else { "OFF" },
         if settings.update.check_on_startup { "ON" } else { "OFF" },
     );
+}
+
+/// 設定（設定画面で保存したもの・読み込んだもの）を、フック・入力モード表示・トレイメニューへ
+/// 反映する。
+fn apply_settings(settings: &config::Settings, tray: &mut tray::Menu, indicator_running: bool) {
+    let hotkey = configure_remap(settings);
+    configure_hotkeys(settings);
+    let was_logging = logging::is_enabled();
+    logging::set_enabled(settings.log.enabled);
+    if logging::is_enabled() && !was_logging {
+        // 記録を始めたので、調査に要る情報（版・設定）を最初に残す。
+        log_startup(settings);
+    }
+    ime_indicator::set_params(ime_indicator::Params::from_settings(&settings.ime_indicator));
+    if indicator_running {
+        ime_indicator::set_enabled(settings.ime_indicator.enabled);
+    }
+    if let Err(e) = tray.set_remap_hotkey(&hotkey, keyboard::is_enabled()) {
+        log::warn!("メニュー更新失敗: {e}");
+    }
+    if let Err(e) = tray.set_ime_indicator_checked(indicator_running && ime_indicator::is_enabled()) {
+        log::warn!("メニュー更新失敗: {e}");
+    }
+    if let Err(e) = tray.set_startup_checked(startup::is_enabled()) {
+        log::warn!("メニュー更新失敗: {e}");
+    }
+    log::info!("設定を反映しました（キー: {}）", hotkey.format());
 }
 
 /// キー割り当てとクリップボードの履歴の設定を読み取ってフックへ渡す。使えない割り当ては
@@ -469,13 +477,16 @@ fn wait_for_update_to_finish() {
     const MAX_WAIT: Duration = Duration::from_secs(60);
     const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-    if !update::is_running() {
+    update::begin_shutdown();
+    // 利用者の返事を待っている間（「今すぐ更新しますか？」など）は、ファイルを入れ替えて
+    // いないので待たずに終了する。
+    if !update::is_running() || update::is_waiting_for_user() {
         return;
     }
     log::info!("更新処理が実行中のため、完了を待ってから終了します");
 
     let start = Instant::now();
-    while update::is_running() && start.elapsed() < MAX_WAIT {
+    while update::is_running() && !update::is_waiting_for_user() && start.elapsed() < MAX_WAIT {
         thread::sleep(POLL_INTERVAL);
     }
 

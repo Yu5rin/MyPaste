@@ -438,13 +438,21 @@ pub struct DoubleTap {
 }
 
 impl DoubleTap {
+    /// 数え直す（マウスのボタンを押したときなど。Ctrl+クリックを 2 回押しと数えないように）。
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
     /// キーが押された・離された（`time` はミリ秒の時刻。Windows のキーボードフックの値）。
     /// 2 回押しが成立したら `true`。
     pub fn on_key(&mut self, key: Modifier, vk: u32, down: bool, time: u32, interval_ms: u32) -> bool {
         if !key.matches(vk) {
-            // ほかのキーが押されたら、組み合わせとみなして数え直す。
             if down {
-                *self = Self::default();
+                // ほかのキーが押されたら、組み合わせとみなして数え直す。
+                self.reset();
+            } else if self.down_at.is_some() {
+                // 押している間にほかのキーが離された（AltGr は Ctrl+Alt として届く など）。
+                self.clean = false;
             }
             return false;
         }
@@ -688,6 +696,23 @@ mod tests {
         assert!(!d.on_key(k, 0x11, false, 950, 400));
         d.on_key(k, 0x11, true, 1000, 400);
         assert!(d.on_key(k, 0x11, false, 1050, 400));
+        // AltGr（左 Ctrl と右 Alt が一緒に届く）を Alt の 2 回押しと数えない。
+        let alt = Modifier::Alt;
+        let mut d = DoubleTap::default();
+        for t in [0u32, 200] {
+            d.on_key(alt, 0xA2, true, t, 400);
+            d.on_key(alt, 0xA5, true, t + 1, 400);
+            d.on_key(alt, 0xA2, false, t + 30, 400);
+            assert!(!d.on_key(alt, 0xA5, false, t + 31, 400));
+        }
+        // マウスのボタンで数え直す（Ctrl+クリックを 2 回）。
+        let mut d = DoubleTap::default();
+        d.on_key(k, 0x11, true, 0, 400);
+        d.reset();
+        d.on_key(k, 0x11, false, 50, 400);
+        d.on_key(k, 0x11, true, 100, 400);
+        d.reset();
+        assert!(!d.on_key(k, 0x11, false, 150, 400));
         // 長押しは数えない。
         let mut d = DoubleTap::default();
         d.on_key(k, 0x11, true, 0, 400);

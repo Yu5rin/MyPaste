@@ -181,21 +181,36 @@ impl SingleWindow {
 
     /// 開いていれば閉じ（保存はしない。変更の有無も確かめない）、スレッドが終わるのを待つ。
     /// アプリの終了時に呼ぶ。
+    ///
+    /// 画面ができる前（作っている途中や、作れずにメッセージを出している間）だと閉じる宛先が
+    /// 無いので、少し待ちながら送り直す。それでも終わらなければ、待たずに戻る
+    /// （アプリの終了でスレッドも終わる）。
     pub fn close(&self) {
-        let window = self.window.load(Ordering::SeqCst);
-        if window != 0 {
-            unsafe {
-                let _ = PostMessageW(
-                    HWND(window as *mut core::ffi::c_void),
-                    WM_APP_FORCE_CLOSE,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
-            }
-        }
         let handle = self.thread.lock().unwrap_or_else(|p| p.into_inner()).take();
-        if let Some(handle) = handle {
+        let Some(handle) = handle else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut posted_to = 0isize;
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            let window = self.window.load(Ordering::SeqCst);
+            if window != 0 && window != posted_to {
+                unsafe {
+                    let _ = PostMessageW(
+                        HWND(window as *mut core::ffi::c_void),
+                        WM_APP_FORCE_CLOSE,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+                posted_to = window;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if handle.is_finished() {
             let _ = handle.join();
+        } else {
+            log::warn!("画面のスレッドが終わらないため、待たずに終了します");
         }
     }
 }

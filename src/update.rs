@@ -109,6 +109,22 @@ pub fn is_running() -> bool {
     UPDATE_RUNNING.load(Ordering::SeqCst)
 }
 
+/// 更新処理が、利用者の返事（メッセージボックス）を待っているか。この間はファイルを
+/// 入れ替えていないので、アプリを終了しても壊れない（終了するときに待たなくてよい）。
+static WAITING_FOR_USER: AtomicBool = AtomicBool::new(false);
+/// アプリが終了に向かっているか（終了の途中で「更新する」を押されても入れ替えない）。
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// 利用者の返事を待っているか。
+pub fn is_waiting_for_user() -> bool {
+    WAITING_FOR_USER.load(Ordering::SeqCst)
+}
+
+/// アプリの終了を始めたことを知らせる。
+pub fn begin_shutdown() {
+    SHUTTING_DOWN.store(true, Ordering::SeqCst);
+}
+
 /// GitHub Releases API のレスポンス（必要な項目のみ）。
 #[derive(Debug, Deserialize)]
 struct Release {
@@ -640,6 +656,10 @@ pub fn run(settings: Settings, tx: Sender<TrayMessage>, manual: bool) {
         log::info!("利用者が更新を見送りました");
         return;
     }
+    if SHUTTING_DOWN.load(Ordering::SeqCst) {
+        log::info!("アプリの終了中のため、更新しません");
+        return;
+    }
 
     // ダウンロードと検証。
     let downloaded = match download_and_verify(&info, &tx) {
@@ -736,7 +756,8 @@ pub(crate) fn message_box(text: &str, style: MESSAGEBOX_STYLE) -> i32 {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    unsafe {
+    let was_waiting = WAITING_FOR_USER.swap(true, Ordering::SeqCst);
+    let answer = unsafe {
         MessageBoxW(
             None,
             PCWSTR(text_w.as_ptr()),
@@ -744,7 +765,9 @@ pub(crate) fn message_box(text: &str, style: MESSAGEBOX_STYLE) -> i32 {
             style,
         )
         .0
-    }
+    };
+    WAITING_FOR_USER.store(was_waiting, Ordering::SeqCst);
+    answer
 }
 
 #[cfg(test)]

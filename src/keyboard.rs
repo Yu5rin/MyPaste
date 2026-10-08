@@ -27,7 +27,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
-    WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
+    WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
 };
 
 use crate::clip_history::{DoubleTap, Modifier};
@@ -113,6 +114,13 @@ pub fn mark_released_by_us(ctrl: bool, shift: bool, alt: bool, win: bool) {
         | (u32::from(win && (is_down(VK_LWIN) || is_down(VK_RWIN))) * MOD_WIN);
     if bits != 0 {
         RELEASED_BY_US.fetch_or(bits, Ordering::SeqCst);
+        // 印を付けている間に、利用者がもう離していた（フックが印を消したあとに付けてしまった）
+        // 修飾キーは、印を外す。
+        let released = (u32::from(!is_down(VK_CONTROL)) * MOD_CTRL)
+            | (u32::from(!is_down(VK_SHIFT)) * MOD_SHIFT)
+            | (u32::from(!is_down(VK_MENU)) * MOD_ALT)
+            | (u32::from(!is_down(VK_LWIN) && !is_down(VK_RWIN)) * MOD_WIN);
+        RELEASED_BY_US.fetch_and(!(bits & released), Ordering::SeqCst);
     }
 }
 
@@ -232,12 +240,41 @@ pub fn install() -> windows::core::Result<()> {
             0,
         )?;
         HOOK_HANDLE.store(hook.0 as isize, Ordering::SeqCst);
+        // マウスのボタンを押したことを知るためのフック（Ctrl+クリックを 2 回したのを、Ctrl の
+        // 2 回押しと数えないように）。設置できなくても、キーボードの動作には影響しない。
+        match SetWindowsHookExW(WH_MOUSE_LL, Some(low_level_mouse_proc), HINSTANCE(hmod.0), 0) {
+            Ok(mouse) => MOUSE_HOOK_HANDLE.store(mouse.0 as isize, Ordering::SeqCst),
+            Err(e) => log::warn!("マウスのフックを設置できませんでした: {e}"),
+        }
     }
     Ok(())
 }
 
+/// 設置済みのマウスのフック。0 は未設置。
+static MOUSE_HOOK_HANDLE: AtomicIsize = AtomicIsize::new(0);
+
+/// 低レベルマウスフックのコールバック。ボタンを押したら 2 回押しの数えを戻すだけで、
+/// マウスの動きには何もしない。
+unsafe extern "system" fn low_level_mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0
+        && matches!(
+            wparam.0 as u32,
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
+        )
+    {
+        DOUBLE_TAP.with(|d| d.borrow_mut().reset());
+    }
+    CallNextHookEx(None, code, wparam, lparam)
+}
+
 /// キーボードフックを解除する（リソースリーク防止のため終了時に必ず呼ぶ）。
 pub fn uninstall() {
+    let mouse = MOUSE_HOOK_HANDLE.swap(0, Ordering::SeqCst);
+    if mouse != 0 {
+        unsafe {
+            let _ = UnhookWindowsHookEx(HHOOK(mouse as *mut core::ffi::c_void));
+        }
+    }
     let raw = HOOK_HANDLE.swap(0, Ordering::SeqCst);
     if raw != 0 {
         unsafe {
@@ -280,8 +317,10 @@ unsafe extern "system" fn low_level_keyboard_proc(
         let is_self = kb.dwExtraInfo == sendinput::EXTRA_INFO_SIGNATURE;
 
         // 利用者が修飾キーを実際に離した・押し直したら、「アプリが離した」の印を消す
-        // （ここからは GetAsyncKeyState が正しい状態を表す）。
-        if !injected && !is_self {
+        // （ここからは GetAsyncKeyState が正しい状態を表す）。PowerToys や AutoHotkey で
+        // キーを入れ替えている人は、修飾キーが注入された入力として届くので、注入でも消す
+        // （このアプリ自身が送ったものだけは除く）。
+        if !is_self {
             let bit = modifier_bit(kb.vkCode);
             if bit != 0 {
                 RELEASED_BY_US.fetch_and(!bit, Ordering::SeqCst);

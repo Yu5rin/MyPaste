@@ -42,11 +42,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetMessageW, GetShellWindow, GetWindowLongPtrW,
     GetWindowThreadProcessId, KillTimer, MessageBoxW, PeekMessageW, PostMessageW,
     PostQuitMessage, PostThreadMessageW, RegisterClassW, SetForegroundWindow, SetTimer,
-    SetWindowPos, TranslateMessage, GA_ROOT, GWL_EXSTYLE, HWND_MESSAGE, HWND_NOTOPMOST,
-    HWND_TOPMOST, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MSG, PM_REMOVE,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-    WM_CLIPBOARDUPDATE, WM_DESTROYCLIPBOARD, WM_QUIT, WM_RENDERALLFORMATS, WM_RENDERFORMAT,
-    WM_TIMER, WNDCLASSW, WS_EX_TOPMOST,
+    SetWindowPos, TranslateMessage, GA_ROOT, GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOPMOST,
+    MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MSG, PM_NOREMOVE,
+    PM_QS_SENDMESSAGE, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNORMAL, WM_APP,
+    WM_CLIPBOARDUPDATE, WM_DESTROYCLIPBOARD, WM_ENDSESSION, WM_QUIT, WM_RENDERALLFORMATS,
+    WM_RENDERFORMAT, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::clip_history::{self, History, MenuPosition};
@@ -83,6 +83,15 @@ thread_local! {
     static HISTORY_LOADED: Cell<bool> = const { Cell::new(false) };
     /// 履歴が変わって、まだファイルに保存していないか。
     static HISTORY_DIRTY: Cell<bool> = const { Cell::new(false) };
+    /// 最初に履歴が変わった（まだ保存していない）時刻。続けてコピーしても、いつまでも保存が
+    /// 先延ばしにならないようにするため。
+    static HISTORY_DIRTY_SINCE: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// 前に当てた履歴の使い方（記録するか, 残すか）。保存した履歴を消すのは、利用者が
+    /// 記録・残すを ON から OFF にしたときだけにする（起動直後や、設定ファイルが読めず既定値で
+    /// 動いているときに消してしまわないように）。
+    static HISTORY_APPLIED: Cell<Option<(bool, bool)>> = const { Cell::new(None) };
+    /// 保存した履歴を読めなかった（ほかのアプリが使っていた など）。この間は上書きしない。
+    static HISTORY_STORE_UNREADABLE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// クリップボードの履歴の使い方（[`set_history_config`]）。
@@ -111,6 +120,11 @@ static HISTORY_CONFIG: Mutex<HistoryConfig> = Mutex::new(HistoryConfig {
     },
 });
 
+/// 今の一覧の不透明度（一覧の上で Shift+ホイールで変えたものを含む）。
+pub fn history_opacity() -> u32 {
+    history_config().view.opacity
+}
+
 fn history_config() -> HistoryConfig {
     *HISTORY_CONFIG.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -137,6 +151,8 @@ const WM_APP_CLEAR_HISTORY: u32 = WM_APP + 3;
 /// 履歴を保存するまでの待ち時間を計るタイマー（続けてコピーしたときに、何度も書かないように）。
 const TIMER_SAVE_HISTORY: usize = 1;
 const SAVE_HISTORY_DELAY_MS: u32 = 2000;
+/// 続けてコピーされても、最初の変更からこの時間がたったら保存する。
+const SAVE_HISTORY_MAX_DELAY: Duration = Duration::from_secs(15);
 
 /// 履歴の一覧を閉じてから、元のウィンドウに入力が戻るのを待つ時間。
 const MENU_REFOCUS_WAIT: Duration = Duration::from_millis(80);
@@ -221,10 +237,16 @@ pub fn dispatch(action: Action, held: Hotkey) {
     if window == 0 {
         return;
     }
-    QUEUE
+    if action == Action::ClipboardHistory && history_window::is_open() {
+        // 一覧を出しているときに、出す操作をもう一度したら閉じる（積んでおくと、閉じたあとで
+        // また出てしまう）。実行スレッドを起こすだけで、依頼は積まない。
+        history_window::request_close();
+    } else {
+        QUEUE
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .push_back(Request { action, held });
+    }
     unsafe {
         let _ = PostMessageW(
             HWND(window as *mut core::ffi::c_void),
@@ -267,22 +289,35 @@ unsafe fn apply_history_setting(window: HWND) {
         return;
     }
     let config = history_config();
+    let previous = HISTORY_APPLIED.with(|a| a.replace(Some((config.record, config.keep))));
     // 二重に登録しないよう、いったん外してから必要なら登録し直す。
     let _ = RemoveClipboardFormatListener(window);
     if !config.record {
-        // 記録をやめたら、覚えている履歴も保存した履歴も消す。
+        // 記録をやめたら、覚えている履歴を消す。保存した履歴は、利用者が記録を ON から OFF に
+        // したときだけ消す。
         HISTORY.with(|h| h.borrow_mut().clear());
         HISTORY_DIRTY.with(|d| d.set(false));
         HISTORY_LOADED.with(|l| l.set(false));
-        clip_store::delete();
+        if previous.is_some_and(|(record, _)| record) {
+            clip_store::delete();
+        }
         return;
     }
     if !HISTORY_LOADED.with(Cell::get) {
         HISTORY_LOADED.with(|l| l.set(true));
         if config.keep {
-            let saved = clip_store::load();
-            log::debug!("保存していたクリップボードの履歴を読みました（{} 件）", saved.len());
-            HISTORY.with(|h| *h.borrow_mut() = History::from_saved(saved, config.max_items));
+            match clip_store::load() {
+                Ok(saved) => {
+                    log::debug!("保存していたクリップボードの履歴を読みました（{} 件）", saved.len());
+                    HISTORY.with(|h| *h.borrow_mut() = History::from_saved(saved, config.max_items));
+                    HISTORY_STORE_UNREADABLE.with(|u| u.set(false));
+                }
+                Err(e) => {
+                    // 読めないまま保存すると、残していた履歴を空で上書きしてしまう。
+                    log::warn!("保存していたクリップボードの履歴を読めないため、この間は保存しません: {e}");
+                    HISTORY_STORE_UNREADABLE.with(|u| u.set(true));
+                }
+            }
         }
     }
     let before = HISTORY.with(|h| h.borrow().len());
@@ -317,6 +352,13 @@ unsafe fn mark_history_changed() {
         return;
     }
     HISTORY_DIRTY.with(|d| d.set(true));
+    let since = HISTORY_DIRTY_SINCE.with(|d| *d.get().get_or_insert_with(Instant::now));
+    HISTORY_DIRTY_SINCE.with(|d| d.set(Some(since)));
+    // 続けてコピーされても、最初の変更から一定の時間がたったら待たずに保存する。
+    if since.elapsed() >= SAVE_HISTORY_MAX_DELAY {
+        save_history_now();
+        return;
+    }
     let window = clip_window();
     if !window.is_invalid() {
         SetTimer(window, TIMER_SAVE_HISTORY, SAVE_HISTORY_DELAY_MS, None);
@@ -325,7 +367,11 @@ unsafe fn mark_history_changed() {
 
 /// まだ保存していない履歴があれば、今すぐ保存する。
 fn save_history_now() {
+    HISTORY_DIRTY_SINCE.with(|d| d.set(None));
     if !HISTORY_DIRTY.with(|d| d.replace(false)) || !history_config().keep {
+        return;
+    }
+    if HISTORY_STORE_UNREADABLE.with(Cell::get) {
         return;
     }
     let items: Vec<String> = HISTORY.with(|h| h.borrow().items().cloned().collect());
@@ -344,6 +390,10 @@ fn clear_all_history() {
 
 /// クリップボードが変わった。記録してよい文字なら履歴に加える。
 unsafe fn record_clipboard() {
+    // 記録をやめた直後に、すでに届いていた知らせは記録しない。
+    if !history_config().record {
+        return;
+    }
     // 貼り付けのために自分で一時的に置いたもの・元に戻したものは記録しない。
     let owner = GetClipboardOwner().ok();
     if owner.is_some() && owner == Some(clip_window()) {
@@ -555,7 +605,8 @@ unsafe fn paste_from_history(held: &Hotkey) {
         ime_indicator::notify("不可");
         return;
     };
-    if !target.is_invalid() {
+    // ほかのウィンドウをクリックして閉じたときは、そちらを使いたいので元のウィンドウに戻さない。
+    if !target.is_invalid() && !outcome.left_for_other_window {
         let _ = SetForegroundWindow(target);
     }
     if let Some(opacity) = outcome.opacity {
@@ -677,6 +728,13 @@ pub fn show_assignment_list() {
 /// 待っている間に利用者が別のものをコピーした場合は、それを消さないよう元に戻さない。
 unsafe fn paste_text(held: &Hotkey, text: &str) {
     let saved = save_clipboard();
+    if matches!(saved, Saved::Unavailable) {
+        // 元の内容を控えられないときは、クリップボードを使うと元に戻せず失われるので、
+        // 1 文字ずつ入力する。
+        log::debug!("キー割り当て: 元のクリップボードを控えられないため、1 文字ずつ入力します");
+        sendinput::send_text(held, text);
+        return;
+    }
     if let Err(e) = offer_text(text) {
         // クリップボードが使えないときは、1 文字ずつ入力する。
         log::warn!("キー割り当て: クリップボードを使えないため 1 文字ずつ入力します: {e}");
@@ -699,10 +757,8 @@ unsafe fn paste_text(held: &Hotkey, text: &str) {
                     log::warn!("キー割り当て: クリップボードを元に戻せませんでした: {e}");
                 }
             }
-            Saved::Unavailable => {
-                // 元の内容を控えられなかったので、空にして消してしまわないよう、そのままにする。
-                log::warn!("キー割り当て: 元のクリップボードを控えられなかったため、元に戻しません");
-            }
+            // 控えられなかったときは、ここまで来ない（クリップボードを使わずに入力する）。
+            Saved::Unavailable => {}
             Saved::Contents(None) => {
                 // もともと空（または控えられなかった）なら、空に戻す。
                 if open_clipboard() {
@@ -847,6 +903,13 @@ unsafe extern "system" fn clip_wnd_proc(
             record_clipboard();
             LRESULT(0)
         }
+        // Windows の終了・サインアウト。まだ保存していない履歴を保存する。
+        WM_ENDSESSION => {
+            if wparam.0 != 0 {
+                save_history_now();
+            }
+            LRESULT(0)
+        }
         // 別のものがコピーされた（または自分で空にした）。予約は無効になる。
         WM_DESTROYCLIPBOARD => {
             PENDING_TEXT.with(|p| p.borrow_mut().take());
@@ -869,16 +932,18 @@ unsafe fn create_clipboard_window() -> HWND {
         ..Default::default()
     };
     RegisterClassW(&class);
+    // メッセージ専用（HWND_MESSAGE）にはしない。Windows の終了・サインアウトの知らせ
+    // （WM_ENDSESSION）は、表示していない普通のウィンドウにも届くが、メッセージ専用には届かない。
     CreateWindowExW(
-        WINDOW_EX_STYLE::default(),
+        WS_EX_TOOLWINDOW,
         class_name,
         w!(""),
-        WINDOW_STYLE::default(),
+        WS_POPUP,
         0,
         0,
         0,
         0,
-        HWND_MESSAGE,
+        None,
         None,
         instance,
         None,
@@ -919,39 +984,43 @@ struct ClipboardSnapshot(Vec<(u32, Vec<u8>)>);
 
 /// メモリの中身として写し取れる形式か。画像（ビットマップ）やメタファイルなど、
 /// メモリ以外のもので渡される形式は写し取れないので除く（画像は CF_DIB として残る）。
+/// アプリ専用の形式（CF_PRIVATEFIRST〜LAST）も、中身の持ち方が決まっていないので除く。
 fn copyable_format(format: u32) -> bool {
-    !matches!(format, 2 | 3 | 9 | 14 | 0x80..=0x8E | 0x300..=0x3FF)
+    !matches!(format, 2 | 3 | 9 | 14 | 0x80..=0x8E | 0x200..=0x3FF)
 }
+
+/// 控える内容の大きさの上限（大きすぎるものは控えず、クリップボードを使わずに入力する）。
+const SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// 控えた結果。
 enum Saved {
     /// 控えられた（空だった場合は中身が空）。
     Contents(Option<ClipboardSnapshot>),
-    /// ほかのアプリが使っていて開けず、控えられなかった。
+    /// 控えられなかった（ほかのアプリが使っている、写し取れない形式しかない、大きすぎる）。
+    /// このときはクリップボードに触らない。
     Unavailable,
 }
 
-/// 今のクリップボードの内容を控える。
+/// 今のクリップボードの内容を控える（開くのは 1 回だけ。開いている間に中身が変わらないように）。
 unsafe fn save_clipboard() -> Saved {
     if !open_clipboard() {
         return Saved::Unavailable;
     }
-    let _ = CloseClipboard();
-    Saved::Contents(snapshot_clipboard())
-}
-
-/// 今のクリップボードの内容を控える。空なら `None`。
-unsafe fn snapshot_clipboard() -> Option<ClipboardSnapshot> {
-    if !open_clipboard() {
-        return None;
-    }
     let mut items = Vec::new();
+    let mut total = 0usize;
+    let mut any_format = false;
     let mut format = 0u32;
-    loop {
+    let result = loop {
         format = EnumClipboardFormats(format);
         if format == 0 {
-            break;
+            break if items.is_empty() && any_format {
+                // 形式はあるのに 1 つも写し取れなかった（メタファイルだけ など）。
+                Saved::Unavailable
+            } else {
+                Saved::Contents((!items.is_empty()).then_some(ClipboardSnapshot(items)))
+            };
         }
+        any_format = true;
         if !copyable_format(format) {
             continue;
         }
@@ -960,15 +1029,19 @@ unsafe fn snapshot_clipboard() -> Option<ClipboardSnapshot> {
         };
         let memory = HGLOBAL(handle.0);
         let size = GlobalSize(memory);
+        total = total.saturating_add(size);
+        if total > SNAPSHOT_MAX_BYTES {
+            break Saved::Unavailable;
+        }
         let ptr = GlobalLock(memory) as *const u8;
         if ptr.is_null() {
             continue;
         }
         items.push((format, std::slice::from_raw_parts(ptr, size).to_vec()));
         let _ = GlobalUnlock(memory);
-    }
+    };
     let _ = CloseClipboard();
-    (!items.is_empty()).then_some(ClipboardSnapshot(items))
+    result
 }
 
 /// 控えた内容をクリップボードに戻す。
@@ -1016,9 +1089,22 @@ unsafe fn open_clipboard_with_retries(retries: u32) -> bool {
         if OpenClipboard(clip_window()).is_ok() {
             return true;
         }
-        std::thread::sleep(CLIPBOARD_RETRY_WAIT);
+        wait_handling_sent_messages(CLIPBOARD_RETRY_WAIT);
     }
     false
+}
+
+/// 少し待つ。待っている間も、ほかのアプリから送られてきたメッセージ（貼り付け先からの
+/// 「文字を渡して」など）は処理する。処理しないと、相手がクリップボードを開いたまま
+/// こちらの返事を待ち続け、いつまでも開けなくなることがある。
+unsafe fn wait_handling_sent_messages(duration: Duration) {
+    let start = Instant::now();
+    let mut msg = MSG::default();
+    while start.elapsed() < duration {
+        // PM_QS_SENDMESSAGE: 送られてきたメッセージだけを処理し、ほかは取り出さない。
+        let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 /// クリップボードの文字を読む。文字が無ければ `None`。

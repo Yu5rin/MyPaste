@@ -707,12 +707,21 @@ unsafe fn on_save(hwnd: HWND) {
 
 /// 履歴の一覧を出すキーが、値貼り付けのキーやキー割り当てと重なっていれば、その説明を返す。
 fn history_conflict(form: &Form, hotkeys: &[config::HotkeyRuleSetting]) -> Option<String> {
-    let history = clip_history::Config::from_settings(&form.history);
+    history_conflict_with(form.hotkey, &form.history, hotkeys)
+}
+
+/// [`history_conflict`] の中身（値貼り付けのキー・履歴の設定・キー割り当てから調べる）。
+fn history_conflict_with(
+    remap: Hotkey,
+    history: &ClipboardHistorySettings,
+    hotkeys: &[config::HotkeyRuleSetting],
+) -> Option<String> {
+    let history = clip_history::Config::from_settings(history);
     if !history.enabled {
         return None;
     }
     let key = history.hotkey?;
-    if key == form.hotkey {
+    if key == remap {
         return Some(format!(
             "クリップボードの履歴を出すキー（{}）が、値貼り付けのキーと同じです。別のキーにしてください。",
             key.format()
@@ -775,13 +784,16 @@ unsafe fn on_import(hwnd: HWND) {
     let read = std::fs::metadata(&path)
         .map_err(|e| e.to_string())
         .and_then(|m| {
-            if m.len() > config::HOTKEYS_FILE_MAX_BYTES {
+            if m.len() > config::SETTINGS_FILE_MAX_BYTES {
                 Err("ファイルが大きすぎます".to_string())
             } else {
                 std::fs::read_to_string(&path).map_err(|e| e.to_string())
             }
         })
         .and_then(|text| config::parse_import(&text));
+    // 書かれていないキー割り当て・定型文は今のものを残し、更新の確認先は今のままにする。
+    let current = config::Settings::load();
+    let read = read.and_then(|imported| config::merge_import(imported, &current));
     let imported = match read {
         Ok(imported) => imported,
         Err(e) => {
@@ -796,10 +808,14 @@ unsafe fn on_import(hwnd: HWND) {
     if !ui::ask_yes_no(
         hwnd,
         &format!(
-            "今の設定とキー割り当て（{} 件）を、読み込んだもの（キー割り当て {} 件）に置き換えます。\n\
+            "今の設定を、読み込んだものに置き換えます。\n\n\
+             キー割り当て: 今 {} 件 → {} 件\n\
+             定型文: 今 {} 件 → {} 件\n\n\
              よろしいですか？",
-            config::Settings::load().hotkeys.len(),
-            imported.settings.hotkeys.len()
+            current.hotkeys.len(),
+            imported.settings.hotkeys.len(),
+            current.snippets.len(),
+            imported.settings.snippets.len()
         ),
     ) {
         return;
@@ -826,8 +842,17 @@ unsafe fn on_import(hwnd: HWND) {
     let Some(tx) = CONTEXT.with(|c| c.borrow().as_ref().map(|context| context.tx.clone())) else {
         return;
     };
-    let _ = tx.send(TrayMessage::SettingsImported(Box::new(imported.settings)));
+    let _ = tx.send(TrayMessage::SettingsImported(Box::new(imported.settings.clone())));
     let mut message = "設定を読み込み、使い始めました。".to_string();
+    // 読み込んだキーどうしが重なっていれば知らせる（使えない割り当てがあることになるため）。
+    let settings = &imported.settings;
+    let (remap, _) = Hotkey::from_setting(&settings.remap.hotkey);
+    let apps = remap_logic::effective_target_apps(&settings.remap.target_apps);
+    let conflict = hotkey_rules::find_conflict(&settings.hotkeys, (remap, &apps))
+        .or_else(|| history_conflict_with(remap, &settings.clipboard_history, &settings.hotkeys));
+    if let Some(conflict) = conflict {
+        message.push_str(&format!("\n\n注意: {conflict}"));
+    }
     if let Some(e) = startup_error {
         message.push_str(&format!("\n\nただし、自動起動の設定を変えられませんでした: {e}"));
     }

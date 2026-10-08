@@ -122,8 +122,9 @@ fn parse_csv(text: &str) -> Result<Vec<Vec<String>>, String> {
         match c {
             '"' if field.is_empty() => quoted = true,
             ',' => row.push(std::mem::take(&mut field)),
-            '\r' => {}
-            '\n' => {
+            // \r\n は 1 つの改行。\r だけ（古い Mac の改行）も改行として扱う。
+            '\r' if chars.peek() == Some(&'\n') => {}
+            '\r' | '\n' => {
                 row.push(std::mem::take(&mut field));
                 rows.push(std::mem::take(&mut row));
             }
@@ -185,6 +186,8 @@ mod tests {
         let list = from_csv("本文だけ\n\n名前,本文2,余分\n,\n").unwrap();
         assert_eq!(list, vec![s("", "本文だけ"), s("名前", "本文2")]);
         assert!(from_csv("\"閉じていない").is_err());
+        // \r だけの改行も行の区切りとして読む。
+        assert_eq!(from_csv("a,b\rc,d").unwrap(), vec![s("a", "b"), s("c", "d")]);
         assert!(from_csv("").unwrap().is_empty());
         let many: String = (0..=MAX_SNIPPETS).map(|i| format!("{i}\n")).collect();
         assert!(from_csv(&many).is_err());

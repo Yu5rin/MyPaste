@@ -15,7 +15,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HFONT};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DestroyWindow, MessageBoxW, PostQuitMessage, SetForegroundWindow, ShowWindow,
+    DefWindowProcW, DestroyWindow, IsWindow, MessageBoxW, PostQuitMessage, SetForegroundWindow, ShowWindow,
     IDCANCEL, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING,
     MB_YESNOCANCEL, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
 };
@@ -72,6 +72,10 @@ struct Context {
     font: HFONT,
     /// 保存していない変更があるか。
     dirty: bool,
+    /// 開いたときの定型文（保存するときに、ほかの場所で足されていないかを確かめる）。
+    loaded: Vec<Snippet>,
+    /// 右側に出している定型文の位置（`None` は新しく書くとき）。
+    shown: Option<usize>,
 }
 
 thread_local! {
@@ -105,6 +109,8 @@ unsafe fn thread_main(list: Vec<Snippet>) {
     let first = list.first().cloned();
     CONTEXT.with(|c| {
         *c.borrow_mut() = Some(Context {
+            loaded: list.clone(),
+            shown: (!list.is_empty()).then_some(0),
             list,
             font,
             dirty: false,
@@ -206,11 +212,46 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 
 /// 一覧で選んだ定型文を右側に出す。
 unsafe fn on_select(hwnd: HWND) {
-    let Some(index) = ui::list_index(hwnd, ID_LIST) else {
+    let shown = CONTEXT.with(|c| c.borrow().as_ref().and_then(|ctx| ctx.shown));
+    if ui::list_index(hwnd, ID_LIST) != shown
+        && editor_differs(hwnd)
+        && !ui::ask_yes_no(
+            hwnd,
+            "右側で変更した内容が、まだ一覧に反映されていません。\n\
+             変更を捨てて、選んだ定型文を表示しますか？",
+        )
+    {
+        refresh_list(hwnd, shown);
         return;
-    };
-    let snippet = list_snapshot().get(index).cloned();
+    }
+    show_selected(hwnd);
+}
+
+/// 一覧で選んでいる定型文を右側に出す（確かめずに）。
+unsafe fn show_selected(hwnd: HWND) {
+    let index = ui::list_index(hwnd, ID_LIST);
+    let snippet = CONTEXT.with(|c| {
+        let mut c = c.borrow_mut();
+        let ctx = c.as_mut()?;
+        ctx.shown = index;
+        index.and_then(|i| ctx.list.get(i).cloned())
+    });
     load_editor(hwnd, snippet.as_ref());
+}
+
+/// 右側が、出している定型文（新しく書くときは空）から変えられているか。
+unsafe fn editor_differs(hwnd: HWND) -> bool {
+    let shown = CONTEXT.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|ctx| ctx.shown.and_then(|i| ctx.list.get(i).cloned()))
+    });
+    let name = get_text(hwnd, ID_NAME);
+    let text = get_text(hwnd, ID_TEXT).replace("\r\n", "\n");
+    match shown {
+        Some(s) => s.name != name.trim() || s.text != text,
+        None => !name.trim().is_empty() || !text.trim().is_empty(),
+    }
 }
 
 /// 右側の内容を、新しい定型文として一覧の最後に足す。
@@ -232,6 +273,7 @@ unsafe fn on_add(hwnd: HWND) {
         let ctx = c.as_mut()?;
         ctx.list.push(snippet);
         ctx.dirty = true;
+        ctx.shown = Some(ctx.list.len() - 1);
         Some(ctx.list.len() - 1)
     });
     refresh_list(hwnd, index);
@@ -256,6 +298,7 @@ unsafe fn on_update(hwnd: HWND) {
             if let Some(slot) = ctx.list.get_mut(index) {
                 *slot = snippet;
                 ctx.dirty = true;
+                ctx.shown = Some(index);
             }
         }
     });
@@ -278,8 +321,7 @@ unsafe fn on_delete(hwnd: HWND) {
         (!ctx.list.is_empty()).then(|| index.min(ctx.list.len() - 1))
     });
     refresh_list(hwnd, next);
-    let snippet = next.and_then(|i| list_snapshot().get(i).cloned());
-    load_editor(hwnd, snippet.as_ref());
+    show_selected(hwnd);
 }
 
 /// 一覧で選んでいる定型文を上下に動かす。
@@ -293,6 +335,15 @@ unsafe fn on_move(hwnd: HWND, delta: isize) {
         let to = index.checked_add_signed(delta).filter(|to| *to < ctx.list.len())?;
         ctx.list.swap(index, to);
         ctx.dirty = true;
+        ctx.shown = ctx.shown.map(|s| {
+            if s == index {
+                to
+            } else if s == to {
+                index
+            } else {
+                s
+            }
+        });
         Some(to)
     });
     if let Some(to) = moved {
@@ -374,7 +425,7 @@ unsafe fn on_import(hwnd: HWND) {
     match result {
         Some(Ok(first)) => {
             refresh_list(hwnd, Some(first));
-            on_select(hwnd);
+            show_selected(hwnd);
             log::info!("定型文を CSV から読み込みました（{count} 件）");
             show_message(
                 hwnd,
@@ -432,6 +483,49 @@ unsafe fn on_save(hwnd: HWND) {
                 on_update(hwnd);
             }
         }
+    } else if editor_differs(hwnd)
+        && ui::ask_yes_no(
+            hwnd,
+            "右側に書いた定型文が、まだ一覧に追加されていません。\n\
+             新しい定型文として追加してから保存しますか？\n\n\
+             「いいえ」を選ぶと、右側の内容は保存しません。",
+        )
+    {
+        on_add(hwnd);
+    }
+    // 確かめている間に、アプリの終了で画面が閉じられていたら、保存しない。
+    if !IsWindow(hwnd).as_bool() {
+        return;
+    }
+    // 開いている間に、ほかの場所（履歴の一覧の「定型文に登録」など）で足された定型文があれば、
+    // 消してしまわないよう、残すかを尋ねる。
+    let loaded = CONTEXT.with(|c| c.borrow().as_ref().map(|ctx| ctx.loaded.clone()).unwrap_or_default());
+    let current = list_snapshot();
+    let added: Vec<Snippet> = config::Settings::load()
+        .snippets
+        .into_iter()
+        .filter(|s| !loaded.contains(s) && !current.contains(s))
+        .collect();
+    if !added.is_empty()
+        && ui::ask_yes_no(
+            hwnd,
+            &format!(
+                "この画面を開いたあとで、ほかの場所で定型文が {} 件足されています\n\
+                 （履歴の一覧の「定型文に登録」など）。一覧の最後に残して保存しますか？\n\n\
+                 「いいえ」を選ぶと、その定型文は消えます。",
+                added.len()
+            ),
+        )
+    {
+        CONTEXT.with(|c| {
+            if let Some(ctx) = c.borrow_mut().as_mut() {
+                ctx.list.extend(added);
+                ctx.list.truncate(snippets::MAX_SNIPPETS);
+            }
+        });
+    }
+    if !IsWindow(hwnd).as_bool() {
+        return;
     }
     let list = list_snapshot();
     if let Err(e) = config::save_snippets(&list) {
@@ -451,7 +545,8 @@ unsafe fn on_save(hwnd: HWND) {
 
 /// 「キャンセル」・閉じるボタン: 保存していない変更があれば確かめてから閉じる。
 unsafe fn on_close(hwnd: HWND) {
-    let dirty = CONTEXT.with(|c| c.borrow().as_ref().is_some_and(|ctx| ctx.dirty));
+    let dirty =
+        CONTEXT.with(|c| c.borrow().as_ref().is_some_and(|ctx| ctx.dirty)) || editor_differs(hwnd);
     if dirty && !ui::ask_yes_no(hwnd, "保存していない変更があります。保存せずに閉じますか？") {
         return;
     }

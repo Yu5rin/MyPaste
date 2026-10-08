@@ -19,6 +19,7 @@
 //! Linux でもテストできる。
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use windows::core::{w, HSTRING, PCWSTR};
@@ -30,13 +31,14 @@ use windows::Win32::Graphics::Gdi::{
     COLOR_BTNSHADOW, COLOR_BTNTEXT, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT,
     COLOR_INFOBK, COLOR_INFOTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, DRAW_TEXT_FORMAT, DT_CALCRECT,
     DT_CENTER, DT_END_ELLIPSIS, DT_EXPANDTABS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE,
-    DT_VCENTER, DT_WORDBREAK, HBRUSH, HDC, HFONT, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    DT_EDITCONTROL, DT_VCENTER, DT_WORDBREAK, HBRUSH, HDC, HFONT, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::Input::Ime::ImmAssociateContextEx;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, VK_APPS, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F10, VK_HOME,
     VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
@@ -44,7 +46,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetClientRect, GetCursorPos, GetDlgItem, GetForegroundWindow,
-    GetGUIThreadInfo, GetMessageW, GetWindowRect, GetWindowThreadProcessId, IsChild,
+    GetGUIThreadInfo, GetMessageW, GetWindowRect, GetWindowThreadProcessId, IsChild, LoadCursorW,
+    IDC_ARROW, WM_RBUTTONDOWN,
     PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow, SetLayeredWindowAttributes,
     SetWindowPos, ShowWindow, TrackPopupMenuEx, TranslateMessage, GUITHREADINFO, HMENU,
     HWND_TOPMOST, LB_GETITEMRECT, LB_ITEMFROMPOINT, LB_SETCOUNT, LB_SETCURSEL, LB_SETITEMHEIGHT,
@@ -136,6 +139,24 @@ pub struct Outcome {
     pub edit_snippets: bool,
     /// Shift+ホイールで変えた不透明度（変えなければ `None`）。
     pub opacity: Option<u32>,
+    /// ほかのウィンドウをクリックして閉じた（このときは元のウィンドウに戻さない）。
+    pub left_for_other_window: bool,
+}
+
+/// 一覧を出しているか。
+static OPEN: AtomicBool = AtomicBool::new(false);
+/// 閉じるよう頼まれたか（一覧を出す操作をもう一度したとき）。
+static CLOSE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// 一覧を出しているか（キーボードフックから呼ぶ）。
+pub fn is_open() -> bool {
+    OPEN.load(Ordering::SeqCst)
+}
+
+/// 出している一覧を閉じるよう頼む（一覧を出す操作をもう一度したとき。Clibor と同じく、
+/// 出すキーで閉じられる）。実行スレッドを起こすのは呼び出し側。
+pub fn request_close() {
+    CLOSE_REQUESTED.store(true, Ordering::SeqCst);
 }
 
 /// タブ。
@@ -174,6 +195,12 @@ struct State {
     /// 全文の吹き出しと、そこに出している文。
     tip: HWND,
     tip_text: String,
+    /// 最後に見たマウスの位置（動いていないのに届く WM_MOUSEMOVE で選び直さないため）。
+    last_mouse: Option<(i32, i32)>,
+    /// 一覧の上でマウスのボタンを押したか（押したまま一覧に来て離しても貼り付けないため）。
+    pressed_on_list: bool,
+    /// ホイールの回した量の端数（細かく届くタッチパッドで、1 回に何ページも移らないため）。
+    wheel: i32,
     outcome: Outcome,
     done: bool,
 }
@@ -246,6 +273,16 @@ pub unsafe fn choose(
         dpi = 96;
     }
 
+    // 画面の高さに収まる件数にする（低い画面で、下の行がはみ出さないように）。
+    let work = work_area(monitor);
+    let fit = ((work.bottom - work.top - ui::scale(HEADER_H, dpi) - BORDER * 2)
+        / ui::scale(ROW_H, dpi).max(1))
+    .max(1) as usize;
+    let view = View {
+        page_size: view.page_size.clamp(1, fit),
+        ..view
+    };
+
     let hwnd = create_window()?;
     let tip = create_tip_window(hwnd);
     let font = ui::create_ui_font(dpi);
@@ -275,6 +312,9 @@ pub unsafe fn choose(
             tab_rects: [RECT::default(); 2],
             tip,
             tip_text: String::new(),
+            last_mouse: None,
+            pressed_on_list: false,
+            wheel: 0,
             outcome: Outcome::default(),
             done: false,
         })
@@ -284,8 +324,10 @@ pub unsafe fn choose(
     ui::create_controls(hwnd, ITEMS, font);
     let (width, height) = layout(hwnd, view, dpi);
 
+    // 一覧では日本語入力を使わない（文字を打つと変換が始まり、Esc や Enter が効かなくなるため）。
+    let _ = ImmAssociateContextEx(control(hwnd, ID_LIST), None, 0);
+
     // 置く場所: 基準の位置の下（入らなければ上）。モニターの作業領域に収める。
-    let work = work_area(monitor);
     let mut x = anchor.x;
     let mut y = anchor.y + ui::scale(4, dpi);
     if y + height > work.bottom {
@@ -303,7 +345,10 @@ pub unsafe fn choose(
     let _ = SetFocus(control(hwnd, ID_LIST));
     show_page(hwnd);
 
+    CLOSE_REQUESTED.store(false, Ordering::SeqCst);
+    OPEN.store(true, Ordering::SeqCst);
     run_loop(hwnd);
+    OPEN.store(false, Ordering::SeqCst);
     let outcome = with_state(|st| std::mem::take(&mut st.outcome));
     close(hwnd);
     outcome
@@ -378,6 +423,9 @@ unsafe fn run_loop(hwnd: HWND) {
     let mut msg = MSG::default();
     while !is_done() {
         let ret = GetMessageW(&mut msg, None, 0, 0);
+        if CLOSE_REQUESTED.swap(false, Ordering::SeqCst) {
+            finish(None);
+        }
         if ret.0 <= 0 {
             // アプリの終了。元のループにも知らせる。
             PostQuitMessage(msg.wParam.0 as i32);
@@ -392,21 +440,45 @@ unsafe fn run_loop(hwnd: HWND) {
             continue;
         }
         if ours && msg.message == WM_MOUSEWHEEL {
-            let delta = ((msg.wParam.0 >> 16) & 0xFFFF) as u16 as i16;
-            if msg.wParam.0 & MK_SHIFT != 0 {
-                // Shift+ホイールで不透明度を変える（奥に回すと濃く）。
-                change_opacity(hwnd, delta > 0);
-            } else {
-                // ホイールはページを移る（手前に回すと次のページ）。
-                turn_page(hwnd, if delta < 0 { 1 } else { -1 });
+            let delta = i32::from(((msg.wParam.0 >> 16) & 0xFFFF) as u16 as i16);
+            // 回した量を貯めて、1 目盛り（WHEEL_DELTA = 120）ごとに 1 回動かす。
+            let steps = with_state(|st| {
+                st.wheel += delta;
+                let steps = st.wheel / 120;
+                st.wheel -= steps * 120;
+                steps
+            })
+            .unwrap_or(0);
+            for _ in 0..steps.unsigned_abs() {
+                if msg.wParam.0 & MK_SHIFT != 0 {
+                    // Shift+ホイールで不透明度を変える（奥に回すと濃く）。
+                    change_opacity(hwnd, steps > 0);
+                } else {
+                    // ホイールはページを移る（手前に回すと次のページ）。
+                    turn_page(hwnd, if steps < 0 { 1 } else { -1 });
+                }
             }
             continue;
         }
         if msg.hwnd == list && msg.message == WM_MOUSEMOVE {
-            // マウスを乗せた行を選ぶ。
-            if let Some(row) = row_at(list, msg.lParam) {
-                let page_start = with_state(|st| st.page() * st.page_size).unwrap_or(0);
-                select(hwnd, page_start + row);
+            // マウスを乗せた行を選ぶ。マウスが動いていないのに届いたもの（画面や吹き出しを
+            // 出し直したときに Windows が送る）では選び直さない（キーで選んだ行を保つ）。
+            let moved = with_state(|st| {
+                let point = (msg.pt.x, msg.pt.y);
+                let moved = st.last_mouse.is_some_and(|last| last != point);
+                st.last_mouse = Some(point);
+                moved
+            })
+            .unwrap_or(false);
+            if moved {
+                select_row_at(hwnd, list, msg.lParam);
+            }
+        }
+        if msg.hwnd == list && (msg.message == WM_LBUTTONDOWN || msg.message == WM_RBUTTONDOWN) {
+            // 押した行を選ぶ（キーで選んだあと、マウスを動かさずに押したときも、押した行にする）。
+            select_row_at(hwnd, list, msg.lParam);
+            if msg.message == WM_LBUTTONDOWN {
+                with_state(|st| st.pressed_on_list = true);
             }
         }
         if ours && msg.message == WM_RBUTTONUP {
@@ -417,9 +489,21 @@ unsafe fn run_loop(hwnd: HWND) {
         }
         let _ = TranslateMessage(&msg);
         DispatchMessageW(&msg);
-        if msg.hwnd == list && msg.message == WM_LBUTTONUP && row_at(list, msg.lParam).is_some() {
-            choose_current();
+        if msg.message == WM_LBUTTONUP {
+            let pressed = with_state(|st| std::mem::take(&mut st.pressed_on_list)).unwrap_or(false);
+            if pressed && msg.hwnd == list && row_at(list, msg.lParam).is_some() {
+                select_row_at(hwnd, list, msg.lParam);
+                choose_current();
+            }
         }
+    }
+}
+
+/// マウスの位置（一覧の中の座標）にある行を選ぶ。
+unsafe fn select_row_at(hwnd: HWND, list: HWND, lparam: LPARAM) {
+    if let Some(row) = row_at(list, lparam) {
+        let page_start = with_state(|st| st.page() * st.page_size).unwrap_or(0);
+        select(hwnd, page_start + row);
     }
 }
 
@@ -893,15 +977,16 @@ unsafe fn update_tip(hwnd: HWND) {
     let hdc = GetDC(tip);
     let old = SelectObject(hdc, font);
     let mut units: Vec<u16> = text.encode_utf16().collect();
+    // DT_EDITCONTROL: 空白の無い長い行（URL など）も、幅で折り返す。
     DrawTextW(
         hdc,
         &mut units,
         &mut calc,
-        DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | DT_EXPANDTABS,
+        DT_CALCRECT | DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX | DT_EXPANDTABS,
     );
     SelectObject(hdc, old);
     ReleaseDC(tip, hdc);
-    let width = (calc.right - calc.left) + pad * 2 + 2;
+    let width = ((calc.right - calc.left) + pad * 2 + 2).min(ui::scale(TIP_MAX_W, dpi));
     let height = ((calc.bottom - calc.top) + pad * 2 + 2).min(ui::scale(TIP_MAX_H, dpi));
 
     // 置く場所: 画面の右（入らなければ左）、選んでいる行の高さ。
@@ -919,11 +1004,12 @@ unsafe fn update_tip(hwnd: HWND) {
         x = window.left - gap - width;
     }
     let y = top_left.y.clamp(work.top, (work.bottom - height).max(work.top));
+    let x = x.clamp(work.left, (work.right - width).max(work.left));
     with_state(|st| st.tip_text = text);
     let _ = SetWindowPos(
         tip,
         HWND_TOPMOST,
-        x.max(work.left),
+        x,
         y,
         width,
         height,
@@ -954,6 +1040,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         // ほかのウィンドウに移ったら（ほかの場所をクリックしたら）、何もせずに閉じる。
         WM_ACTIVATE if wparam.0 & 0xFFFF == 0 => {
             if !is_done() {
+                with_state(|st| st.outcome.left_for_other_window = true);
                 finish(None);
             }
             LRESULT(0)
@@ -1021,7 +1108,7 @@ unsafe extern "system" fn tip_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     hdc,
                     &mut units,
                     &mut inner,
-                    DT_WORDBREAK | DT_NOPREFIX | DT_EXPANDTABS | DT_END_ELLIPSIS,
+                    DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX | DT_EXPANDTABS | DT_END_ELLIPSIS,
                 );
                 SelectObject(hdc, old);
             } else {
@@ -1043,6 +1130,7 @@ unsafe fn create_window() -> Option<HWND> {
         lpfnWndProc: Some(wnd_proc),
         hInstance: instance.into(),
         lpszClassName: class_name,
+        hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
         ..Default::default()
     };
     // 2 回目以降は登録済みで失敗するが、そのまま使える。
@@ -1074,6 +1162,7 @@ unsafe fn create_header(parent: HWND) {
         lpfnWndProc: Some(header_proc),
         hInstance: instance.into(),
         lpszClassName: class_name,
+        hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
         ..Default::default()
     };
     RegisterClassW(&class);
@@ -1103,6 +1192,7 @@ unsafe fn create_tip_window(owner: HWND) -> HWND {
         lpfnWndProc: Some(tip_proc),
         hInstance: instance.into(),
         lpszClassName: class_name,
+        hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
         ..Default::default()
     };
     RegisterClassW(&class);

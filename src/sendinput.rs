@@ -93,10 +93,12 @@ pub fn send_key_sequence(held: &Hotkey, keys: &[Hotkey]) {
 pub fn send_text(held: &Hotkey, text: &str) {
     let mut inputs = release_inputs(held);
     let mut buf = [0u16; 2];
-    for c in text.chars() {
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
-            '\r' => {}
-            '\n' => {
+            // \r\n は 1 回の Enter。\r だけ（古い Mac の改行）も Enter にする。
+            '\r' if chars.peek() == Some(&'\n') => {}
+            '\r' | '\n' => {
                 inputs.push(key(VK_RETURN.0, false));
                 inputs.push(key(VK_RETURN.0, true));
             }

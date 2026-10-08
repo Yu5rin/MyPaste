@@ -13,9 +13,14 @@
 //! **どこへ通信するのかを利用者が確認できるようにする**ためである。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+/// settings.json を書き換えている間持つ鍵（[`save_patch`] と [`replace_settings`]）。
+static SETTINGS_LOCK: Mutex<()> = Mutex::new(());
 
 /// 設定ファイル名。
 const SETTINGS_FILE: &str = "settings.json";
@@ -406,8 +411,42 @@ pub fn parse_import(text: &str) -> Result<Imported, String> {
     })
 }
 
+/// 読み込んだ設定を、今の設定と合わせて仕上げる（[`Imported::root`] と `settings` を直す）。
+///
+/// - 読み込んだファイルにキー割り当て・定型文が書かれていなければ、今のものを残す
+///   （前の版で書き出したファイルや、一部だけを書いたファイルで消えてしまわないように）。
+/// - 更新の確認先（`update` の URL・ファイル名）は、読み込んだファイルの値を使わず今の値を残す
+///   （他人から受け取ったファイルで、別の配布元から更新させられないように）。
+pub fn merge_import(mut imported: Imported, current: &Settings) -> Result<Imported, String> {
+    let object = imported
+        .root
+        .as_object_mut()
+        .ok_or("設定の形が想定と違います")?;
+    if !object.contains_key("hotkeys") {
+        object.insert("hotkeys".into(), serde_json::to_value(&current.hotkeys).map_err(|e| e.to_string())?);
+    }
+    if !object.contains_key("snippets") {
+        object.insert("snippets".into(), serde_json::to_value(&current.snippets).map_err(|e| e.to_string())?);
+    }
+    let update = object
+        .entry("update")
+        .or_insert_with(|| serde_json::json!({}));
+    if !update.is_object() {
+        *update = serde_json::json!({});
+    }
+    if let Some(update) = update.as_object_mut() {
+        update.insert("api_url".into(), current.update.api_url.clone().into());
+        update.insert("releases_page".into(), current.update.releases_page.clone().into());
+        update.insert("asset_name".into(), current.update.asset_name.clone().into());
+    }
+    imported.settings = serde_json::from_value(imported.root.clone())
+        .map_err(|e| format!("設定の形が想定と違います（{e}）"))?;
+    Ok(imported)
+}
+
 /// 読み込んだ設定で `settings.json` を置き換える。
 pub fn replace_settings(root: &serde_json::Value) -> Result<(), String> {
+    let _lock = SETTINGS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let path = settings_path().ok_or("設定ファイルの場所を決められません")?;
     let text = serde_json::to_string_pretty(root).map_err(|e| e.to_string())?;
     write_replacing(&path, text.as_bytes())
@@ -423,6 +462,9 @@ pub fn clip_history_file() -> Option<PathBuf> {
 pub fn write_file_safely(path: &Path, data: &[u8]) -> std::io::Result<()> {
     write_replacing(path, data)
 }
+
+/// 設定全体の読み込みで扱うファイルの大きさの上限（定型文が多くても読めるよう、キー割り当てより大きい）。
+pub const SETTINGS_FILE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
 /// 書き出し・読み込みで扱うファイルの大きさの上限（誤って大きなファイルを選んだときに備える）。
 pub const HOTKEYS_FILE_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -456,6 +498,9 @@ pub fn hotkeys_from_json(text: &str) -> Result<Vec<HotkeyRuleSetting>, String> {
 /// ファイルが読めない・JSON として解釈できない場合は、利用者の編集内容を
 /// 壊さないよう**書き込まずに** `Err` を返す。
 fn save_patch(patch: &serde_json::Value) -> Result<(), String> {
+    // 複数の画面・スレッドから書くので、読んでから書き終えるまでを 1 つずつにする
+    // （同時に書くと、片方の変更が失われることがある）。
+    let _lock = SETTINGS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let path = settings_path().ok_or("設定ファイルの場所を決められません")?;
     let mut root: serde_json::Value = match std::fs::read_to_string(&path) {
         Ok(text) => serde_json::from_str(strip_bom(&text)).map_err(|e| {
@@ -482,8 +527,14 @@ fn save_patch(patch: &serde_json::Value) -> Result<(), String> {
 /// ファイルを書き換える。いったん隣の一時ファイルに書いてから置き換えるので、書き込みの
 /// 途中で電源が切れたりしても、元のファイルが壊れた中途半端な状態で残らない。
 fn write_replacing(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    // 一時ファイルの名前は書くたびに変える（同時に書いても、互いの一時ファイルを壊さない）。
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
     let mut temp = path.as_os_str().to_owned();
-    temp.push(".tmp");
+    temp.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     let temp = PathBuf::from(temp);
     std::fs::write(&temp, data)?;
     // Windows でも、既にあるファイルを置き換えられる（MoveFileExW の置き換え指定）。
@@ -587,6 +638,13 @@ fn state_path() -> Option<PathBuf> {
 /// `Program Files` 配下など書き込めない場所に置かれている場合は、
 /// `%LOCALAPPDATA%\Atai-paste` にフォールバックする。
 fn data_dir() -> Option<PathBuf> {
+    // 書き込めるかを確かめるためにファイルを作って消すので、決めるのは 1 回だけにする
+    // （複数のスレッドが同時に確かめると、片方が「書き込めない」と誤ることがある）。
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(find_data_dir).clone()
+}
+
+fn find_data_dir() -> Option<PathBuf> {
     let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
     if is_writable(&exe_dir) {
         return Some(exe_dir);
@@ -612,8 +670,8 @@ pub fn is_writable(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        hotkeys_from_json, hotkeys_to_json, is_due, merge_json, parse_import, strip_bom,
-        HotkeyRuleSetting, Settings,
+        hotkeys_from_json, hotkeys_to_json, is_due, merge_import, merge_json, parse_import,
+        strip_bom, HotkeyRuleSetting, Settings,
     };
 
     const HOUR: u64 = 3600;
@@ -789,6 +847,37 @@ mod tests {
         assert!(parse_import(r#"{"name":"別のアプリ"}"#).is_err());
         assert!(parse_import("[1]").is_err());
         assert!(parse_import("x").is_err());
+    }
+
+    #[test]
+    fn import_keeps_missing_lists_and_update_source() {
+        let current = Settings {
+            hotkeys: vec![HotkeyRuleSetting {
+                hotkey: "Ctrl+Alt+V".into(),
+                action: "paste_plain".into(),
+                ..Default::default()
+            }],
+            snippets: vec![super::Snippet {
+                name: "a".into(),
+                text: "b".into(),
+            }],
+            ..Default::default()
+        };
+        // キー割り当て・定型文が無いファイル: 今のものを残す。更新の確認先は今のまま。
+        let text = r#"{"remap":{"hotkey":"Ctrl+Q"},
+                       "update":{"api_url":"https://api.github.com/repos/someone/else/releases/latest",
+                                 "check_on_startup":false}}"#;
+        let merged = merge_import(parse_import(text).unwrap(), &current).unwrap();
+        assert_eq!(merged.settings.hotkeys, current.hotkeys);
+        assert_eq!(merged.settings.snippets, current.snippets);
+        assert_eq!(merged.settings.update.api_url, current.update.api_url);
+        assert!(!merged.settings.update.check_on_startup);
+        assert_eq!(merged.root["update"]["api_url"], current.update.api_url.as_str());
+        // 書かれていれば、空でもそれを使う。
+        let merged =
+            merge_import(parse_import(r#"{"hotkeys":[],"snippets":[]}"#).unwrap(), &current).unwrap();
+        assert!(merged.settings.hotkeys.is_empty());
+        assert!(merged.settings.snippets.is_empty());
     }
 
     #[test]

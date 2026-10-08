@@ -19,7 +19,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HFONT};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DestroyWindow, MessageBoxW, PostQuitMessage, SetForegroundWindow,
+    DefWindowProcW, DestroyWindow, IsWindow, MessageBoxW, PostQuitMessage, SetForegroundWindow,
     ShowWindow, IDCANCEL, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION,
     MB_ICONWARNING, MB_YESNOCANCEL, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
 };
@@ -130,11 +130,13 @@ struct Context {
     tx: Sender<TrayMessage>,
     /// 編集中の割り当て（保存するまで settings.json には書かない）。
     rules: Vec<HotkeyRuleSetting>,
-    /// 値貼り付けのキーと対象アプリ（同じキーを使っていないか確かめるため）。
-    remap: (Hotkey, Vec<String>),
     font: HFONT,
     /// 保存していない変更があるか。
     dirty: bool,
+    /// 開いたときの割り当て（保存するときに、ほかの場所で変えられていないかを確かめる）。
+    loaded: Vec<HotkeyRuleSetting>,
+    /// 右側に出している割り当ての位置（`None` は新しく作るときの初期値）。
+    shown: Option<usize>,
 }
 
 thread_local! {
@@ -146,9 +148,9 @@ static WINDOW: SingleWindow = SingleWindow::new();
 
 /// キー割り当て画面を開く。すでに開いていれば手前に出す。
 ///
-/// `rules` は現在の割り当て、`remap` は値貼り付けのキーと対象アプリ。
-pub fn open(tx: Sender<TrayMessage>, rules: Vec<HotkeyRuleSetting>, remap: (Hotkey, Vec<String>)) {
-    WINDOW.open(move || unsafe { thread_main(tx, rules, remap) });
+/// `rules` は現在の割り当て。値貼り付けのキーは、保存するときに settings.json から読み直す。
+pub fn open(tx: Sender<TrayMessage>, rules: Vec<HotkeyRuleSetting>) {
+    WINDOW.open(move || unsafe { thread_main(tx, rules) });
 }
 
 /// 開いていれば閉じ（保存はしない）、スレッドが終わるのを待つ。アプリの終了時に呼ぶ。
@@ -159,7 +161,6 @@ pub fn close() {
 unsafe fn thread_main(
     tx: Sender<TrayMessage>,
     rules: Vec<HotkeyRuleSetting>,
-    remap: (Hotkey, Vec<String>),
 ) {
     ui::init_common_controls();
     let title = format!("キー割り当て - アタイの貼り付け v{}", env!("CARGO_PKG_VERSION"));
@@ -173,8 +174,9 @@ unsafe fn thread_main(
     CONTEXT.with(|c| {
         *c.borrow_mut() = Some(Context {
             tx,
+            loaded: rules.clone(),
+            shown: (!rules.is_empty()).then_some(0),
             rules,
-            remap,
             font,
             dirty: false,
         })
@@ -416,10 +418,50 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 
 /// 一覧で選んだ割り当てを右側に出す。
 unsafe fn on_select(hwnd: HWND) {
-    let Some(index) = ui::list_index(hwnd, ID_LIST) else {
+    let shown = CONTEXT.with(|c| c.borrow().as_ref().and_then(|ctx| ctx.shown));
+    if ui::list_index(hwnd, ID_LIST) != shown
+        && editor_differs(hwnd)
+        && !ui::ask_yes_no(
+            hwnd,
+            "右側で変更した内容が、まだ一覧に反映されていません。\n\
+             変更を捨てて、選んだ割り当てを表示しますか？",
+        )
+    {
+        // 選び直す前の行に戻す（右側の変更を残す）。
+        refresh_list(hwnd, shown);
         return;
-    };
-    let rule = CONTEXT.with(|c| c.borrow().as_ref().and_then(|ctx| ctx.rules.get(index).cloned()));
+    }
+    show_selected(hwnd);
+}
+
+/// 右側が、出している割り当て（新しく作るときは初期値）から変えられているか。
+/// 読めない割り当て（知らない動作など）を出しているときは、比べられないので変えていないとみなす。
+unsafe fn editor_differs(hwnd: HWND) -> bool {
+    let shown = CONTEXT.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|ctx| ctx.shown.and_then(|i| ctx.rules.get(i).cloned()))
+    })
+    .flatten();
+    let base = shown.unwrap_or_else(new_rule);
+    if Rule::from_setting(&base).is_err() {
+        return false;
+    }
+    match read_editor(hwnd) {
+        Ok(edited) => !same_rule(&base, &edited),
+        Err(_) => true,
+    }
+}
+
+/// 一覧で選んでいる割り当てを右側に出す（確かめずに）。
+unsafe fn show_selected(hwnd: HWND) {
+    let index = ui::list_index(hwnd, ID_LIST);
+    let rule = CONTEXT.with(|c| {
+        let mut c = c.borrow_mut();
+        let ctx = c.as_mut()?;
+        ctx.shown = index;
+        index.and_then(|i| ctx.rules.get(i).cloned())
+    });
     if let Some(rule) = rule {
         load_editor(hwnd, &rule);
     }
@@ -436,6 +478,7 @@ unsafe fn on_add(hwnd: HWND) {
         let ctx = c.as_mut()?;
         ctx.rules.push(setting);
         ctx.dirty = true;
+        ctx.shown = Some(ctx.rules.len() - 1);
         Some(ctx.rules.len() - 1)
     });
     refresh_list(hwnd, index);
@@ -460,6 +503,7 @@ unsafe fn on_update(hwnd: HWND) {
             if let Some(rule) = ctx.rules.get_mut(index) {
                 *rule = setting;
                 ctx.dirty = true;
+                ctx.shown = Some(index);
             }
         }
     });
@@ -484,7 +528,13 @@ unsafe fn on_delete(hwnd: HWND) {
     });
     refresh_list(hwnd, next);
     if next.is_some() {
-        on_select(hwnd);
+        show_selected(hwnd);
+    } else {
+        CONTEXT.with(|c| {
+            if let Some(ctx) = c.borrow_mut().as_mut() {
+                ctx.shown = None;
+            }
+        });
     }
 }
 
@@ -499,6 +549,16 @@ unsafe fn on_move(hwnd: HWND, delta: isize) {
         let to = index.checked_add_signed(delta).filter(|to| *to < ctx.rules.len())?;
         ctx.rules.swap(index, to);
         ctx.dirty = true;
+        // 右側に出している割り当ての位置も入れ替える。
+        ctx.shown = ctx.shown.map(|s| {
+            if s == index {
+                to
+            } else if s == to {
+                index
+            } else {
+                s
+            }
+        });
         Some(to)
     });
     if let Some(to) = moved {
@@ -514,7 +574,9 @@ unsafe fn on_save(hwnd: HWND) {
         if let Ok(edited) = read_editor(hwnd) {
             let current =
                 CONTEXT.with(|c| c.borrow().as_ref().and_then(|ctx| ctx.rules.get(index).cloned()));
-            if current.is_some_and(|current| !same_rule(&current, &edited))
+            let readable = current.as_ref().is_some_and(|c| Rule::from_setting(c).is_ok());
+            if readable
+                && current.is_some_and(|current| !same_rule(&current, &edited))
                 && ui::ask_yes_no(
                     hwnd,
                     "右側で変更した内容が、まだ一覧に反映されていません。\n\
@@ -525,20 +587,49 @@ unsafe fn on_save(hwnd: HWND) {
                 on_update(hwnd);
             }
         }
+    } else if editor_differs(hwnd)
+        && ui::ask_yes_no(
+            hwnd,
+            "右側に書いた割り当てが、まだ一覧に追加されていません。\n\
+             新しい割り当てとして追加してから保存しますか？\n\n\
+             「いいえ」を選ぶと、右側の内容は保存しません。",
+        )
+    {
+        on_add(hwnd);
     }
-    let Some((tx, rules, remap)) = CONTEXT.with(|c| {
+    // 確かめている間に、アプリの終了で画面が閉じられていたら、保存しない。
+    if !IsWindow(hwnd).as_bool() {
+        return;
+    }
+    let Some((tx, rules, loaded)) = CONTEXT.with(|c| {
         c.borrow()
             .as_ref()
-            .map(|ctx| (ctx.tx.clone(), ctx.rules.clone(), ctx.remap.clone()))
+            .map(|ctx| (ctx.tx.clone(), ctx.rules.clone(), ctx.loaded.clone()))
     }) else {
         return;
     };
+    let saved = config::Settings::load();
+    // 開いている間に、ほかの場所（設定の読み込みなど）でキー割り当てが変えられていないか。
+    if saved.hotkeys != loaded
+        && !ui::ask_yes_no(
+            hwnd,
+            "この画面を開いたあとで、キー割り当てがほかの場所で変えられています\n\
+             （設定の読み込みなど）。この画面の内容で上書きしますか？",
+        )
+    {
+        return;
+    }
+    // 値貼り付けのキーは、開いたあとで設定画面で変えられていることがあるので読み直す。
+    let remap = (
+        Hotkey::from_setting(&saved.remap.hotkey).0,
+        remap_logic::effective_target_apps(&saved.remap.target_apps),
+    );
     if let Some(message) = hotkey_rules::find_conflict(&rules, (remap.0, &remap.1)) {
         show_message(hwnd, &message, MB_ICONWARNING);
         return;
     }
     // クリップボードの履歴を出すキー（設定画面で決める）と重なっていないか。
-    let history = clip_history::Config::from_settings(&config::Settings::load().clipboard_history);
+    let history = clip_history::Config::from_settings(&saved.clipboard_history);
     if let Some(key) = history.hotkey.filter(|_| history.enabled) {
         if let Some(n) = hotkey_rules::find_key_in_rules(&rules, key) {
             show_message(
@@ -666,7 +757,7 @@ unsafe fn on_import(hwnd: HWND) {
         Some(first)
     });
     refresh_list(hwnd, first);
-    on_select(hwnd);
+    show_selected(hwnd);
     log::info!("キー割り当てを読み込みました（{count} 件、{}）", path.display());
     let mut message = format!("{count} 件の割り当てを読み込みました。「保存」を押すと使えるようになります。");
     if unusable > 0 {
@@ -704,7 +795,8 @@ fn same_rule(a: &HotkeyRuleSetting, b: &HotkeyRuleSetting) -> bool {
 
 /// 「キャンセル」・閉じるボタン: 保存していない変更があれば確かめてから閉じる。
 unsafe fn on_close(hwnd: HWND) {
-    let dirty = CONTEXT.with(|c| c.borrow().as_ref().is_some_and(|ctx| ctx.dirty));
+    let dirty = CONTEXT.with(|c| c.borrow().as_ref().is_some_and(|ctx| ctx.dirty))
+        || editor_differs(hwnd);
     if dirty
         && !ui::ask_yes_no(
             hwnd,
