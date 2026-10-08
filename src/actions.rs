@@ -23,9 +23,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{
-    GlobalFree, COLORREF, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, POINT, WPARAM,
-};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, EnumClipboardFormats,
@@ -37,29 +35,24 @@ use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
-use windows::Win32::System::Threading::{
-    AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId,
-};
+use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, KillTimer, SetTimer, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetAncestor, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo,
-    GetMessageW, GetShellWindow, GetWindowLongPtrW, GetWindowThreadProcessId, MessageBoxW,
-    PeekMessageW, PostMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW,
-    SetForegroundWindow, SetLayeredWindowAttributes, SetWindowPos, TrackPopupMenuEx,
-    TranslateMessage, GA_ROOT, GUITHREADINFO, GWL_EXSTYLE, HWND_MESSAGE, HWND_NOTOPMOST,
-    HWND_TOPMOST, LWA_ALPHA, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
-    MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_SHOWWINDOW, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLIPBOARDUPDATE, WM_DESTROYCLIPBOARD, WM_NULL, WM_TIMER,
-    WM_QUIT, WM_RENDERALLFORMATS, WM_RENDERFORMAT, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetAncestor,
+    GetForegroundWindow, GetMessageW, GetShellWindow, GetWindowLongPtrW,
+    GetWindowThreadProcessId, KillTimer, MessageBoxW, PeekMessageW, PostMessageW,
+    PostQuitMessage, PostThreadMessageW, RegisterClassW, SetForegroundWindow, SetTimer,
+    SetWindowPos, TranslateMessage, GA_ROOT, GWL_EXSTYLE, HWND_MESSAGE, HWND_NOTOPMOST,
+    HWND_TOPMOST, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MSG, PM_REMOVE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+    WM_CLIPBOARDUPDATE, WM_DESTROYCLIPBOARD, WM_QUIT, WM_RENDERALLFORMATS, WM_RENDERFORMAT,
+    WM_TIMER, WNDCLASSW, WS_EX_TOPMOST,
 };
 
 use crate::clip_history::{self, History, MenuPosition};
 use crate::hotkey_rules::{self, Action, LocalTime};
 use crate::remap_logic::Hotkey;
-use crate::{clip_store, config, ime_indicator, keyboard, remap_logic, sendinput, text_transform};
+use crate::{clip_store, config, history_window, ime_indicator, keyboard, remap_logic, sendinput, text_transform};
 
 /// クリップボードの文字（`CF_UNICODETEXT`）。
 const CF_UNICODETEXT: u32 = 13;
@@ -138,10 +131,6 @@ const WM_APP_CLEAR_HISTORY: u32 = WM_APP + 3;
 const TIMER_SAVE_HISTORY: usize = 1;
 const SAVE_HISTORY_DELAY_MS: u32 = 2000;
 
-/// 履歴の一覧の「履歴を消す」の番号（履歴の番号 1〜100 と重ならないもの）。
-const MENU_CLEAR_HISTORY: usize = 1000;
-/// 履歴の一覧の持ち主のウィンドウを出してから、前面にするまでの待ち時間。
-const MENU_SHOW_WAIT: Duration = Duration::from_millis(30);
 /// 履歴の一覧を閉じてから、元のウィンドウに入力が戻るのを待つ時間。
 const MENU_REFOCUS_WAIT: Duration = Duration::from_millis(80);
 
@@ -540,9 +529,9 @@ unsafe fn paste_transformed(held: &Hotkey, transforms: &[text_transform::Transfo
     paste_text(held, &text);
 }
 
-/// クリップボードの履歴を一覧で出し、選んだものを貼り付ける。
+/// クリップボードの履歴の一覧（[`history_window`]）を出し、選んだものを貼り付ける。
 unsafe fn paste_from_history(held: &Hotkey) {
-    // 一覧を数字キーで選べるよう、押されたままの修飾キーを先に離す。
+    // 押されたままの修飾キーを先に離す（一覧でのキー操作に混ざらないように）。
     sendinput::release_modifiers(held);
     let config = history_config();
     if !config.record {
@@ -553,201 +542,30 @@ unsafe fn paste_from_history(held: &Hotkey) {
         ime_indicator::notify("空");
         return;
     }
-    let Ok(menu) = CreatePopupMenu() else {
-        ime_indicator::notify("失敗");
-        return;
-    };
-    let owner = create_menu_window();
-    if owner.is_invalid() {
-        let _ = DestroyMenu(menu);
-        ime_indicator::notify("失敗");
-        return;
-    }
-    // 最初の 10 件はそのまま並べ、11 件目からは 10 件ずつまとめる（100 件を 1 列に並べると、
-    // 画面に収まらないため）。まとめた段には A〜I、各段の中では 1〜0 のキーで移れる。
-    let first_page = items.len().min(clip_history::MENU_PAGE);
-    for (i, text) in items.iter().take(first_page).enumerate() {
-        let label = HSTRING::from(clip_history::menu_label(Some(i), text));
-        let _ = AppendMenuW(menu, MF_STRING, i + 1, &label);
-    }
-    if items.len() > clip_history::MENU_PAGE {
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        for (page, start) in (clip_history::MENU_PAGE..items.len())
-            .step_by(clip_history::MENU_PAGE)
-            .enumerate()
-        {
-            let Ok(sub) = CreatePopupMenu() else {
-                break;
-            };
-            let end = (start + clip_history::MENU_PAGE).min(items.len());
-            for (j, text) in items[start..end].iter().enumerate() {
-                let label = HSTRING::from(clip_history::menu_label(Some(j), text));
-                let _ = AppendMenuW(sub, MF_STRING, start + j + 1, &label);
-            }
-            let letter = char::from(b'A' + (page as u8).min(25));
-            let title = HSTRING::from(format!(
-                "&{letter} {}",
-                clip_history::page_label(start, end - start)
-            ));
-            // 段ごと親のメニューに付ける（親を消すと一緒に消える）。
-            let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, &title);
-        }
-    }
-    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-    let _ = AppendMenuW(menu, MF_STRING, MENU_CLEAR_HISTORY, w!("履歴を消す(&X)"));
-
     let target = GetForegroundWindow();
-    let point = menu_point(target, config.position);
-    // 持ち主のウィンドウを、一覧を出す位置に 1 ピクセルの透明なウィンドウとして出して前面にする
-    // （隠したままだと、環境によっては一覧がキー入力を受け取れない）。使い回すと 2 回目以降に
-    // 前面にならない環境があるので、毎回作って閉じる。
-    let _ = SetWindowPos(
-        owner,
-        HWND_TOPMOST,
-        point.x,
-        point.y,
-        1,
-        1,
-        SWP_SHOWWINDOW | SWP_NOACTIVATE,
-    );
-    pump_messages_until(MENU_SHOW_WAIT, || false);
-    if !bring_to_front(owner, target) {
-        // 前面にできないまま一覧を出すと、キーでもほかの場所のクリックでも閉じられなくなる。
-        log::warn!(
-            "キー割り当て: 履歴の一覧を出せませんでした（前面のアプリ: {}）",
-            crate::excel_check::foreground_process_name().unwrap_or_else(|| "不明".into())
-        );
-        let _ = DestroyWindow(owner);
-        let _ = DestroyMenu(menu);
+    let Some(outcome) = history_window::choose(items, config.position, target) else {
         ime_indicator::notify("不可");
         return;
-    }
-    // TPM_RETURNCMD では、選ばれた項目の番号が返る（選ばずに閉じたら 0）。
-    let chosen = TrackPopupMenuEx(
-        menu,
-        (TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN).0,
-        point.x,
-        point.y,
-        owner,
-        None,
-    )
-    .0 as usize;
-    // メニューをきちんと閉じるための決まりごと（TrackPopupMenu の説明にある）。
-    let _ = PostMessageW(owner, WM_NULL, WPARAM(0), LPARAM(0));
-    let _ = DestroyMenu(menu);
-    let _ = DestroyWindow(owner);
+    };
     if !target.is_invalid() {
         let _ = SetForegroundWindow(target);
     }
-
-    match chosen {
-        0 => {}
-        MENU_CLEAR_HISTORY => {
-            clear_all_history();
-            ime_indicator::notify("消去");
-        }
-        n => {
-            let Some(text) = items.get(n - 1) else {
-                return;
-            };
-            // 元のウィンドウに入力が戻ってから貼り付ける。
-            pump_messages_until(MENU_REFOCUS_WAIT, || false);
-            log::debug!(
-                "キー割り当て: 履歴の {n} 番目を貼り付けます（{} 文字）",
-                text.chars().count()
-            );
-            paste_text(&Hotkey::unpack(0), text);
+    if !outcome.removed.is_empty() {
+        let changed = HISTORY.with(|h| {
+            let mut h = h.borrow_mut();
+            outcome.removed.iter().fold(false, |changed, text| h.remove(text) || changed)
+        });
+        if changed {
+            log::debug!("クリップボードの履歴: {} 件を消しました", outcome.removed.len());
+            mark_history_changed();
         }
     }
-}
-
-/// 履歴の一覧を出す位置。入力位置の近くにするときは、入力位置（キャレット）が分かればその下、
-/// 分からなければマウスの位置。
-unsafe fn menu_point(target: HWND, position: MenuPosition) -> POINT {
-    if position == MenuPosition::Caret && !target.is_invalid() {
-        let thread_id = GetWindowThreadProcessId(target, None);
-        let mut info = GUITHREADINFO {
-            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
-            ..Default::default()
-        };
-        if thread_id != 0 && GetGUIThreadInfo(thread_id, &mut info).is_ok() {
-            if let Some(caret) = ime_indicator::caret_rect(&info) {
-                return POINT {
-                    x: caret.left,
-                    y: caret.bottom,
-                };
-            }
-        }
+    if let Some(text) = outcome.chosen {
+        // 元のウィンドウに入力が戻ってから貼り付ける。
+        pump_messages_until(MENU_REFOCUS_WAIT, || false);
+        log::debug!("クリップボードの履歴から貼り付けます（{} 文字）", text.chars().count());
+        paste_text(&Hotkey::unpack(0), &text);
     }
-    let mut point = POINT::default();
-    let _ = GetCursorPos(&mut point);
-    point
-}
-
-/// 一覧を出すウィンドウを前面にする（一覧をキーで操作できるように）。前面にできたら `true`。
-/// Windows は、ほかのアプリが前面のときに前面を奪うことを制限しているので、通らなければ
-/// 前面のアプリの入力の流れに一時的に加わってから前面にする。
-unsafe fn bring_to_front(window: HWND, current: HWND) -> bool {
-    let _ = SetForegroundWindow(window);
-    if GetForegroundWindow() == window {
-        return true;
-    }
-    let ours = GetCurrentThreadId();
-    let theirs = if current.is_invalid() {
-        0
-    } else {
-        GetWindowThreadProcessId(current, None)
-    };
-    if theirs != 0 && theirs != ours && AttachThreadInput(ours, theirs, true).as_bool() {
-        let _ = SetForegroundWindow(window);
-        let _ = AttachThreadInput(ours, theirs, false);
-    }
-    GetForegroundWindow() == window
-}
-
-/// 一覧（メニュー）の持ち主にする透明なウィンドウを作る。作れなければ無効なハンドル。
-unsafe fn create_menu_window() -> HWND {
-    let Ok(instance) = GetModuleHandleW(None) else {
-        return HWND::default();
-    };
-    let class_name = w!("AtaiPasteHistoryMenu");
-    let class = WNDCLASSW {
-        lpfnWndProc: Some(menu_wnd_proc),
-        hInstance: instance.into(),
-        lpszClassName: class_name,
-        ..Default::default()
-    };
-    RegisterClassW(&class);
-    // 透明で、タスクバーにも出ない。一覧（メニュー）の持ち主にするだけ。
-    let window = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TOPMOST,
-        class_name,
-        w!(""),
-        WS_POPUP,
-        0,
-        0,
-        0,
-        0,
-        None,
-        None,
-        instance,
-        None,
-    )
-    .unwrap_or_default();
-    if !window.is_invalid() {
-        let _ = SetLayeredWindowAttributes(window, COLORREF(0), 0, LWA_ALPHA);
-    }
-    window
-}
-
-unsafe extern "system" fn menu_wnd_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    // 一覧を出している間に依頼が届いても、ここでは実行しない（一覧を閉じてから順に実行する）。
-    DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
 /// 開いている一覧の表示（2 つ以上同時に開かない）。

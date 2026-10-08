@@ -34,6 +34,7 @@ mod excel_check;
 mod actions;
 mod clip_history;
 mod clip_store;
+mod history_window;
 mod hotkey_rules;
 mod hotkey_window;
 mod http;

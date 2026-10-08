@@ -32,7 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowPos,
     SetWindowTextW, ShowWindow, TranslateMessage, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_GROUPBOX,
     BS_PUSHBUTTON, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL,
-    ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_NUMBER, ES_WANTRETURN, HMENU, LBS_NOTIFY,
+    ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_NUMBER, ES_READONLY, ES_WANTRETURN, HMENU, LBS_NOTIFY,
     MB_OK, MESSAGEBOX_STYLE, MSG, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE,
     SWP_NOZORDER, SW_RESTORE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT, WNDCLASSW,
     WNDPROC, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
@@ -110,6 +110,10 @@ pub enum Kind {
     NumberEdit,
     MultiEdit,
     ListBox,
+    /// 行をアプリが描く一覧（中身の文字は持たず、行数だけを持つ）。
+    OwnerList,
+    /// 読むだけの、複数行の文字の欄。
+    ReadOnlyText,
     Button,
     DefaultButton,
 }
@@ -367,6 +371,17 @@ pub unsafe fn create_controls(hwnd: HWND, items: &[Item], font: HFONT) {
             Kind::ListBox => (
                 w!("LISTBOX"),
                 LBS_NOTIFY as u32 | WS_VSCROLL.0 | WS_TABSTOP.0,
+                WS_EX_CLIENTEDGE.0,
+            ),
+            Kind::OwnerList => (
+                w!("LISTBOX"),
+                // LBS_OWNERDRAWFIXED | LBS_NODATA | LBS_NOINTEGRALHEIGHT | LBS_NOTIFY
+                0x0010 | 0x2000 | 0x0100 | LBS_NOTIFY as u32 | WS_VSCROLL.0,
+                WS_EX_CLIENTEDGE.0,
+            ),
+            Kind::ReadOnlyText => (
+                w!("EDIT"),
+                ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32 | ES_READONLY as u32 | WS_VSCROLL.0,
                 WS_EX_CLIENTEDGE.0,
             ),
             Kind::Button => (w!("BUTTON"), BS_PUSHBUTTON as u32 | WS_TABSTOP.0, 0),

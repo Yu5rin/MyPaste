@@ -77,6 +77,7 @@ src/
  ├ text_transform.rs // 「文字を整えて貼り付け」の整え方（Win32 非依存）
  ├ clip_history.rs  // クリップボードの履歴の判断ロジック（Win32 非依存）
  ├ clip_store.rs    // クリップボードの履歴の保存（DPAPI で暗号化）
+ ├ history_window.rs // クリップボードの履歴の一覧の画面
  ├ ui.rs            // 画面の共通部品
  ├ single_instance.rs // 二重起動の防止
  ├ tray.rs          // タスクトレイ制御（tray-item）

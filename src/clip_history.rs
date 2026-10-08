@@ -23,10 +23,10 @@ pub const MAX_CHARS: usize = 50_000;
 pub const DOUBLE_TAP_MS_MIN: u32 = 200;
 pub const DOUBLE_TAP_MS_MAX: u32 = 1000;
 pub const DEFAULT_DOUBLE_TAP_MS: u32 = 400;
-/// 一覧に出すときの文字数。
-const LABEL_CHARS: usize = 40;
-/// 一覧の 1 段に並べる件数（11 件目からは 10 件ずつまとめる）。
-pub const MENU_PAGE: usize = 10;
+/// 一覧の 1 行に出す文字数の上限（実際には欄の幅に合わせて「…」で切る）。
+const ROW_CHARS: usize = 200;
+/// 下の欄に全文を出すときの文字数の上限。
+const PREVIEW_CHARS: usize = 5000;
 
 /// コピーされた文字の履歴（新しい順）。
 #[derive(Debug)]
@@ -85,6 +85,17 @@ impl History {
 
     pub fn items(&self) -> impl Iterator<Item = &String> {
         self.items.iter()
+    }
+
+    /// 1 件を消す（一覧で消したとき）。消えたら `true`。
+    pub fn remove(&mut self, text: &str) -> bool {
+        match self.items.iter().position(|t| t == text) {
+            Some(i) => {
+                self.items.remove(i);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -310,37 +321,55 @@ impl DoubleTap {
     }
 }
 
-/// 一覧に出す 1 行。`key` が `Some(0..=9)` なら先頭に数字キーで選べる印（`&1`〜`&9`、
-/// 10 個目は `&0`）を付ける。最初の行を短くして出し、複数行なら行数も添える。
-pub fn menu_label(key: Option<usize>, text: &str) -> String {
+/// 一覧の 1 行に出す文字（最初の空でない行。タブは空白に）と、全体の行数。
+pub fn row_text(text: &str) -> (String, usize) {
     let first = text
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or("");
-    // メニューの & は印として扱われるので、文字の & は && にする。タブは見づらいので空白に。
-    let mut short: String = first.chars().take(LABEL_CHARS).collect::<String>().replace('&', "&&");
-    short = short.replace('\t', " ");
-    if first.chars().count() > LABEL_CHARS {
-        short.push('…');
-    }
-    let lines = text.trim_end_matches(['\r', '\n']).lines().count();
-    let more = if lines > 1 {
-        format!("（{lines} 行）")
-    } else {
-        String::new()
-    };
-    let key = match key {
-        Some(i @ 0..=8) => format!("&{} ", i + 1),
-        Some(9) => "&0 ".to_string(),
-        _ => "   ".to_string(),
-    };
-    format!("{key}{short}{more}")
+    let row: String = first.chars().take(ROW_CHARS).collect::<String>().replace('\t', " ");
+    let lines = text.trim_end_matches(['\r', '\n']).lines().count().max(1);
+    (row, lines)
 }
 
-/// 11 件目からをまとめる段の見出し（例 `11〜20`）。`start` は 0 から数えた位置。
-pub fn page_label(start: usize, len: usize) -> String {
-    format!("{}〜{}", start + 1, start + len)
+/// 下の欄に出す全文（改行は \r\n にそろえる。長すぎるものは途中まで）。
+pub fn preview_text(text: &str) -> String {
+    let mut preview: String = text.chars().take(PREVIEW_CHARS).collect();
+    if text.chars().count() > PREVIEW_CHARS {
+        preview.push_str("\n…（以下省略）");
+    }
+    preview.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
+/// 絞り込み。`query` を空白で区切った語を**すべて**含むものの位置を返す（大文字・小文字、
+/// 全角・半角の英数字は区別しない）。`query` が空ならすべて。
+pub fn filter<'a>(items: impl IntoIterator<Item = &'a String>, query: &str) -> Vec<usize> {
+    let words: Vec<String> = query.split_whitespace().map(normalize).collect();
+    items
+        .into_iter()
+        .enumerate()
+        .filter(|(_, text)| {
+            if words.is_empty() {
+                return true;
+            }
+            let text = normalize(text);
+            words.iter().all(|w| text.contains(w.as_str()))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// 絞り込み用に、全角の英数字・記号を半角に、英字を小文字にそろえる。
+fn normalize(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+            '\u{3000}' => ' ',
+            _ => c,
+        })
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 #[cfg(test)]
@@ -483,14 +512,35 @@ mod tests {
     }
 
     #[test]
-    fn labels() {
-        assert_eq!(menu_label(Some(0), "hello"), "&1 hello");
-        assert_eq!(menu_label(Some(9), "x"), "&0 x");
-        assert_eq!(menu_label(None, "x"), "   x");
-        assert_eq!(menu_label(Some(1), "\r\n  A&B\r\n2行目\r\n"), "&2 A&&B（3 行）");
-        let long = "あ".repeat(50);
-        assert_eq!(menu_label(Some(2), &long), format!("&3 {}…", "あ".repeat(40)));
-        assert_eq!(page_label(10, 10), "11〜20");
-        assert_eq!(page_label(90, 3), "91〜93");
+    fn rows_and_preview() {
+        assert_eq!(row_text("hello"), ("hello".to_string(), 1));
+        assert_eq!(row_text("\r\n  A\tB\r\n2行目\r\n"), ("A B".to_string(), 3));
+        assert_eq!(row_text(&"あ".repeat(300)).0.chars().count(), 200);
+        assert_eq!(preview_text("a\nb\r\nc"), "a\r\nb\r\nc");
+        assert!(preview_text(&"x".repeat(6000)).ends_with("…（以下省略）"));
+    }
+
+    #[test]
+    fn filters() {
+        let items: Vec<String> = ["Hello World", "ＡＢＣ商事", "見積書 2026", "hello"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(filter(&items, ""), [0, 1, 2, 3]);
+        assert_eq!(filter(&items, "HELLO"), [0, 3]);
+        assert_eq!(filter(&items, "abc"), [1]);
+        assert_eq!(filter(&items, "見積　２０２６"), [2]);
+        assert_eq!(filter(&items, "hello world"), [0]);
+        assert!(filter(&items, "なし").is_empty());
+    }
+
+    #[test]
+    fn removes() {
+        let mut h = History::default();
+        h.push("a");
+        h.push("b");
+        assert!(h.remove("a"));
+        assert!(!h.remove("a"));
+        assert_eq!(items(&h), ["b"]);
     }
 }
