@@ -374,8 +374,9 @@ pub unsafe fn create_controls(hwnd: HWND, items: &[Item], font: HFONT) {
             Kind::OwnerList => (
                 w!("LISTBOX"),
                 // LBS_OWNERDRAWFIXED | LBS_NODATA | LBS_NOINTEGRALHEIGHT | LBS_NOTIFY
-                0x0010 | 0x2000 | 0x0100 | LBS_NOTIFY as u32 | WS_VSCROLL.0,
-                WS_EX_CLIENTEDGE.0,
+                // 枠は付けない（一覧の画面の側で 1 ピクセルの枠を描く）。
+                0x0010 | 0x2000 | 0x0100 | LBS_NOTIFY as u32,
+                0,
             ),
             Kind::Button => (w!("BUTTON"), BS_PUSHBUTTON as u32 | WS_TABSTOP.0, 0),
             Kind::DefaultButton => (w!("BUTTON"), BS_DEFPUSHBUTTON as u32 | WS_TABSTOP.0, 0),

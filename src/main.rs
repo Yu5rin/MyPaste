@@ -34,6 +34,8 @@ mod excel_check;
 mod actions;
 mod clip_history;
 mod clip_store;
+mod snippet_window;
+mod snippets;
 mod history_window;
 mod hotkey_rules;
 mod hotkey_window;
@@ -84,6 +86,8 @@ pub enum TrayMessage {
     OpenHotkeys,
     /// 値貼り付けのキーとキー割り当ての一覧を表示する
     ShowList,
+    /// 定型文の画面を開く
+    OpenSnippets,
     /// キー割り当て画面で保存された（settings.json への書き込みは済んでいる。反映だけ行う）
     HotkeysSaved(Vec<config::HotkeyRuleSetting>),
     /// 更新を確認（メニューからの手動操作）
@@ -114,6 +118,7 @@ fn main() {
     let hotkey = configure_remap(&settings);
     configure_hotkeys(&settings);
     // キー割り当ての動作を実行するスレッド。フックより先に始めておく。
+    actions::set_snippets(settings.snippets.clone());
     let action_worker = actions::start();
 
     // --- フックスレッドを起動し、そのスレッド ID を受け取る ---
@@ -282,6 +287,7 @@ fn main() {
                 log::info!("設定を反映しました（キー: {}）", hotkey.format());
             }
             TrayMessage::SettingsImported(imported) => {
+                actions::set_snippets(imported.snippets.clone());
                 // キー割り当ても読み込んだものにして、設定の保存と同じように反映する。
                 let hotkeys = imported.hotkeys.clone();
                 let _ = tx.send(TrayMessage::SettingsSaved(imported));
@@ -300,6 +306,7 @@ fn main() {
                 hotkey_window::open(tx.clone(), settings.hotkeys.clone(), (remap, remap_apps));
             }
             TrayMessage::ShowList => actions::show_assignment_list(),
+            TrayMessage::OpenSnippets => snippet_window::open(),
             TrayMessage::HotkeysSaved(hotkeys) => {
                 settings.hotkeys = hotkeys;
                 configure_hotkeys(&settings);
@@ -334,6 +341,7 @@ fn main() {
     // --- 後始末: 画面・入力モード表示・フックスレッド・キー割り当ての実行スレッドを終了させて待つ ---
     settings_window::close();
     hotkey_window::close();
+    snippet_window::close();
     if let Some(indicator) = ime_indicator {
         indicator.stop();
     }
@@ -393,6 +401,7 @@ fn configure_hotkeys(settings: &config::Settings) {
             width: history.width,
             opacity: history.opacity,
             page_size: history.page_size,
+            theme: history.theme,
         },
     });
 }

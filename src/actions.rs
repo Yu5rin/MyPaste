@@ -52,7 +52,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::clip_history::{self, History, MenuPosition};
 use crate::hotkey_rules::{self, Action, LocalTime};
 use crate::remap_logic::Hotkey;
-use crate::{clip_store, config, history_window, ime_indicator, keyboard, remap_logic, sendinput, text_transform};
+use crate::config::Snippet;
+use crate::{clip_store, config, history_window, snippet_window, ime_indicator, keyboard, remap_logic, sendinput, text_transform};
 
 /// クリップボードの文字（`CF_UNICODETEXT`）。
 const CF_UNICODETEXT: u32 = 13;
@@ -106,6 +107,7 @@ static HISTORY_CONFIG: Mutex<HistoryConfig> = Mutex::new(HistoryConfig {
         width: clip_history::DEFAULT_WIDTH,
         opacity: clip_history::DEFAULT_OPACITY,
         page_size: clip_history::DEFAULT_PAGE_SIZE,
+        theme: clip_history::Theme::System,
     },
 });
 
@@ -543,12 +545,13 @@ unsafe fn paste_from_history(held: &Hotkey) {
         return;
     }
     let items: Vec<String> = HISTORY.with(|h| h.borrow().items().cloned().collect());
-    if items.is_empty() {
+    let snippets = snippets();
+    if items.is_empty() && snippets.is_empty() {
         ime_indicator::notify("空");
         return;
     }
     let target = GetForegroundWindow();
-    let Some(outcome) = history_window::choose(items, config.view, target) else {
+    let Some(outcome) = history_window::choose(items, snippets, config.view, target) else {
         ime_indicator::notify("不可");
         return;
     };
@@ -572,12 +575,64 @@ unsafe fn paste_from_history(held: &Hotkey) {
             mark_history_changed();
         }
     }
-    if let Some(text) = outcome.chosen {
-        // 元のウィンドウに入力が戻ってから貼り付ける。
-        pump_messages_until(MENU_REFOCUS_WAIT, || false);
-        log::debug!("クリップボードの履歴から貼り付けます（{} 文字）", text.chars().count());
-        paste_text(&Hotkey::unpack(0), &text);
+    if !outcome.registered.is_empty() {
+        register_snippets(&outcome.registered);
     }
+    if outcome.edit_snippets {
+        snippet_window::open();
+    }
+    let text = match outcome.chosen {
+        Some(history_window::Pick::History(text)) => text,
+        // 定型文は {date} などを置き換えてから貼り付ける。
+        Some(history_window::Pick::Snippet(text)) => {
+            hotkey_rules::expand_placeholders(&text, &local_time())
+        }
+        None => return,
+    };
+    // 元のウィンドウに入力が戻ってから貼り付ける。
+    pump_messages_until(MENU_REFOCUS_WAIT, || false);
+    log::debug!("クリップボードの履歴・定型文から貼り付けます（{} 文字）", text.chars().count());
+    paste_text(&Hotkey::unpack(0), &text);
+}
+
+/// 定型文（[`crate::snippets`]）。起動時・設定の読み込み・定型文の画面で保存したときに差し替える。
+static SNIPPETS: Mutex<Vec<Snippet>> = Mutex::new(Vec::new());
+
+/// 定型文を差し替える。
+pub fn set_snippets(list: Vec<Snippet>) {
+    *SNIPPETS.lock().unwrap_or_else(|p| p.into_inner()) = list;
+}
+
+/// 今の定型文。
+pub fn snippets() -> Vec<Snippet> {
+    SNIPPETS.lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+/// 履歴の一覧で「定型文に登録」したものを、定型文の最後に足して保存する（同じ本文は足さない）。
+fn register_snippets(texts: &[String]) {
+    let mut list = snippets();
+    let mut added = 0;
+    for text in texts {
+        let Ok(snippet) = crate::snippets::make("", text) else {
+            continue;
+        };
+        if list.len() >= crate::snippets::MAX_SNIPPETS || list.iter().any(|s| s.text == snippet.text) {
+            continue;
+        }
+        list.push(snippet);
+        added += 1;
+    }
+    if added == 0 {
+        return;
+    }
+    if let Err(e) = config::save_snippets(&list) {
+        log::error!("定型文を保存できませんでした: {e}");
+        ime_indicator::notify("失敗");
+        return;
+    }
+    log::info!("履歴から定型文に {added} 件を登録しました");
+    set_snippets(list);
+    ime_indicator::notify("登録");
 }
 
 /// 開いている一覧の表示（2 つ以上同時に開かない）。

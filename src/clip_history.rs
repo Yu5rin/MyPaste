@@ -14,9 +14,12 @@ use crate::config::ClipboardHistorySettings;
 use crate::remap_logic::Hotkey;
 
 /// 覚えておく件数の上限と下限、既定値。
-pub const MAX_ITEMS_LIMIT: usize = 100;
+pub const MAX_ITEMS_LIMIT: usize = 10_000;
 pub const MIN_ITEMS: usize = 10;
-pub const DEFAULT_ITEMS: usize = 100;
+pub const DEFAULT_ITEMS: usize = 1000;
+/// 履歴全体の大きさの上限（UTF-8 のバイト数）。件数が多くても、大きなものばかりを覚えて
+/// メモリや保存するファイルが大きくなりすぎないよう、超えたら古いものから消す。
+pub const MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 /// 1 件として覚える文字数の上限（大きな表をコピーしたときにメモリやファイルを使いすぎないように）。
 pub const MAX_CHARS: usize = 50_000;
 /// 2 回押しの間隔の範囲と既定値（ミリ秒）。
@@ -78,6 +81,16 @@ impl History {
         self.items.truncate(self.max);
     }
 
+    /// 全体の大きさが上限を超えていたら、古いものから消す（いちばん新しいものは残す）。
+    fn trim_to_total(&mut self) {
+        let mut total: usize = self.items.iter().map(String::len).sum();
+        while total > MAX_TOTAL_BYTES && self.items.len() > 1 {
+            if let Some(old) = self.items.pop_back() {
+                total -= old.len();
+            }
+        }
+    }
+
     /// コピーされた文字を加える。空白だけの文字や、長すぎる文字は覚えない。
     /// すでにある文字なら、前のものを消していちばん新しい位置へ移す。
     /// 履歴が変わったら `true`。
@@ -93,6 +106,7 @@ impl History {
         }
         self.items.push_front(text.to_string());
         self.items.truncate(self.max);
+        self.trim_to_total();
         true
     }
 
@@ -199,6 +213,126 @@ impl Modifier {
     }
 }
 
+/// 一覧の配色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Theme {
+    /// Windows の色（ハイコントラストなどの設定にも従う）。
+    System,
+    Light,
+    Dark,
+    Blue,
+    Green,
+}
+
+impl Theme {
+    /// (値, settings.json に書く名前, 画面に出す名前)
+    pub const ALL: [(Theme, &'static str, &'static str); 5] = [
+        (Theme::System, "system", "Windows の色"),
+        (Theme::Light, "light", "ライト"),
+        (Theme::Dark, "dark", "ダーク"),
+        (Theme::Blue, "blue", "ブルー"),
+        (Theme::Green, "green", "グリーン"),
+    ];
+
+    pub fn from_setting(text: &str) -> Theme {
+        Self::ALL
+            .iter()
+            .find(|(_, key, _)| key.eq_ignore_ascii_case(text.trim()))
+            .map_or(Theme::System, |(t, _, _)| *t)
+    }
+
+    pub fn as_setting(self) -> &'static str {
+        Self::ALL.iter().find(|(t, _, _)| *t == self).map_or("system", |(_, k, _)| *k)
+    }
+
+    /// 配色。Windows の色を使うときは `None`（画面の側で Windows の色を読む）。
+    pub fn palette(self) -> Option<Palette> {
+        let p = match self {
+            Theme::System => return None,
+            Theme::Light => Palette {
+                back: rgb(255, 255, 255),
+                alt: rgb(244, 246, 249),
+                text: rgb(28, 28, 28),
+                sub: rgb(140, 140, 140),
+                sel_back: rgb(204, 228, 252),
+                sel_text: rgb(0, 0, 0),
+                header_back: rgb(236, 236, 236),
+                header_text: rgb(90, 90, 90),
+                border: rgb(160, 160, 160),
+                tip_back: rgb(255, 255, 238),
+                tip_text: rgb(28, 28, 28),
+            },
+            Theme::Dark => Palette {
+                back: rgb(32, 32, 32),
+                alt: rgb(42, 42, 42),
+                text: rgb(232, 232, 232),
+                sub: rgb(140, 140, 140),
+                sel_back: rgb(0, 95, 184),
+                sel_text: rgb(255, 255, 255),
+                header_back: rgb(20, 20, 20),
+                header_text: rgb(200, 200, 200),
+                border: rgb(90, 90, 90),
+                tip_back: rgb(48, 48, 48),
+                tip_text: rgb(236, 236, 236),
+            },
+            Theme::Blue => Palette {
+                back: rgb(244, 248, 255),
+                alt: rgb(228, 238, 252),
+                text: rgb(16, 34, 68),
+                sub: rgb(110, 128, 160),
+                sel_back: rgb(38, 98, 196),
+                sel_text: rgb(255, 255, 255),
+                header_back: rgb(38, 78, 150),
+                header_text: rgb(255, 255, 255),
+                border: rgb(38, 78, 150),
+                tip_back: rgb(250, 252, 255),
+                tip_text: rgb(16, 34, 68),
+            },
+            Theme::Green => Palette {
+                back: rgb(246, 251, 246),
+                alt: rgb(232, 244, 232),
+                text: rgb(22, 52, 24),
+                sub: rgb(112, 140, 112),
+                sel_back: rgb(46, 125, 50),
+                sel_text: rgb(255, 255, 255),
+                header_back: rgb(46, 105, 50),
+                header_text: rgb(255, 255, 255),
+                border: rgb(46, 105, 50),
+                tip_back: rgb(250, 255, 250),
+                tip_text: rgb(22, 52, 24),
+            },
+        };
+        Some(p)
+    }
+}
+
+/// 一覧の画面の色（Windows の COLORREF と同じ 0x00BBGGRR の形）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Palette {
+    /// 行の背景と、1 行おきの背景。
+    pub back: u32,
+    pub alt: u32,
+    /// 文字と、番号・行数などの控えめな文字。
+    pub text: u32,
+    pub sub: u32,
+    /// 選んでいる行。
+    pub sel_back: u32,
+    pub sel_text: u32,
+    /// 見出し（タブとページ）。
+    pub header_back: u32,
+    pub header_text: u32,
+    /// 外枠。
+    pub border: u32,
+    /// 全文の吹き出し。
+    pub tip_back: u32,
+    pub tip_text: u32,
+}
+
+/// 赤・緑・青から、COLORREF の形（0x00BBGGRR）を作る。
+pub const fn rgb(r: u8, g: u8, b: u8) -> u32 {
+    (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
+}
+
 /// 一覧を出す位置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuPosition {
@@ -238,10 +372,11 @@ pub struct Config {
     pub max_items: usize,
     pub keep_after_exit: bool,
     pub position: MenuPosition,
-    /// 一覧の画面の幅（96 DPI 基準）・不透明度（%）・1 ページの件数。
+    /// 一覧の画面の幅（96 DPI 基準）・不透明度（%）・1 ページの件数・配色。
     pub width: u32,
     pub opacity: u32,
     pub page_size: usize,
+    pub theme: Theme,
     /// 使えない値があったときの理由（記録用）。
     pub problem: Option<String>,
 }
@@ -274,6 +409,7 @@ impl Config {
             width: settings.width.clamp(MIN_WIDTH, MAX_WIDTH),
             opacity: settings.opacity.clamp(MIN_OPACITY, MAX_OPACITY),
             page_size: settings.page_size.clamp(MIN_PAGE_SIZE, MAX_PAGE_SIZE),
+            theme: Theme::from_setting(&settings.theme),
             problem,
         }
     }
@@ -386,13 +522,13 @@ pub fn page_range(page: usize, len: usize, size: usize) -> std::ops::Range<usize
     start..(start + size).min(len)
 }
 
-/// 一覧の上に出す見出し（例 `履歴 1〜20 / 100`）。
+/// 一覧の上に出すページ（例 `1〜20 / 100`）。
 pub fn page_label(page: usize, len: usize, size: usize) -> String {
     let range = page_range(page, len, size);
     if range.is_empty() {
-        return "履歴 0 件".to_string();
+        return "0 件".to_string();
     }
-    format!("履歴 {}〜{} / {len}", range.start + 1, range.end)
+    format!("{}〜{} / {len}", range.start + 1, range.end)
 }
 
 #[cfg(test)]
@@ -424,7 +560,7 @@ mod tests {
 
     #[test]
     fn keeps_at_most_max_items() {
-        let mut h = History::default();
+        let mut h = History::new(100);
         for i in 0..150 {
             h.push(&i.to_string());
         }
@@ -435,7 +571,31 @@ mod tests {
         assert_eq!(h.items().last().unwrap(), "130");
         // 範囲の外は収める。
         assert_eq!(History::new(5).max, MIN_ITEMS);
-        assert_eq!(History::new(1000).max, MAX_ITEMS_LIMIT);
+        assert_eq!(History::new(100_000).max, MAX_ITEMS_LIMIT);
+        assert_eq!(History::default().max, 1000);
+    }
+
+    #[test]
+    fn keeps_total_size_bounded() {
+        let mut h = History::new(MAX_ITEMS_LIMIT);
+        let big = "x".repeat(MAX_CHARS - 10);
+        let count = MAX_TOTAL_BYTES / (MAX_CHARS - 10) + 10;
+        for i in 0..count {
+            h.push(&format!("{i}{big}"));
+        }
+        let total: usize = h.items().map(String::len).sum();
+        assert!(total <= MAX_TOTAL_BYTES);
+        assert!(h.items().next().unwrap().starts_with(&(count - 1).to_string()));
+    }
+
+    #[test]
+    fn themes() {
+        assert_eq!(Theme::from_setting("DARK"), Theme::Dark);
+        assert_eq!(Theme::from_setting("?"), Theme::System);
+        assert_eq!(Theme::Blue.as_setting(), "blue");
+        assert!(Theme::System.palette().is_none());
+        assert_eq!(Theme::Light.palette().unwrap().back, 0x00FF_FFFF);
+        assert_eq!(rgb(1, 2, 3), 0x0003_0201);
     }
 
     #[test]
@@ -469,11 +629,13 @@ mod tests {
         let config = Config::from_settings(&settings);
         assert!(!config.enabled);
         assert_eq!(config.hotkey, Some(Hotkey::parse("Ctrl+Alt+H").unwrap()));
-        assert_eq!(config.max_items, 100);
+        assert_eq!(config.max_items, 1000);
+        assert_eq!(config.theme, Theme::System);
         assert!(config.keep_after_exit);
         assert_eq!((config.width, config.opacity, config.page_size), (260, 90, 20));
         settings.trigger = "double_ctrl".into();
-        settings.max_items = 500;
+        settings.max_items = 50_000;
+        settings.theme = "green".into();
         settings.double_tap_ms = 50;
         settings.width = 5000;
         settings.opacity = 0;
@@ -481,7 +643,8 @@ mod tests {
         let config = Config::from_settings(&settings);
         assert_eq!(config.trigger, Trigger::DoubleCtrl);
         assert_eq!(config.hotkey, None);
-        assert_eq!(config.max_items, 100);
+        assert_eq!(config.max_items, MAX_ITEMS_LIMIT);
+        assert_eq!(config.theme, Theme::Green);
         assert_eq!(config.double_tap_ms, DOUBLE_TAP_MS_MIN);
         assert_eq!((config.width, config.opacity, config.page_size), (600, 30, 10));
         settings.trigger = "hotkey".into();
@@ -558,9 +721,9 @@ mod tests {
         assert_eq!(page_count(100, 30), 4);
         assert_eq!(page_range(1, 25, 20), 20..25);
         assert_eq!(page_range(3, 25, 20), 25..25);
-        assert_eq!(page_label(0, 100, 20), "履歴 1〜20 / 100");
-        assert_eq!(page_label(1, 25, 20), "履歴 21〜25 / 25");
-        assert_eq!(page_label(0, 0, 20), "履歴 0 件");
+        assert_eq!(page_label(0, 100, 20), "1〜20 / 100");
+        assert_eq!(page_label(1, 25, 20), "21〜25 / 25");
+        assert_eq!(page_label(0, 0, 20), "0 件");
     }
 
     #[test]

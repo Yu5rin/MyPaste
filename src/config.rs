@@ -41,6 +41,18 @@ pub struct Settings {
     pub hotkeys: Vec<HotkeyRuleSetting>,
     /// クリップボードの履歴（[`crate::clip_history`]）。
     pub clipboard_history: ClipboardHistorySettings,
+    /// 定型文（[`crate::snippets`]）。上から順に一覧に並べる。
+    pub snippets: Vec<Snippet>,
+}
+
+/// 定型文 1 つ分。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Snippet {
+    /// 一覧に出す名前（空なら本文の最初の行を出す）。
+    pub name: String,
+    /// 貼り付ける本文（改行は \n）。
+    pub text: String,
 }
 
 /// クリップボードの履歴に関する設定。
@@ -67,6 +79,8 @@ pub struct ClipboardHistorySettings {
     pub opacity: u32,
     /// 一覧の 1 ページに並べる件数（10〜40）。
     pub page_size: usize,
+    /// 一覧の配色（`"system"` / `"light"` / `"dark"` / `"blue"` / `"green"`）。
+    pub theme: String,
 }
 
 impl Default for ClipboardHistorySettings {
@@ -82,6 +96,7 @@ impl Default for ClipboardHistorySettings {
             width: crate::clip_history::DEFAULT_WIDTH,
             opacity: crate::clip_history::DEFAULT_OPACITY,
             page_size: crate::clip_history::DEFAULT_PAGE_SIZE,
+            theme: "system".to_string(),
         }
     }
 }
@@ -310,6 +325,12 @@ pub fn save_from_settings_window(settings: &Settings) -> Result<(), String> {
     }))
 }
 
+/// 定型文を `settings.json` に書き込む（定型文の画面と、履歴から登録したとき）。
+pub fn save_snippets(snippets: &[Snippet]) -> Result<(), String> {
+    let value = serde_json::to_value(snippets).map_err(|e| e.to_string())?;
+    save_patch(&serde_json::json!({ "snippets": value }))
+}
+
 /// クリップボードの履歴の一覧の不透明度だけを書き込む（一覧の上で Shift+ホイールで変えたとき）。
 pub fn save_clipboard_history_opacity(opacity: u32) -> Result<(), String> {
     save_patch(&serde_json::json!({ "clipboard_history": { "opacity": opacity } }))
@@ -362,7 +383,15 @@ pub fn parse_import(text: &str) -> Result<Imported, String> {
     let mut root: serde_json::Value = serde_json::from_str(strip_bom(text))
         .map_err(|e| format!("JSON として読めません（{e}）"))?;
     let object = root.as_object_mut().ok_or("設定の形が想定と違います")?;
-    const KNOWN: [&str; 6] = ["remap", "hotkeys", "ime_indicator", "clipboard_history", "update", "log"];
+    const KNOWN: [&str; 7] = [
+        "remap",
+        "hotkeys",
+        "ime_indicator",
+        "clipboard_history",
+        "snippets",
+        "update",
+        "log",
+    ];
     if !KNOWN.iter().any(|k| object.contains_key(*k)) {
         return Err("このアプリの設定が書かれていません".into());
     }
@@ -749,7 +778,7 @@ mod tests {
         assert!(imported.settings.clipboard_history.enabled);
         assert_eq!(imported.settings.clipboard_history.trigger, "double_ctrl");
         // 書かれていない項目は既定値。
-        assert_eq!(imported.settings.clipboard_history.max_items, 100);
+        assert_eq!(imported.settings.clipboard_history.max_items, 1000);
         // 書き出し用の印は settings.json に入れない。利用者の項目は残す。
         let root = imported.root.as_object().unwrap();
         assert!(!root.contains_key("autostart"));

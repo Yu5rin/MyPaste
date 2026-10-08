@@ -37,7 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_DESTROY, WM_DPICHANGED,
 };
 
-use crate::clip_history::{self, MenuPosition, Trigger};
+use crate::clip_history::{self, MenuPosition, Theme as HistoryTheme, Trigger};
 use crate::config::{self, ClipboardHistorySettings, Settings};
 use crate::hotkey_rules;
 use crate::ime_indicator::{Params, Timing};
@@ -93,6 +93,7 @@ const ID_CH_CLEAR: i32 = 151;
 const ID_CH_WIDTH: i32 = 152;
 const ID_CH_OPACITY: i32 = 153;
 const ID_CH_PAGE: i32 = 154;
+const ID_CH_THEME: i32 = 155;
 const ID_EXPORT: i32 = 160;
 const ID_IMPORT: i32 = 161;
 
@@ -158,7 +159,7 @@ const ITEMS: &[Item] = &[
     item(235, Kind::Label, "秒以内（0.2〜1）", 692, 154, 200, 24),
     item(236, Kind::Label, "覚えておく件数", 492, 186, 120, 24),
     item(ID_CH_MAX, Kind::NumberEdit, "", 616, 186, 70, 24),
-    item(237, Kind::Label, "件（10〜100）", 692, 186, 200, 24),
+    item(237, Kind::Label, "件（10〜10000）", 692, 186, 200, 24),
     item(238, Kind::Label, "一覧を出す位置", 492, 218, 120, 24),
     item(ID_CH_POSITION, Kind::Combo, "", 616, 218, 200, 200),
     item(242, Kind::Label, "一覧の幅", 492, 250, 120, 24),
@@ -169,13 +170,15 @@ const ITEMS: &[Item] = &[
     item(245, Kind::Label, "%", 834, 250, 30, 24),
     item(246, Kind::Label, "1 ページの件数", 492, 282, 120, 24),
     item(ID_CH_PAGE, Kind::NumberEdit, "", 616, 282, 54, 24),
-    item(247, Kind::Label, "件（10〜40）", 674, 282, 160, 24),
+    item(247, Kind::Label, "件", 674, 282, 30, 24),
+    item(248, Kind::Label, "配色", 712, 282, 64, 24),
+    item(ID_CH_THEME, Kind::Combo, "", 784, 282, 140, 200),
     item(ID_CH_KEEP, Kind::Check, "アプリを終了しても履歴を残す（暗号化して保存）", 492, 312, 432, 22),
     item(239, Kind::Note, "一覧はクリックか矢印キーと Enter で選びます。一覧の上で Shift+ホイールを回すと不透明度を変えられます。パスワード管理ソフトなどの内容は記録しません。", 492, 338, 334, 58),
     item(ID_CH_CLEAR, Kind::Button, "履歴を消す", 834, 344, 90, 28),
     // 設定の書き出し・読み込み（右の列）
     item(240, Kind::Group, "設定の書き出し・読み込み（PC の引っ越しに）", 480, 410, 456, 116),
-    item(241, Kind::Note, "保存済みの設定・キー割り当て・自動起動の状態を 1 つのファイルにまとめます。新しい PC では、このアプリを置いてから「読み込む」を押します（履歴の中身は含めません）。", 492, 432, 432, 52),
+    item(241, Kind::Note, "保存済みの設定・キー割り当て・定型文・自動起動の状態を 1 つのファイルにまとめます。新しい PC では、このアプリを置いてから「読み込む」を押します（履歴の中身は含めません）。", 492, 432, 432, 52),
     item(ID_EXPORT, Kind::Button, "設定を書き出す...", 492, 488, 150, 28),
     item(ID_IMPORT, Kind::Button, "設定を読み込む...", 650, 488, 150, 28),
     // 操作ボタン
@@ -261,6 +264,7 @@ unsafe fn thread_main(tx: Sender<TrayMessage>, settings: Settings, startup: bool
     ui::add_combo_items(hwnd, ID_CH_TRIGGER, Trigger::ALL.iter().map(|(_, _, name)| *name));
     ui::add_combo_items(hwnd, ID_CH_KEY, KEYS.iter().map(|(name, _)| *name));
     ui::add_combo_items(hwnd, ID_CH_POSITION, MenuPosition::ALL.iter().map(|(_, _, name)| *name));
+    ui::add_combo_items(hwnd, ID_CH_THEME, HistoryTheme::ALL.iter().map(|(_, _, name)| *name));
     fill_form(hwnd, &form);
     ui::place_window(hwnd, dpi, CLIENT_W, CLIENT_H);
     ui::layout(hwnd, ITEMS, dpi);
@@ -332,6 +336,8 @@ unsafe fn fill_history(hwnd: HWND, settings: &ClipboardHistorySettings) {
     set_text(hwnd, ID_CH_WIDTH, &config.width.to_string());
     set_text(hwnd, ID_CH_OPACITY, &config.opacity.to_string());
     set_text(hwnd, ID_CH_PAGE, &config.page_size.to_string());
+    let theme_index = HistoryTheme::ALL.iter().position(|(t, _, _)| *t == config.theme).unwrap_or(0);
+    set_combo_index(hwnd, ID_CH_THEME, theme_index);
     update_history_fields(hwnd);
 }
 
@@ -354,6 +360,7 @@ unsafe fn update_history_fields(hwnd: HWND) {
         ID_CH_WIDTH,
         ID_CH_OPACITY,
         ID_CH_PAGE,
+        ID_CH_THEME,
     ] {
         ui::set_enabled(hwnd, id, on);
     }
@@ -446,6 +453,10 @@ unsafe fn read_history(hwnd: HWND) -> Result<ClipboardHistorySettings, (i32, Str
         width,
         opacity,
         page_size,
+        theme: combo_index(hwnd, ID_CH_THEME)
+            .and_then(|i| HistoryTheme::ALL.get(i))
+            .map_or("system", |(t, _, _)| t.as_setting())
+            .to_string(),
     })
 }
 
