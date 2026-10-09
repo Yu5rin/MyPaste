@@ -17,7 +17,8 @@
 //! **別枠**であるため、普段の「新しい版があるか」の確認はこちらに寄せる。
 //! API を呼ぶのは Atom で新しい版が見つかったとき（添付ファイルの詳細・SHA256 が
 //! 要るとき）だけにし、それでも API が失敗した場合は、規則から組み立てられる
-//! ダウンロード URL で続行する（SHA256 の照合は省く）。
+//! ダウンロード URL と、リリースのページの添付ファイル一覧（`expanded_assets`）に
+//! 載っている SHA256 で続行する。
 //!
 //! 詳しい経緯は `/home/user/yu5rin/pane` リポジトリの `UpdateCheckLogic.cs` を参照
 //! （このリポジトリの実装は同じ考え方を Rust に移植したもの）。
@@ -107,7 +108,7 @@ pub fn atom_url_from_api_url(api_url: &str) -> Option<String> {
 ///
 /// GitHub API の未認証レート制限（1 時間 60 回・IP アドレス単位）に当たって
 /// 添付ファイルの詳細が取れなくても、ダウンロード URL は規則から組み立てられる。
-/// 引き換えに SHA256 は分からない（API からしか取れない）。組み立てた URL が
+/// SHA256 は [`build_expanded_assets_url`] の一覧から取る。組み立てた URL が
 /// 404 ならダウンロードに失敗するだけで、誤ったものが入ることはない。
 pub fn build_download_url(atom_url: &str, tag: &str, asset_name: &str) -> Option<String> {
     if tag.is_empty() || asset_name.is_empty() {
@@ -129,6 +130,62 @@ pub fn build_release_page_url(atom_url: &str, tag: &str) -> Option<String> {
     }
     let base = atom_url.strip_suffix(".atom")?;
     Some(format!("{base}/tag/{}", percent_encode_path_segment(tag)))
+}
+
+/// Atom フィードの URL から、あるタグの添付ファイル一覧（HTML の断片）の URL を組み立てる。
+/// 組み立てられなければ `None`。
+///
+/// ```text
+/// https://github.com/{owner}/{repo}/releases.atom
+///   → https://github.com/{owner}/{repo}/releases/expanded_assets/{tag}
+/// ```
+///
+/// リリースのページが添付ファイルの一覧を読み込むときに使う URL で、各ファイルの
+/// SHA256（`sha256:...`）が載っている。API と違い未認証のレート制限（1 時間 60 回）の
+/// 枠を使わないので、API が HTTP 403 を返すときの SHA256 の取得先にする。
+pub fn build_expanded_assets_url(atom_url: &str, tag: &str) -> Option<String> {
+    if tag.is_empty() {
+        return None;
+    }
+    let base = atom_url.strip_suffix(".atom")?;
+    Some(format!("{base}/expanded_assets/{}", percent_encode_path_segment(tag)))
+}
+
+/// 添付ファイル一覧の HTML から、`asset_name` の SHA256（小文字の 16 進 64 文字）を取り出す。
+/// 見つからない・1 つに決まらないときは `None`。
+///
+/// 一覧は添付ファイルごとに `<li>` で区切られている。`.../releases/download/{tag}/{asset_name}`
+/// へのリンクを含む `<li>` だけを見て、その中の `sha256:` に続く 64 文字を読む。
+/// その `<li>` の中に違う値が 2 つ以上あれば、取り違えを避けて `None` にする。
+pub fn extract_asset_sha256(html: &str, tag: &str, asset_name: &str) -> Option<String> {
+    if tag.is_empty() || asset_name.is_empty() {
+        return None;
+    }
+    let link = format!(
+        "/releases/download/{}/{}\"",
+        percent_encode_path_segment(tag),
+        percent_encode_path_segment(asset_name)
+    )
+    .to_ascii_lowercase();
+    let mut found: Option<String> = None;
+    for item in html.split("<li").skip(1) {
+        let item = item.split("</li>").next().unwrap_or(item);
+        if !item.to_ascii_lowercase().contains(&link) {
+            continue;
+        }
+        for (i, _) in item.match_indices("sha256:") {
+            let hex: String = item[i + "sha256:".len()..].chars().take(64).collect();
+            if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            let hex = hex.to_ascii_lowercase();
+            match &found {
+                Some(prev) if *prev != hex => return None,
+                _ => found = Some(hex),
+            }
+        }
+    }
+    found
 }
 
 /// 更新ファイルの取得先として許可する URL か。
@@ -647,5 +704,65 @@ mod tests {
              </entry>\n\
              </feed>";
         assert_eq!(extract_latest_tag_from_atom(xml), Some("v2.0.0".to_string()));
+    }
+
+    const SHA: &str = "d6e48f617ee8fcb14925ee60a62da9fe11dccd4db91395363f648275191e9c01";
+
+    fn asset_item(tag: &str, name: &str, sha: &str) -> String {
+        format!(
+            "<li class=\"Box-row\"><a href=\"/Yu5rin/MyPaste/releases/download/{tag}/{name}\" rel=\"nofollow\">\
+             <span class=\"text-bold\">{name}</span></a>\
+             <span class=\"Truncate-text\">sha256:{sha}</span>\
+             <clipboard-copy id=\"clipboard-button-sha256:{sha}\" value=\"sha256:{sha}\"></clipboard-copy></li>"
+        )
+    }
+
+    #[test]
+    fn builds_expanded_assets_url() {
+        assert_eq!(
+            build_expanded_assets_url("https://github.com/Yu5rin/MyPaste/releases.atom", "v1.6.0").as_deref(),
+            Some("https://github.com/Yu5rin/MyPaste/releases/expanded_assets/v1.6.0")
+        );
+        assert_eq!(build_expanded_assets_url("https://github.com/Yu5rin/MyPaste/releases.atom", ""), None);
+        assert_eq!(build_expanded_assets_url("https://github.com/Yu5rin/MyPaste/releases", "v1"), None);
+    }
+
+    #[test]
+    fn extracts_sha256_of_the_named_asset() {
+        let other = "1111111111111111111111111111111111111111111111111111111111111111";
+        let html = format!(
+            "<ul>{}{}<li class=\"Box-row\"><a href=\"/Yu5rin/MyPaste/archive/refs/tags/v1.6.0.zip\">Source code</a></li></ul>",
+            asset_item("v1.6.0", "other.exe", other),
+            asset_item("v1.6.0", "Atai-paste.exe", &SHA.to_ascii_uppercase()),
+        );
+        assert_eq!(extract_asset_sha256(&html, "v1.6.0", "Atai-paste.exe").as_deref(), Some(SHA));
+        assert_eq!(extract_asset_sha256(&html, "v1.6.0", "atai-paste.exe").as_deref(), Some(SHA));
+        assert_eq!(extract_asset_sha256(&html, "v1.6.0", "other.exe").as_deref(), Some(other));
+    }
+
+    #[test]
+    fn sha256_needs_the_right_tag_and_asset() {
+        let html = asset_item("v1.6.0", "Atai-paste.exe", SHA);
+        assert_eq!(extract_asset_sha256(&html, "v1.5.0", "Atai-paste.exe"), None);
+        assert_eq!(extract_asset_sha256(&html, "v1.6.0", "Atai-paste"), None);
+        assert_eq!(extract_asset_sha256(&html, "v1.6.0", "paste.exe"), None);
+        assert_eq!(extract_asset_sha256("", "v1.6.0", "Atai-paste.exe"), None);
+        assert_eq!(extract_asset_sha256(&html, "", "Atai-paste.exe"), None);
+    }
+
+    #[test]
+    fn sha256_rejects_missing_short_or_conflicting_values() {
+        // digest の無い添付ファイル
+        let no_digest = "<li><a href=\"/o/r/releases/download/v1/a.exe\">a.exe</a></li>";
+        assert_eq!(extract_asset_sha256(no_digest, "v1", "a.exe"), None);
+        // 64 文字に満たない・16 進でない
+        let short = "<li><a href=\"/o/r/releases/download/v1/a.exe\">a.exe</a>sha256:abc</li>";
+        assert_eq!(extract_asset_sha256(short, "v1", "a.exe"), None);
+        // 同じ添付ファイルの中に違う値が 2 つ
+        let other = "2222222222222222222222222222222222222222222222222222222222222222";
+        let conflict = format!(
+            "<li><a href=\"/o/r/releases/download/v1/a.exe\">a.exe</a>sha256:{SHA} sha256:{other}</li>"
+        );
+        assert_eq!(extract_asset_sha256(&conflict, "v1", "a.exe"), None);
     }
 }

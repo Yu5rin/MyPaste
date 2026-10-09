@@ -203,10 +203,10 @@ impl From<http::HttpError> for CheckError {
 ///   URL・SHA256）を取りに API を呼ぶ。呼ぶ頻度が「更新があったとき」だけに
 ///   なるので、上限に当たる見込みはほぼ無くなる。
 /// - その API が失敗しても（403 を含む）、Atom で新しい版があると分かって
-///   いれば、ダウンロード URL は規則から組み立てて続行する
-///   （[`update_logic::build_download_url`]）。引き換えに SHA256 は分からない
-///   （API からしか取れない）ため検証を省略する。HTTPS で取得している以上、
-///   それで防げるのは転送中の破損までであり、改ざんそのものへの防御ではない。
+///   いれば、ダウンロード URL は規則から組み立てる（[`update_logic::build_download_url`]）。
+///   SHA256 は、リリースのページが読み込む添付ファイルの一覧（`expanded_assets`。
+///   API のレート制限の枠を使わない）から取る（[`sha256_from_release_page`]）。
+///   そこでも取れなければ、検証できないものは入れずに、今回の更新を見送る。
 ///
 /// Atom フィードが読めない・配布元が GitHub 以外に差し替えられているなどの
 /// 場合は、従来どおり API だけで確認する。
@@ -272,10 +272,18 @@ pub fn check(settings: &Settings) -> Result<Option<Available>, CheckError> {
                 )));
             };
 
-            let sha256 = asset.digest.as_ref().and_then(|d| {
-                d.strip_prefix("sha256:")
-                    .map(|h| h.trim().to_ascii_lowercase())
-            });
+            let sha256 = asset
+                .digest
+                .as_ref()
+                .and_then(|d| {
+                    d.strip_prefix("sha256:")
+                        .map(|h| h.trim().to_ascii_lowercase())
+                })
+                .or_else(|| {
+                    // API に digest が無ければ、リリースのページの一覧からも探す。
+                    let atom_url = atom_url.as_deref()?;
+                    sha256_from_release_page(atom_url, &release.tag_name, &settings.update.asset_name)
+                });
 
             Ok(Some(Available {
                 version: latest,
@@ -290,21 +298,31 @@ pub fn check(settings: &Settings) -> Result<Option<Available>, CheckError> {
         }
         Err(e) => {
             // API が使えなかった。Atom で新しい版が分かっていれば、規則から
-            // ダウンロード URL を組み立てて続行する（SHA256 の照合は省く）。
+            // ダウンロード URL を組み立て、SHA256 はリリースのページの一覧から取って続行する。
+            // SHA256 が取れなければ、検証できないものは入れずに今回は見送る。
             if let (Some((version, tag)), Some(atom_url)) = (&known_newer, &atom_url) {
                 if let Some(download_url) =
                     update_logic::build_download_url(atom_url, tag, &settings.update.asset_name)
                 {
-                    log::warn!(
-                        "更新確認 API に失敗しましたが（{e}）、Atom で判明した新しい版 {tag} の \
-                         ダウンロード URL を組み立てて続行します（SHA256 の照合は省略されます）"
+                    let Some(sha256) =
+                        sha256_from_release_page(atom_url, tag, &settings.update.asset_name)
+                    else {
+                        log::warn!(
+                            "更新確認 API に失敗し（{e}）、リリースのページからも新しい版 {tag} の \
+                             SHA256 を取れなかったため、今回の更新は見送ります"
+                        );
+                        return Err(CheckError::from(e));
+                    };
+                    log::info!(
+                        "更新確認 API に失敗したため（{e}）、Atom で判明した新しい版 {tag} の \
+                         ダウンロード URL を組み立て、SHA256 はリリースのページから取りました"
                     );
                     let page_url = update_logic::build_release_page_url(atom_url, tag)
                         .unwrap_or_else(|| settings.update.releases_page.clone());
                     return Ok(Some(Available {
                         version: *version,
                         download_url,
-                        sha256: None,
+                        sha256: Some(sha256),
                         page_url,
                     }));
                 }
@@ -312,6 +330,27 @@ pub fn check(settings: &Settings) -> Result<Option<Available>, CheckError> {
             Err(CheckError::from(e))
         }
     }
+}
+
+/// リリースのページが読み込む添付ファイルの一覧（`expanded_assets`）から、
+/// `asset_name` の SHA256 を取る。取れなければ `None`（理由はログに残す）。
+///
+/// GitHub API の未認証レート制限（1 時間 60 回・IP アドレス単位）とは別枠なので、
+/// 会社などの共有回線で API が HTTP 403 を返すときでも読めることが多い。
+fn sha256_from_release_page(atom_url: &str, tag: &str, asset_name: &str) -> Option<String> {
+    let url = update_logic::build_expanded_assets_url(atom_url, tag)?;
+    let body = match http::get(&url, Some("text/html"), CHECK_TIMEOUT_MS, |_, _| {}) {
+        Ok(body) => body,
+        Err(e) => {
+            log::warn!("リリースのページの添付ファイル一覧を取得できませんでした: {e}");
+            return None;
+        }
+    };
+    let sha256 = update_logic::extract_asset_sha256(&String::from_utf8_lossy(&body), tag, asset_name);
+    if sha256.is_none() {
+        log::warn!("リリースのページの添付ファイル一覧に {asset_name} の SHA256 がありませんでした");
+    }
+    sha256
 }
 
 /// 更新ファイルをダウンロードし、SHA256 が判っていれば検証する。
