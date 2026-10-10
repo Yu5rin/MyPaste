@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-10-10
+
 ### 追加
 - 動いている間も、6 時間おきに新しい版を確かめる（設定画面の「動いている間も 6 時間おきに確認する」。
   `settings.json` の `update.check_every_hours` で間隔を変えられる）。PC を一日中つけたままでも
@@ -423,6 +425,7 @@ UX と品質の総点検で見つかった問題への対応。
 - ON/OFF 切替は右クリックメニューから行う（左クリックによるトグルは `tray-item` の制約により非対応）。
 - 他ソフトとのキー競合は対象外。
 
+[1.7.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.7.0
 [1.6.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.6.0
 [1.5.1]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.5.1
 [1.5.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.5.0
