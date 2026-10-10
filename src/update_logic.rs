@@ -411,6 +411,84 @@ fn percent_encode_path_segment(s: &str) -> String {
     out
 }
 
+/// 新しい版が見つかったときの動き（設定画面の「新しい版が出たら」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateMode {
+    /// 「今すぐ更新しますか？」と尋ねてから更新する（既定）。
+    Ask,
+    /// 尋ねずに更新する。操作の途中で再起動しないよう、しばらく操作が無いときに入れ替える。
+    Auto,
+    /// 新しい版が出たことを知らせるだけ（更新はトレイメニューの「更新を確認」から）。
+    Notify,
+}
+
+impl UpdateMode {
+    /// 設定ファイルの値・画面の表示名との対応（画面の並び順）。
+    pub const ALL: [(UpdateMode, &'static str, &'static str); 3] = [
+        (UpdateMode::Ask, "ask", "尋ねてから更新する"),
+        (UpdateMode::Auto, "auto", "尋ねずに更新する"),
+        (UpdateMode::Notify, "notify", "知らせるだけ"),
+    ];
+
+    /// 設定ファイルの値から。知らない値なら既定（尋ねてから更新）。
+    pub fn from_setting(value: &str) -> UpdateMode {
+        let value = value.trim();
+        Self::ALL
+            .iter()
+            .find(|(_, name, _)| name.eq_ignore_ascii_case(value))
+            .map(|(mode, _, _)| *mode)
+            .unwrap_or(UpdateMode::Ask)
+    }
+
+    /// 設定ファイルに書く値。
+    pub fn as_setting(self) -> &'static str {
+        Self::ALL.iter().find(|(m, _, _)| *m == self).map(|(_, n, _)| *n).unwrap_or("ask")
+    }
+}
+
+/// 更新の確認のきっかけ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    /// 起動したとき。
+    Startup,
+    /// 動いている間の定期的な確認。
+    Periodic,
+    /// トレイメニューの「更新を確認」。
+    Manual,
+}
+
+/// 新しい版が見つかったときにすること。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// 「今すぐ更新しますか？」と尋ねる。
+    Ask,
+    /// 尋ねずに更新する。
+    Install,
+    /// 新しい版が出たことを知らせる。
+    Notify,
+    /// 何もしない（この版は、動いている間にもう尋ねた・知らせた）。
+    Nothing,
+}
+
+/// 新しい版 `found` が見つかったときにすることを決める。
+///
+/// - 利用者がメニューから確かめたときは、どの設定でも尋ねる（更新したくて押しているため）。
+/// - 定期的な確認では、動いている間にすでに尋ねた（見送られた）・知らせた版
+///   （`already_offered`）を、もう一度は出さない（数時間おきに同じことを聞かないように）。
+pub fn decide(mode: UpdateMode, trigger: Trigger, found: Version, already_offered: Option<Version>) -> Decision {
+    if trigger == Trigger::Manual {
+        return Decision::Ask;
+    }
+    if trigger == Trigger::Periodic && already_offered.is_some_and(|v| v >= found) {
+        return Decision::Nothing;
+    }
+    match mode {
+        UpdateMode::Ask => Decision::Ask,
+        UpdateMode::Auto => Decision::Install,
+        UpdateMode::Notify => Decision::Notify,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -764,5 +842,43 @@ mod tests {
             "<li><a href=\"/o/r/releases/download/v1/a.exe\">a.exe</a>sha256:{SHA} sha256:{other}</li>"
         );
         assert_eq!(extract_asset_sha256(&conflict, "v1", "a.exe"), None);
+    }
+
+    fn v(text: &str) -> Version {
+        Version::parse(text).unwrap()
+    }
+
+    #[test]
+    fn update_mode_round_trip() {
+        for (mode, name, _) in UpdateMode::ALL {
+            assert_eq!(UpdateMode::from_setting(name), mode);
+            assert_eq!(mode.as_setting(), name);
+        }
+        assert_eq!(UpdateMode::from_setting(" AUTO "), UpdateMode::Auto);
+        assert_eq!(UpdateMode::from_setting(""), UpdateMode::Ask);
+        assert_eq!(UpdateMode::from_setting("unknown"), UpdateMode::Ask);
+    }
+
+    #[test]
+    fn decides_by_mode() {
+        let found = v("1.7.0");
+        assert_eq!(decide(UpdateMode::Ask, Trigger::Startup, found, None), Decision::Ask);
+        assert_eq!(decide(UpdateMode::Auto, Trigger::Startup, found, None), Decision::Install);
+        assert_eq!(decide(UpdateMode::Notify, Trigger::Periodic, found, None), Decision::Notify);
+        // メニューから確かめたときは、どの設定でも尋ねる。
+        for (mode, _, _) in UpdateMode::ALL {
+            assert_eq!(decide(mode, Trigger::Manual, found, Some(found)), Decision::Ask);
+        }
+    }
+
+    #[test]
+    fn periodic_check_does_not_repeat_the_same_version() {
+        let found = v("1.7.0");
+        assert_eq!(decide(UpdateMode::Ask, Trigger::Periodic, found, Some(found)), Decision::Nothing);
+        assert_eq!(decide(UpdateMode::Notify, Trigger::Periodic, found, Some(found)), Decision::Nothing);
+        // さらに新しい版が出たら、また尋ねる。
+        assert_eq!(decide(UpdateMode::Ask, Trigger::Periodic, v("1.7.1"), Some(found)), Decision::Ask);
+        // 起動したときは、前回の起動で見送った版でも尋ねる。
+        assert_eq!(decide(UpdateMode::Ask, Trigger::Startup, found, Some(found)), Decision::Ask);
     }
 }

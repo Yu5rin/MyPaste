@@ -174,6 +174,11 @@ impl SingleWindow {
         }));
     }
 
+    /// 画面が開いている（開いている途中・閉じている途中を含む）か。
+    pub fn is_open(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
     /// 作った画面を知らせる（手前に出す・閉じるときの宛先）。閉じたら `HWND::default()`。
     pub fn set_window(&self, hwnd: HWND) {
         self.window.store(hwnd.0 as isize, Ordering::SeqCst);

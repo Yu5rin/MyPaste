@@ -23,7 +23,8 @@
 //!   保存した内容はチャネルでメインスレッドへ送り、メインスレッドが反映する。
 //! - **更新スレッド**: 更新の確認・ダウンロード・適用を行う。通信が起動や
 //!   キー操作を妨げないよう、必ず別スレッドで実行する。多重実行の防止は
-//!   `update::run` 内部で行う。
+//!   `update::run` 内部で行う。動いている間の定期的な確認のきっかけは、
+//!   10 分おきに [`TrayMessage::UpdateTick`] を送る小さなスレッドが作る。
 
 // 本番（release）ビルドではコンソールウィンドウを出さない。
 // デバッグビルドではパニック出力などを確認できるよう残す。
@@ -65,6 +66,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{LPARAM, WPARAM};
+
+use update_logic::Trigger;
+
+/// 動いている間の更新確認の時刻かを確かめる間隔。
+const UPDATE_TICK: Duration = Duration::from_secs(10 * 60);
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK};
 
 /// タスクトレイのメニュー操作をメインスレッドへ伝えるメッセージ。
@@ -93,6 +99,8 @@ pub enum TrayMessage {
     HotkeysSaved(Vec<config::HotkeyRuleSetting>),
     /// 更新を確認（メニューからの手動操作）
     CheckUpdate,
+    /// 動いている間の定期的な更新確認の時刻か確かめる（10 分おき）
+    UpdateTick,
     /// 更新ファイルのダウンロード進捗（パーセント）
     UpdateProgress(u64),
     /// 更新処理が終わった（進捗表示を戻す）
@@ -194,7 +202,21 @@ fn main() {
     if settings.update.check_on_startup {
         let tx_update = tx.clone();
         let settings_for_update = settings.clone();
-        thread::spawn(move || update::run(settings_for_update, tx_update, false));
+        thread::spawn(move || update::run(settings_for_update, tx_update, Trigger::Startup));
+    }
+    update::announce_if_auto_updated(&settings);
+
+    // --- 動いている間の定期的な更新確認のきっかけ ---
+    // 間隔は設定（check_every_hours）と前回の確認の時刻で、メインスレッドが決める
+    // （設定を変えたらすぐ効き、スリープしていた間も時計で数える）。
+    {
+        let tx_tick = tx.clone();
+        thread::spawn(move || loop {
+            thread::sleep(UPDATE_TICK);
+            if tx_tick.send(TrayMessage::UpdateTick).is_err() {
+                break;
+            }
+        });
     }
 
     // --- メインループ: トレイのメニュー操作を処理 ---
@@ -265,6 +287,8 @@ fn main() {
                 settings.ime_indicator = saved.ime_indicator;
                 settings.log = saved.log;
                 settings.update.check_on_startup = saved.update.check_on_startup;
+                settings.update.check_every_hours = saved.update.check_every_hours;
+                settings.update.mode = saved.update.mode;
                 settings.clipboard_history = saved.clipboard_history;
                 apply_settings(&settings, &mut tray, ime_indicator.is_some());
             }
@@ -297,7 +321,16 @@ fn main() {
                 // 手動確認。結果（最新である／失敗した）もダイアログで知らせる。
                 let tx_update = tx.clone();
                 let settings_for_update = settings.clone();
-                thread::spawn(move || update::run(settings_for_update, tx_update, true));
+                thread::spawn(move || update::run(settings_for_update, tx_update, Trigger::Manual));
+            }
+            TrayMessage::UpdateTick => {
+                let hours = settings.update.check_every_hours;
+                if hours > 0 && !update::is_running() && config::should_check_now(hours) {
+                    log::info!("動いている間の更新確認（{hours} 時間おき）");
+                    let tx_update = tx.clone();
+                    let settings_for_update = settings.clone();
+                    thread::spawn(move || update::run(settings_for_update, tx_update, Trigger::Periodic));
+                }
             }
             TrayMessage::UpdateProgress(percent) => {
                 if let Err(e) = tray.set_progress(percent) {
@@ -343,11 +376,14 @@ fn log_startup(settings: &config::Settings) {
         log::info!("設定ファイル: {}", path.display());
     }
     log::info!(
-        "設定: キー {} / 対象アプリ {:?} / 入力モード表示 {} / 起動時の更新確認 {}",
+        "設定: キー {} / 対象アプリ {:?} / 入力モード表示 {} / 起動時の更新確認 {} / \
+         動いている間の更新確認 {} 時間おき（0 は確認しない） / 新しい版が出たら {}",
         settings.remap.hotkey,
         settings.remap.target_apps,
         if settings.ime_indicator.enabled { "ON" } else { "OFF" },
         if settings.update.check_on_startup { "ON" } else { "OFF" },
+        settings.update.check_every_hours,
+        update_logic::UpdateMode::from_setting(&settings.update.mode).as_setting(),
     );
 }
 

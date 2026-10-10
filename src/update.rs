@@ -1,7 +1,13 @@
 //! 更新の確認・ダウンロード・インストール。
 //!
-//! GitHub の Releases API から最新版を調べ、現在より新しければ利用者に確認したうえで
-//! 新しい実行ファイルへ置き換える。
+//! GitHub の Releases API から最新版を調べ、現在より新しければ、設定（`update.mode`）に
+//! 従って新しい実行ファイルへ置き換える。
+//!
+//! - 確認するのは、起動したとき（`check_on_startup`）、動いている間の数時間おき
+//!   （`check_every_hours`。きっかけはメインスレッドが作る）、メニューの「更新を確認」。
+//! - 新しい版が見つかったら、「尋ねてから更新」「尋ねずに更新」「知らせるだけ」のどれかを
+//!   行う（[`update_logic::decide`]）。尋ねずに更新するときは、ダウンロードを済ませてから、
+//!   しばらく操作が無く、編集中の画面も開いていないときに入れ替える（[`wait_until_idle`]）。
 //!
 //! ## 実行中の EXE を置き換える方法
 //!
@@ -29,11 +35,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use windows::core::PCWSTR;
+use windows::Win32::System::SystemInformation::GetTickCount;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO,
@@ -41,8 +51,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::{self, Settings};
-use crate::update_logic::{self, Version};
-use crate::{http, TrayMessage};
+use crate::update_logic::{self, Decision, Trigger, UpdateMode, Version};
+use crate::{history_window, hotkey_window, http, settings_window, snippet_window, TrayMessage};
+
+/// 尋ねずに更新したあと、新しい版を起動するときに付ける引数（起動したら更新したことを知らせる）。
+pub const AUTO_UPDATED_ARG: &str = "--auto-updated";
+
+/// 尋ねずに更新するとき、入れ替える前に要る「操作の無い時間」。
+const IDLE_BEFORE_AUTO_INSTALL: Duration = Duration::from_secs(120);
+/// 操作が無くなるのを待つ間の、確かめる間隔。
+const IDLE_POLL: Duration = Duration::from_secs(5);
+
+/// 動いている間にすでに尋ねた（見送られた）・知らせた版。定期的な確認で同じ版を
+/// 何度も出さないために覚えておく（アプリを起動し直すと忘れる）。
+static OFFERED: Mutex<Option<Version>> = Mutex::new(None);
 
 /// ダイアログのタイトル。
 const DIALOG_TITLE: &str = "アタイの貼り付け";
@@ -607,11 +629,12 @@ fn is_temp_update_file(name: &str) -> bool {
 
 /// 更新を確認し、必要ならインストールまで行う。別スレッドから呼ぶこと。
 ///
-/// - `manual` が `true`（メニューからの手動確認）のときは、最新である場合や
-///   失敗した場合にもダイアログで結果を知らせる。
-/// - `manual` が `false`（起動時の自動確認）のときは、更新が見つかったときだけ
-///   利用者に尋ね、それ以外は黙ってログに残す。
-pub fn run(settings: Settings, tx: Sender<TrayMessage>, manual: bool) {
+/// - メニューからの手動確認（[`Trigger::Manual`]）のときは、最新である場合や
+///   失敗した場合にもダイアログで結果を知らせ、新しい版があれば設定にかかわらず尋ねる。
+/// - 起動時・定期的な確認のときは、新しい版が見つかったときだけ設定（`update.mode`）に
+///   従って動き、それ以外は黙ってログに残す。
+pub fn run(settings: Settings, tx: Sender<TrayMessage>, trigger: Trigger) {
+    let manual = trigger == Trigger::Manual;
     // 起動時の自動確認と手動確認が同時に走らないようにする。既に実行中なら、
     // 手動操作のときだけその旨を知らせて何もしない（自動確認は黙って諦める）。
     let Some(_guard) = RunningGuard::acquire() else {
@@ -625,14 +648,19 @@ pub fn run(settings: Settings, tx: Sender<TrayMessage>, manual: bool) {
         return;
     };
 
-    if !manual {
-        // 起動時チェック。既定では毎回確認する（設定で間隔を空けられる）。
-        let interval = settings.update.check_interval_hours;
-        if !config::should_check_now(interval) {
-            log::info!("前回の確認から {interval} 時間経っていないため、更新確認を省略しました");
-            return;
+    match trigger {
+        Trigger::Startup => {
+            // 起動時チェック。既定では毎回確認する（設定で間隔を空けられる）。
+            let interval = settings.update.check_interval_hours;
+            if !config::should_check_now(interval) {
+                log::info!("前回の確認から {interval} 時間経っていないため、更新確認を省略しました");
+                return;
+            }
+            config::mark_checked();
         }
-        config::mark_checked();
+        // 間隔はメインスレッドで確かめてある。
+        Trigger::Periodic => config::mark_checked(),
+        Trigger::Manual => {}
     }
 
     let found = match check(&settings) {
@@ -680,7 +708,37 @@ pub fn run(settings: Settings, tx: Sender<TrayMessage>, manual: bool) {
         return;
     };
 
-    // 更新が見つかった。インストールしてよいか尋ねる。
+    let mode = UpdateMode::from_setting(&settings.update.mode);
+    let offered = *OFFERED.lock().unwrap_or_else(|p| p.into_inner());
+    match update_logic::decide(mode, trigger, info.version, offered) {
+        Decision::Nothing => {
+            log::info!("新しい版 {} は、動いている間にすでに知らせたため、今回は出しません", info.version);
+        }
+        Decision::Notify => {
+            remember_offered(info.version);
+            log::info!("新しい版 {} が出たことを知らせます", info.version);
+            message_box(
+                &format!(
+                    "新しいバージョン {} が出ています（現在 {}）。\n\n\
+                     更新するには、トレイメニューの「更新を確認」を選んでください。",
+                    info.version,
+                    Version::current()
+                ),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+        Decision::Ask => ask_and_install(&info, &tx),
+        Decision::Install => install_when_idle(&info, &tx),
+    }
+}
+
+/// 動いている間に尋ねた・知らせた版を覚えておく。
+fn remember_offered(version: Version) {
+    *OFFERED.lock().unwrap_or_else(|p| p.into_inner()) = Some(version);
+}
+
+/// 「今すぐ更新しますか？」と尋ね、「はい」なら更新する。
+fn ask_and_install(info: &Available, tx: &Sender<TrayMessage>) {
     let answer = message_box(
         &format!(
             "新しいバージョン {} があります（現在 {}）。\n\n\
@@ -693,6 +751,7 @@ pub fn run(settings: Settings, tx: Sender<TrayMessage>, manual: bool) {
     );
     if answer != IDYES.0 {
         log::info!("利用者が更新を見送りました");
+        remember_offered(info.version);
         return;
     }
     if SHUTTING_DOWN.load(Ordering::SeqCst) {
@@ -701,7 +760,7 @@ pub fn run(settings: Settings, tx: Sender<TrayMessage>, manual: bool) {
     }
 
     // ダウンロードと検証。
-    let downloaded = match download_and_verify(&info, &tx) {
+    let downloaded = match download_and_verify(info, tx) {
         Ok(p) => p,
         Err(e) => {
             log::error!("更新の取得に失敗しました: {e}");
@@ -716,13 +775,81 @@ pub fn run(settings: Settings, tx: Sender<TrayMessage>, manual: bool) {
             return;
         }
     };
+    install_and_restart(info, &downloaded, tx, false);
+}
 
+/// 尋ねずに更新する。ダウンロードと検証を済ませてから、操作が無いときに入れ替える。
+/// 失敗しても画面には出さず、ログに残すだけにする（次の確認で、また試す）。
+fn install_when_idle(info: &Available, tx: &Sender<TrayMessage>) {
+    log::info!("新しい版 {} を、尋ねずに更新します（ダウンロードを始めます）", info.version);
+    let downloaded = match download_and_verify(info, tx) {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("更新の取得に失敗しました（次の確認で、また試します）: {e}");
+            let _ = tx.send(TrayMessage::UpdateFinished);
+            return;
+        }
+    };
+    // 待っている間は、トレイの進捗表示を戻しておく。
+    let _ = tx.send(TrayMessage::UpdateFinished);
+    if !wait_until_idle() {
+        log::info!("アプリの終了中のため、更新しません");
+        let _ = std::fs::remove_file(&downloaded);
+        return;
+    }
+    install_and_restart(info, &downloaded, tx, true);
+}
+
+/// しばらく操作が無く、編集中の画面も開いていなくなるまで待つ。アプリの終了が始まったら
+/// `false`。待っている間は、終了のときに待たせない（入れ替えはまだ始めていない）。
+fn wait_until_idle() -> bool {
+    let was_waiting = WAITING_FOR_USER.swap(true, Ordering::SeqCst);
+    let mut logged = false;
+    let ready = loop {
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            break false;
+        }
+        let windows_open = settings_window::is_open()
+            || hotkey_window::is_open()
+            || snippet_window::is_open()
+            || history_window::is_open();
+        if !windows_open && idle_time() >= IDLE_BEFORE_AUTO_INSTALL {
+            break true;
+        }
+        if !logged {
+            log::info!("操作が {} 秒ほど無くなるまで、入れ替えを待ちます", IDLE_BEFORE_AUTO_INSTALL.as_secs());
+            logged = true;
+        }
+        std::thread::sleep(IDLE_POLL);
+    };
+    WAITING_FOR_USER.store(was_waiting, Ordering::SeqCst);
+    ready && !SHUTTING_DOWN.load(Ordering::SeqCst)
+}
+
+/// 最後にキーボード・マウスを操作してからの時間。
+fn idle_time() -> Duration {
+    let mut info = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    unsafe {
+        if !GetLastInputInfo(&mut info).as_bool() {
+            return Duration::ZERO;
+        }
+        // GetTickCount は約 49.7 日で一周するので、引き算は折り返しを考えて行う。
+        Duration::from_millis(u64::from(GetTickCount().wrapping_sub(info.dwTime)))
+    }
+}
+
+/// ダウンロードしたファイルで入れ替え、新しい版を起動して自分は終了する。
+/// `auto` なら、新しい版に「尋ねずに更新した」ことを伝える（起動したら知らせる）。
+fn install_and_restart(info: &Available, downloaded: &Path, tx: &Sender<TrayMessage>, auto: bool) {
     // 入れ替え。
-    let installed = match install(&downloaded) {
+    let installed = match install(downloaded) {
         Ok(p) => p,
         Err(e) => {
             log::error!("更新の適用に失敗しました: {e}");
-            let _ = std::fs::remove_file(&downloaded);
+            let _ = std::fs::remove_file(downloaded);
             // 自動で置き換えられない場合（書き込み権限が無いなど）は、
             // 手動で入れ替えられるようリリースページを開く。
             let summary = "更新を適用できませんでした。リリースページを開きますので、\
@@ -733,15 +860,17 @@ pub fn run(settings: Settings, tx: Sender<TrayMessage>, manual: bool) {
             return;
         }
     };
-    let _ = std::fs::remove_file(&downloaded);
+    let _ = std::fs::remove_file(downloaded);
 
     // 新しい実行ファイルを起動して、自分は終了する。
     // 新しい版は二重起動の防止に掛かるので、更新後の起動であることを伝え、
     // こちらが終わるのを待ってもらう。
-    match std::process::Command::new(&installed)
-        .arg(crate::single_instance::AFTER_UPDATE_ARG)
-        .spawn()
-    {
+    let mut command = std::process::Command::new(&installed);
+    command.arg(crate::single_instance::AFTER_UPDATE_ARG);
+    if auto {
+        command.arg(AUTO_UPDATED_ARG);
+    }
+    match command.spawn() {
         Ok(_) => {
             log::info!("新しいバージョンを起動しました。終了します");
             let _ = tx.send(TrayMessage::Quit);
@@ -754,6 +883,25 @@ pub fn run(settings: Settings, tx: Sender<TrayMessage>, manual: bool) {
             let _ = tx.send(TrayMessage::UpdateFinished);
         }
     }
+}
+
+/// 尋ねずに更新したあとの起動なら、更新したことを知らせる（別スレッドで出し、起動を止めない）。
+pub fn announce_if_auto_updated(settings: &Settings) {
+    if !std::env::args().any(|a| a == AUTO_UPDATED_ARG) {
+        return;
+    }
+    log::info!("尋ねずに更新したあとの起動です");
+    let page = settings.update.releases_page.clone();
+    std::thread::spawn(move || {
+        message_box(
+            &format!(
+                "アタイの貼り付けを、新しいバージョン {} に更新しました。\n\n\
+                 変更点は、リリースページで確かめられます。\n{page}",
+                Version::current()
+            ),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    });
 }
 
 /// 既定のブラウザで URL を開く。

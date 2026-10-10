@@ -85,6 +85,11 @@ thread_local! {
 /// 開いている定型文の画面。
 static WINDOW: SingleWindow = SingleWindow::new();
 
+/// 画面が開いているか（尋ねずに更新するとき、編集中に再起動しないように確かめる）。
+pub fn is_open() -> bool {
+    WINDOW.is_open()
+}
+
 /// 定型文の画面を開く。すでに開いていれば手前に出す。定型文は settings.json から読み直す
 /// （履歴の一覧から登録したものも出すため）。
 pub fn open() {

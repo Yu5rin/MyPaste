@@ -148,6 +148,11 @@ thread_local! {
 /// 開いているキー割り当て画面。
 static WINDOW: SingleWindow = SingleWindow::new();
 
+/// 画面が開いているか（尋ねずに更新するとき、編集中に再起動しないように確かめる）。
+pub fn is_open() -> bool {
+    WINDOW.is_open()
+}
+
 /// キー割り当て画面を開く。すでに開いていれば手前に出す。
 ///
 /// `rules` は現在の割り当て。値貼り付けのキーは、保存するときに settings.json から読み直す。

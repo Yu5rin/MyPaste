@@ -216,6 +216,9 @@ impl Default for ImeIndicatorSettings {
     }
 }
 
+/// 動いている間に更新を確認する間隔の既定（時間）。
+pub const DEFAULT_CHECK_EVERY_HOURS: u64 = 6;
+
 /// 更新確認に関する設定。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -226,6 +229,11 @@ pub struct UpdateSettings {
     ///
     /// `0` なら**起動のたびに**確認する（既定）。`24` にすると 1 日 1 回までになる。
     pub check_interval_hours: u64,
+    /// 動いている間に確認する間隔（時間）。`0` なら動いている間は確認しない（既定 6）。
+    pub check_every_hours: u64,
+    /// 新しい版が見つかったときの動き。`"ask"`（尋ねてから更新・既定）/ `"auto"`（尋ねずに更新）/
+    /// `"notify"`（知らせるだけ）。
+    pub mode: String,
     /// GitHub Releases API のエンドポイント。
     pub api_url: String,
     /// 更新が見つかったときにブラウザで開くページ。
@@ -240,6 +248,8 @@ impl Default for UpdateSettings {
             check_on_startup: true,
             // 既定は 0 = 起動のたびに確認する。
             check_interval_hours: 0,
+            check_every_hours: DEFAULT_CHECK_EVERY_HOURS,
+            mode: "ask".to_string(),
             api_url: "https://api.github.com/repos/Yu5rin/MyPaste/releases/latest".to_string(),
             releases_page: "https://github.com/Yu5rin/MyPaste/releases/latest".to_string(),
             asset_name: "Atai-paste.exe".to_string(),
@@ -331,6 +341,8 @@ pub fn save_from_settings_window(settings: &Settings) -> Result<(), String> {
         },
         "update": {
             "check_on_startup": settings.update.check_on_startup,
+            "check_every_hours": settings.update.check_every_hours,
+            "mode": settings.update.mode,
         },
         "clipboard_history": settings.clipboard_history,
     }))

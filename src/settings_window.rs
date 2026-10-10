@@ -10,7 +10,8 @@
 //!   表示時間とフェードアウトの時間（秒）、大きさ、不透明度、全画面のアプリでは出さない
 //!   （プレビュー付き）
 //! - トラブル調査用の動作の記録（`log.txt`）の ON/OFF と「記録を開く」
-//! - 自動起動、起動時の更新確認
+//! - 自動起動、更新の確認（起動時・動いている間の数時間おき）と、新しい版が出たときの動き
+//!   （尋ねてから更新・尋ねずに更新・知らせるだけ）
 //! - クリップボードの履歴: ON/OFF、一覧を出す操作（キーの組み合わせ、Ctrl・Shift・Alt の
 //!   2 回押し）、2 回押しの間隔、覚えておく件数、一覧を出す位置、終了後も残すか、履歴を消す
 //! - 設定の書き出し・読み込み（PC の引っ越し用。キー割り当てと自動起動の状態も含む）
@@ -47,6 +48,7 @@ use crate::ime_logic::{
     OPACITY_MIN, SIZE_MAX, SIZE_MIN,
 };
 use crate::remap_logic::{self, Hotkey, KEYS};
+use crate::update_logic::UpdateMode;
 use crate::ui::{
     self, combo_index, get_text, is_checked, item, parse_in_range, report_invalid, set_checked,
     set_combo_index, set_text, show_message, wide, Item, Kind, SingleWindow, BN_CLICKED,
@@ -77,6 +79,8 @@ const ID_OPEN_LOG: i32 = 123;
 const ID_PREVIEW: i32 = 113;
 const ID_STARTUP: i32 = 120;
 const ID_UPDATE: i32 = 121;
+const ID_UPDATE_PERIODIC: i32 = 124;
+const ID_UPDATE_MODE: i32 = 125;
 const ID_OPEN_FOLDER: i32 = 130;
 const ID_DEFAULTS: i32 = 131;
 const ID_CH_ENABLED: i32 = 140;
@@ -143,11 +147,14 @@ const ITEMS: &[Item] = &[
     item(221, Kind::Label, "%（30〜100）", 216, 342, 130, 24),
     item(ID_FULLSCREEN, Kind::Check, "全画面のアプリ（ゲーム・動画・発表など）の間は表示しない", 24, 371, 428, 22),
     // 起動・更新・記録
-    item(220, Kind::Group, "起動・更新・記録", 12, 409, 456, 106),
+    item(220, Kind::Group, "起動・更新・記録", 12, 409, 456, 170),
     item(ID_STARTUP, Kind::Check, "Windows にサインインしたら自動で起動する", 24, 431, 428, 22),
     item(ID_UPDATE, Kind::Check, "起動時に新しいバージョンを確認する", 24, 458, 428, 22),
-    item(ID_LOG, Kind::Check, "トラブル調査用に動作を記録する（log.txt）", 24, 485, 330, 22),
-    item(ID_OPEN_LOG, Kind::Button, "記録を開く", 362, 482, 90, 28),
+    item(ID_UPDATE_PERIODIC, Kind::Check, "動いている間も 6 時間おきに確認する", 24, 485, 428, 22),
+    item(222, Kind::Label, "新しい版が出たら", 24, 513, 130, 24),
+    item(ID_UPDATE_MODE, Kind::Combo, "", 158, 513, 200, 200),
+    item(ID_LOG, Kind::Check, "トラブル調査用に動作を記録する（log.txt）", 24, 548, 330, 22),
+    item(ID_OPEN_LOG, Kind::Button, "記録を開く", 362, 545, 90, 28),
     // クリップボードの履歴（右の列）
     item(230, Kind::Group, "クリップボードの履歴", 480, 8, 456, 456),
     item(ID_CH_ENABLED, Kind::Check, "コピーした文字を記録して、一覧から選んで貼り付ける", 492, 30, 432, 22),
@@ -206,6 +213,9 @@ struct Form {
     ime: Params,
     startup: bool,
     check_update: bool,
+    /// 動いている間に確認する間隔（時間）。0 なら確認しない。
+    update_every_hours: u64,
+    update_mode: UpdateMode,
     log: bool,
     history: ClipboardHistorySettings,
 }
@@ -220,6 +230,8 @@ impl Form {
             ime: Params::from_settings(&settings.ime_indicator),
             startup,
             check_update: settings.update.check_on_startup,
+            update_every_hours: settings.update.check_every_hours,
+            update_mode: UpdateMode::from_setting(&settings.update.mode),
             log: settings.log.enabled,
             history: settings.clipboard_history.clone(),
         }
@@ -240,6 +252,11 @@ thread_local! {
 
 /// 開いている設定画面。
 static WINDOW: SingleWindow = SingleWindow::new();
+
+/// 画面が開いているか（尋ねずに更新するとき、編集中に再起動しないように確かめる）。
+pub fn is_open() -> bool {
+    WINDOW.is_open()
+}
 
 /// 設定画面を開く。すでに開いていれば手前に出す。
 ///
@@ -271,6 +288,7 @@ unsafe fn thread_main(tx: Sender<TrayMessage>, settings: Settings, startup: bool
     ui::add_combo_items(hwnd, ID_KEY, KEYS.iter().map(|(name, _)| *name));
     ui::add_combo_items(hwnd, ID_POSITION, Position::ALL.iter().map(|(_, _, name)| *name));
     ui::add_combo_items(hwnd, ID_THEME, Theme::ALL.iter().map(|(_, _, name)| *name));
+    ui::add_combo_items(hwnd, ID_UPDATE_MODE, UpdateMode::ALL.iter().map(|(_, _, name)| *name));
     ui::add_combo_items(hwnd, ID_CH_TRIGGER, Trigger::ALL.iter().map(|(_, _, name)| *name));
     ui::add_combo_items(hwnd, ID_CH_KEY, KEYS.iter().map(|(name, _)| *name));
     ui::add_combo_items(hwnd, ID_CH_POSITION, MenuPosition::ALL.iter().map(|(_, _, name)| *name));
@@ -314,6 +332,14 @@ unsafe fn fill_form(hwnd: HWND, form: &Form) {
     set_checked(hwnd, ID_FULLSCREEN, ime.hide_in_fullscreen);
     set_checked(hwnd, ID_STARTUP, form.startup);
     set_checked(hwnd, ID_UPDATE, form.check_update);
+    set_checked(hwnd, ID_UPDATE_PERIODIC, form.update_every_hours > 0);
+    set_text(
+        hwnd,
+        ID_UPDATE_PERIODIC,
+        &format!("動いている間も {} 時間おきに確認する", periodic_hours(form.update_every_hours)),
+    );
+    let mode_index = UpdateMode::ALL.iter().position(|(m, _, _)| *m == form.update_mode).unwrap_or(0);
+    set_combo_index(hwnd, ID_UPDATE_MODE, mode_index);
     set_checked(hwnd, ID_LOG, form.log);
     fill_history(hwnd, &form.history);
 }
@@ -512,6 +538,17 @@ unsafe fn read_form(hwnd: HWND) -> Result<Form, (i32, String)> {
         ime,
         startup: is_checked(hwnd, ID_STARTUP),
         check_update: is_checked(hwnd, ID_UPDATE),
+        update_every_hours: if is_checked(hwnd, ID_UPDATE_PERIODIC) {
+            let saved = CONTEXT.with(|c| {
+                c.borrow().as_ref().map_or(0, |context| context.settings.update.check_every_hours)
+            });
+            periodic_hours(saved)
+        } else {
+            0
+        },
+        update_mode: combo_index(hwnd, ID_UPDATE_MODE)
+            .and_then(|i| UpdateMode::ALL.get(i))
+            .map_or(UpdateMode::Ask, |(m, _, _)| *m),
         log: is_checked(hwnd, ID_LOG),
         history,
     })
@@ -707,6 +744,8 @@ unsafe fn on_save(hwnd: HWND) {
     settings.ime_indicator.hide_in_fullscreen = ime.hide_in_fullscreen;
     settings.log.enabled = form.log;
     settings.update.check_on_startup = form.check_update;
+    settings.update.check_every_hours = form.update_every_hours;
+    settings.update.mode = form.update_mode.as_setting().to_string();
     settings.clipboard_history = form.history;
 
     if let Err(e) = config::save_from_settings_window(&settings) {
@@ -913,6 +952,16 @@ unsafe fn on_preview(hwnd: HWND) {
             "入力モード表示が動いていないため、プレビューできません。アプリを起動し直してください。",
             MB_ICONINFORMATION,
         );
+    }
+}
+
+/// 動いている間に確認する間隔（時間）。設定ファイルで決めた間隔があればそれを、
+/// 無ければ（0 = 確認しない）既定の間隔を使う。
+fn periodic_hours(saved: u64) -> u64 {
+    if saved > 0 {
+        saved
+    } else {
+        config::DEFAULT_CHECK_EVERY_HOURS
     }
 }
 
