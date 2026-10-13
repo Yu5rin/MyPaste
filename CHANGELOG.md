@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-10-13
+
 ### 修正
 - `Program Files` など書き込めない場所に置き、「尋ねずに更新する」を選んでいると、6 時間おきの確認の
   たびに、更新ファイルをダウンロードし、操作が無くなるのを待ってから、入れ替えられずにエラーを出して
@@ -450,6 +452,7 @@ UX と品質の総点検で見つかった問題への対応。
 - ON/OFF 切替は右クリックメニューから行う（左クリックによるトグルは `tray-item` の制約により非対応）。
 - 他ソフトとのキー競合は対象外。
 
+[1.8.2]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.8.2
 [1.8.1]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.8.1
 [1.8.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.8.0
 [1.7.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.7.0
