@@ -63,7 +63,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::ImeIndicatorSettings;
-use crate::ime_logic::{self, ImeMode, ModeTracker, Position, Theme};
+use crate::ime_logic::{self, ImeMode, ModeTracker, Position, ReadabilityLog, Theme};
 
 /// IME の状態を調べる間隔（ミリ秒）。
 const POLL_INTERVAL_MS: u32 = 100;
@@ -297,8 +297,8 @@ struct State {
     font: Option<(HFONT, i32)>,
     /// 現在の一辺（実際のピクセル）。描画に使う。
     size: i32,
-    /// 前回、IME の状態を取れたか（取れる・取れないが変わったときだけ記録に残す）。
-    last_query_ok: Option<bool>,
+    /// IME の状態を取れたかの記録を、増やしすぎないための控え。
+    readability: ReadabilityLog,
 }
 
 /// 表示中の内容。
@@ -341,7 +341,7 @@ fn thread_main(ready: mpsc::Sender<u32>) {
                 showing: None,
                 font: None,
                 size: 0,
-                last_query_ok: None,
+                readability: ReadabilityLog::default(),
             })
         });
         WINDOW.store(hwnd.0 as isize, Ordering::SeqCst);
@@ -454,20 +454,14 @@ unsafe fn on_poll() {
         let state = s.as_mut()?;
         if !enabled {
             state.tracker.reset();
-            state.last_query_ok = None;
+            state.readability.reset();
             return None;
         }
-        let ok = observed.is_some();
-        if state.last_query_ok != Some(ok) {
-            state.last_query_ok = Some(ok);
-            if ok {
-                log::debug!("入力モード: IME の状態を読み取れるようになりました");
-            } else {
-                log::debug!(
-                    "入力モード: 前面のウィンドウ（{}）の IME の状態を読み取れません",
-                    crate::excel_check::foreground_process_name().unwrap_or_else(|| "不明".into())
-                );
-            }
+        let line = state.readability.observe(observed.is_some(), || {
+            crate::excel_check::foreground_process_name().unwrap_or_else(|| "不明".into())
+        });
+        if let Some(line) = line {
+            log::debug!("{line}");
         }
         state
             .tracker

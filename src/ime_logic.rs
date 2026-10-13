@@ -287,6 +287,53 @@ pub fn centered_origin(left: i32, top: i32, right: i32, bottom: i32, size: i32) 
     (x, y)
 }
 
+/// IME の状態を読み取れたか・読み取れなかったかの記録を、増やしすぎないための控え。
+///
+/// Excel や Outlook はウィンドウを切り替えるたびに一瞬だけ読み取れなくなるので、変わるたびに
+/// 記録すると、一日で何千行にもなり、ほかの記録を探しにくくなる。そこで、読み取れないことは
+/// **アプリごとに最初の 1 回だけ**記録し、読み取れるようになったことは記録しない
+/// （監視を始めて最初に読み取れたときだけ記録する）。
+#[derive(Debug, Default)]
+pub struct ReadabilityLog {
+    last_ok: Option<bool>,
+    /// 読み取れないことを、すでに記録したアプリ。
+    reported: Vec<String>,
+}
+
+/// 読み取れないことを記録したアプリを覚えておく数の上限（際限なく増えないように）。
+const MAX_REPORTED_APPS: usize = 200;
+
+impl ReadabilityLog {
+    /// 監視を止めたとき（入力モード表示を OFF にしたとき）。次に始めたときの最初の結果を記録する。
+    pub fn reset(&mut self) {
+        self.last_ok = None;
+    }
+
+    /// 読み取った結果を受け取り、記録する文があれば返す。`app` は前面のアプリの名前を返す
+    /// （読み取れなくなったときだけ呼ぶ）。
+    pub fn observe(&mut self, ok: bool, app: impl FnOnce() -> String) -> Option<String> {
+        let previous = self.last_ok.replace(ok);
+        if previous == Some(ok) {
+            return None;
+        }
+        if ok {
+            return previous
+                .is_none()
+                .then(|| "入力モード: IME の状態を読み取れます".to_string());
+        }
+        let app = app();
+        if self.reported.contains(&app) || self.reported.len() >= MAX_REPORTED_APPS {
+            return None;
+        }
+        let line = format!(
+            "入力モード: 前面のウィンドウ（{app}）の IME の状態を読み取れません\
+             （このアプリについては、以後は記録しません）"
+        );
+        self.reported.push(app);
+        Some(line)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,5 +523,34 @@ mod tests {
         assert_eq!(centered_origin(1920, 0, 3840, 1040, 120), (2820, 460));
         // 主モニターの左にある（座標が負）
         assert_eq!(centered_origin(-1920, 0, 0, 1080, 120), (-1020, 480));
+    }
+
+    #[test]
+    fn readability_log_reports_each_app_once() {
+        let mut log = ReadabilityLog::default();
+        assert_eq!(log.observe(true, || unreachable!()).as_deref(), Some("入力モード: IME の状態を読み取れます"));
+        assert_eq!(log.observe(true, || unreachable!()), None);
+        let first = log.observe(false, || "EXCEL.EXE".into()).unwrap();
+        assert!(first.contains("EXCEL.EXE"));
+        // 読み取れるようになったことは記録しない。同じアプリでまた読み取れなくなっても記録しない。
+        assert_eq!(log.observe(true, || unreachable!()), None);
+        assert_eq!(log.observe(false, || "EXCEL.EXE".into()), None);
+        assert_eq!(log.observe(false, || unreachable!()), None);
+        // 別のアプリは記録する。
+        assert_eq!(log.observe(true, || unreachable!()), None);
+        assert!(log.observe(false, || "OUTLOOK.EXE".into()).unwrap().contains("OUTLOOK.EXE"));
+        // 監視をやめて始め直したら、最初に読み取れたことを記録する。
+        log.reset();
+        assert!(log.observe(true, || unreachable!()).is_some());
+    }
+
+    #[test]
+    fn readability_log_has_a_limit() {
+        let mut log = ReadabilityLog::default();
+        for i in 0..MAX_REPORTED_APPS {
+            assert!(log.observe(false, || format!("APP{i}.EXE")).is_some());
+            log.observe(true, || unreachable!());
+        }
+        assert_eq!(log.observe(false, || "MORE.EXE".into()), None);
     }
 }

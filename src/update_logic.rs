@@ -466,6 +466,8 @@ pub enum Decision {
     Install,
     /// 新しい版が出たことを知らせる。
     Notify,
+    /// 実行ファイルのフォルダに書き込めず入れ替えられないので、手で置き換えるよう案内する。
+    ManualReplace,
     /// 何もしない（この版は、動いている間にもう尋ねた・知らせた）。
     Nothing,
 }
@@ -475,17 +477,30 @@ pub enum Decision {
 /// - 利用者がメニューから確かめたときは、どの設定でも尋ねる（更新したくて押しているため）。
 /// - 定期的な確認では、動いている間にすでに尋ねた（見送られた）・知らせた版
 ///   （`already_offered`）を、もう一度は出さない（数時間おきに同じことを聞かないように）。
-pub fn decide(mode: UpdateMode, trigger: Trigger, found: Version, already_offered: Option<Version>) -> Decision {
-    if trigger == Trigger::Manual {
-        return Decision::Ask;
-    }
-    if trigger == Trigger::Periodic && already_offered.is_some_and(|v| v >= found) {
+/// - 実行ファイルのフォルダに書き込めない（`can_install` が `false`。`Program Files` など）ときは、
+///   尋ねたり、ダウンロードしたりしても入れ替えられないので、手で置き換えるよう案内する
+///   （知らせるだけの設定なら、知らせるだけ）。
+pub fn decide(
+    mode: UpdateMode,
+    trigger: Trigger,
+    found: Version,
+    already_offered: Option<Version>,
+    can_install: bool,
+) -> Decision {
+    let wanted = if trigger == Trigger::Manual {
+        Decision::Ask
+    } else if trigger == Trigger::Periodic && already_offered.is_some_and(|v| v >= found) {
         return Decision::Nothing;
-    }
-    match mode {
-        UpdateMode::Ask => Decision::Ask,
-        UpdateMode::Auto => Decision::Install,
-        UpdateMode::Notify => Decision::Notify,
+    } else {
+        match mode {
+            UpdateMode::Ask => Decision::Ask,
+            UpdateMode::Auto => Decision::Install,
+            UpdateMode::Notify => Decision::Notify,
+        }
+    };
+    match wanted {
+        Decision::Ask | Decision::Install if !can_install => Decision::ManualReplace,
+        other => other,
     }
 }
 
@@ -862,23 +877,34 @@ mod tests {
     #[test]
     fn decides_by_mode() {
         let found = v("1.7.0");
-        assert_eq!(decide(UpdateMode::Ask, Trigger::Startup, found, None), Decision::Ask);
-        assert_eq!(decide(UpdateMode::Auto, Trigger::Startup, found, None), Decision::Install);
-        assert_eq!(decide(UpdateMode::Notify, Trigger::Periodic, found, None), Decision::Notify);
+        assert_eq!(decide(UpdateMode::Ask, Trigger::Startup, found, None, true), Decision::Ask);
+        assert_eq!(decide(UpdateMode::Auto, Trigger::Startup, found, None, true), Decision::Install);
+        assert_eq!(decide(UpdateMode::Notify, Trigger::Periodic, found, None, true), Decision::Notify);
         // メニューから確かめたときは、どの設定でも尋ねる。
         for (mode, _, _) in UpdateMode::ALL {
-            assert_eq!(decide(mode, Trigger::Manual, found, Some(found)), Decision::Ask);
+            assert_eq!(decide(mode, Trigger::Manual, found, Some(found), true), Decision::Ask);
         }
     }
 
     #[test]
     fn periodic_check_does_not_repeat_the_same_version() {
         let found = v("1.7.0");
-        assert_eq!(decide(UpdateMode::Ask, Trigger::Periodic, found, Some(found)), Decision::Nothing);
-        assert_eq!(decide(UpdateMode::Notify, Trigger::Periodic, found, Some(found)), Decision::Nothing);
+        assert_eq!(decide(UpdateMode::Ask, Trigger::Periodic, found, Some(found), true), Decision::Nothing);
+        assert_eq!(decide(UpdateMode::Notify, Trigger::Periodic, found, Some(found), true), Decision::Nothing);
         // さらに新しい版が出たら、また尋ねる。
-        assert_eq!(decide(UpdateMode::Ask, Trigger::Periodic, v("1.7.1"), Some(found)), Decision::Ask);
+        assert_eq!(decide(UpdateMode::Ask, Trigger::Periodic, v("1.7.1"), Some(found), true), Decision::Ask);
         // 起動したときは、前回の起動で見送った版でも尋ねる。
-        assert_eq!(decide(UpdateMode::Ask, Trigger::Startup, found, Some(found)), Decision::Ask);
+        assert_eq!(decide(UpdateMode::Ask, Trigger::Startup, found, Some(found), true), Decision::Ask);
+    }
+
+    #[test]
+    fn cannot_install_means_manual_replace() {
+        let found = v("1.7.0");
+        assert_eq!(decide(UpdateMode::Auto, Trigger::Periodic, found, None, false), Decision::ManualReplace);
+        assert_eq!(decide(UpdateMode::Ask, Trigger::Startup, found, None, false), Decision::ManualReplace);
+        assert_eq!(decide(UpdateMode::Notify, Trigger::Startup, found, None, false), Decision::Notify);
+        assert_eq!(decide(UpdateMode::Ask, Trigger::Manual, found, Some(found), false), Decision::ManualReplace);
+        // 一度案内した版は、定期的な確認では繰り返さない。
+        assert_eq!(decide(UpdateMode::Auto, Trigger::Periodic, found, Some(found), false), Decision::Nothing);
     }
 }

@@ -723,7 +723,31 @@ pub fn run(settings: Settings, tx: Sender<TrayMessage>, trigger: Trigger) {
 
     let mode = UpdateMode::from_setting(&settings.update.mode);
     let offered = *OFFERED.lock().unwrap_or_else(|p| p.into_inner());
-    match update_logic::decide(mode, trigger, info.version, offered) {
+    let install_dir = exe_dir();
+    let can_install = install_dir.as_deref().is_some_and(config::is_writable);
+    match update_logic::decide(mode, trigger, info.version, offered, can_install) {
+        Decision::ManualReplace => {
+            remember_offered(info.version);
+            log::info!(
+                "新しい版 {} がありますが、実行ファイルのフォルダに書き込めないため、手で置き換えるよう案内します",
+                info.version
+            );
+            let folder = install_dir.map(|d| d.display().to_string()).unwrap_or_default();
+            let answer = message_box(
+                &format!(
+                    "新しいバージョン {} があります（現在 {}）。\n\n\
+                     このアプリは書き込めないフォルダにあるため、自動では更新できません。\n{folder}\n\n\
+                     リリースページを開きますか？ アプリを終了してから、ダウンロードした\
+                     Atai-paste.exe で置き換えてください。",
+                    info.version,
+                    Version::current()
+                ),
+                MB_YESNO | MB_ICONINFORMATION,
+            );
+            if answer == IDYES.0 {
+                open_in_browser(&info.page_url);
+            }
+        }
         Decision::Nothing => {
             log::info!("新しい版 {} は、動いている間にすでに知らせたため、今回は出しません", info.version);
         }
@@ -743,6 +767,11 @@ pub fn run(settings: Settings, tx: Sender<TrayMessage>, trigger: Trigger) {
         Decision::Ask => ask_and_install(&info, &tx),
         Decision::Install => install_when_idle(&info, &tx),
     }
+}
+
+/// 実行ファイルのフォルダ（更新で入れ替える場所）。
+fn exe_dir() -> Option<PathBuf> {
+    Some(std::env::current_exe().ok()?.parent()?.to_path_buf())
 }
 
 /// 動いている間に尋ねた・知らせた版を覚えておく。
@@ -863,6 +892,8 @@ fn install_and_restart(info: &Available, downloaded: &Path, tx: &Sender<TrayMess
         Err(e) => {
             log::error!("更新の適用に失敗しました: {e}");
             let _ = std::fs::remove_file(downloaded);
+            // 動いている間の定期的な確認で、同じ版で何度も失敗して知らせないように。
+            remember_offered(info.version);
             // 自動で置き換えられない場合（書き込み権限が無いなど）は、
             // 手動で入れ替えられるようリリースページを開く。
             let summary = "更新を適用できませんでした。リリースページを開きますので、\
