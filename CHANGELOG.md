@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-10-13
+
 ### 修正
 - 起動したあとで実行ファイルを移動したり名前を変えたりすると、更新のときに「現在の実行ファイルを
   退避できません: 指定されたファイルが見つかりません。(os error 2)」と出ていた。原因が分かるよう、
@@ -439,6 +441,7 @@ UX と品質の総点検で見つかった問題への対応。
 - ON/OFF 切替は右クリックメニューから行う（左クリックによるトグルは `tray-item` の制約により非対応）。
 - 他ソフトとのキー競合は対象外。
 
+[1.8.1]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.8.1
 [1.8.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.8.0
 [1.7.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.7.0
 [1.6.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.6.0
