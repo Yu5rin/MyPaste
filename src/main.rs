@@ -119,6 +119,9 @@ fn main() {
     // 動作の記録は設定で ON にしたときだけ残す（開発用のビルドでは常に残す）。
     logging::set_enabled(settings.log.enabled);
     log_startup(&settings);
+    for note in config::take_migration_notes() {
+        log::info!("{note}");
+    }
 
     // 前回の更新で残った .old があれば削除する。
     update::cleanup_old();

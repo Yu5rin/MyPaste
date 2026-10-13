@@ -5,7 +5,7 @@
 //! - **開発時**: デバッグビルド（`debug_assertions`）または `--features devlog` を付けた
 //!   ビルドでは、設定にかかわらず常に記録する。デバッグビルドではコンソールにも出す。
 //!
-//! `log.txt` は `settings.json` と同じフォルダ（実行ファイルのフォルダ、書き込めなければ
+//! `log.txt` は `settings.json` と同じフォルダ（実行ファイルのフォルダの下の `data`、書き込めなければ
 //! `%LOCALAPPDATA%\Atai-paste`）に置く。1 MB を超えたら `log.old.txt` に回して作り直すので、
 //! 際限なく大きくはならない。
 //!

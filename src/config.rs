@@ -650,9 +650,21 @@ fn state_path() -> Option<PathBuf> {
     data_dir().map(|d| d.join(STATE_FILE))
 }
 
-/// 設定・状態を置くディレクトリ。
+/// 実行ファイルのフォルダに作る、設定・状態・記録を置くフォルダの名前。
+const DATA_FOLDER: &str = "data";
+
+/// 以前（実行ファイルと同じフォルダに置いていたころ）のファイルで、`data` フォルダへ移すもの。
+const LEGACY_FILES: [&str; 5] = [SETTINGS_FILE, STATE_FILE, CLIP_HISTORY_FILE, LOG_FILE, "log.old.txt"];
+
+/// 以前の場所から `data` フォルダへ移したときの記録（記録の準備ができる前に移すので、
+/// あとで [`take_migration_notes`] から取り出して記録に残す）。
+static MIGRATION_NOTES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// 設定・状態・記録を置くディレクトリ。
 ///
-/// ポータブル運用を優先して実行ファイルと同じフォルダを使う。ただし
+/// PC の引っ越しでフォルダごと持ち運べるよう、実行ファイルのフォルダの下の `data` フォルダを
+/// 使う（無ければ作る）。以前の版が実行ファイルと同じフォルダに置いたファイルは、初めてここを
+/// 決めたときに `data` フォルダへ移す（[`migrate_legacy_files`]）。
 /// `Program Files` 配下など書き込めない場所に置かれている場合は、
 /// `%LOCALAPPDATA%\Atai-paste` にフォールバックする。
 fn data_dir() -> Option<PathBuf> {
@@ -664,13 +676,39 @@ fn data_dir() -> Option<PathBuf> {
 
 fn find_data_dir() -> Option<PathBuf> {
     let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    if is_writable(&exe_dir) {
-        return Some(exe_dir);
+    let data = exe_dir.join(DATA_FOLDER);
+    if std::fs::create_dir_all(&data).is_ok() && is_writable(&data) {
+        migrate_legacy_files(&exe_dir, &data);
+        return Some(data);
     }
     let local = std::env::var_os("LOCALAPPDATA")?;
     let dir = PathBuf::from(local).join("Atai-paste");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
+}
+
+/// 以前の版が実行ファイルと同じフォルダ（`from`）に置いたファイルを、`data` フォルダ（`to`）へ移す。
+/// `to` に同じ名前のファイルがすでにあれば、そちらを使い、古い方はそのまま残す。
+/// 移せなかった（ほかのアプリが開いている など）ときは写しを作り、元は残す。
+fn migrate_legacy_files(from: &Path, to: &Path) {
+    let mut notes = MIGRATION_NOTES.lock().unwrap_or_else(|p| p.into_inner());
+    for name in LEGACY_FILES {
+        let old = from.join(name);
+        let new = to.join(name);
+        if !old.is_file() || new.exists() {
+            continue;
+        }
+        let result = std::fs::rename(&old, &new).or_else(|_| std::fs::copy(&old, &new).map(|_| ()));
+        notes.push(match result {
+            Ok(()) => format!("{name} を data フォルダへ移しました"),
+            Err(e) => format!("{name} を data フォルダへ移せませんでした: {e}"),
+        });
+    }
+}
+
+/// 以前の場所から `data` フォルダへ移したときの記録を取り出す（起動時に記録に残す）。
+pub fn take_migration_notes() -> Vec<String> {
+    std::mem::take(&mut *MIGRATION_NOTES.lock().unwrap_or_else(|p| p.into_inner()))
 }
 
 /// 指定ディレクトリに書き込めるかを、一時ファイルを作って確かめる。
