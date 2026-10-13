@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-10-13
+
 ### 変更
 - 設定（`settings.json`）・クリップボードの履歴（`clip_history.dat`）・動作の記録（`log.txt`）・
   更新の確認時刻（`update_state.json`）を、実行ファイルの下の `data` フォルダに置くようにした
@@ -431,6 +433,7 @@ UX と品質の総点検で見つかった問題への対応。
 - ON/OFF 切替は右クリックメニューから行う（左クリックによるトグルは `tray-item` の制約により非対応）。
 - 他ソフトとのキー競合は対象外。
 
+[1.8.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.8.0
 [1.7.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.7.0
 [1.6.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.6.0
 [1.5.1]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.5.1
