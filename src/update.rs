@@ -501,6 +501,18 @@ fn install(new_exe: &Path) -> Result<PathBuf, String> {
         ));
     }
 
+    // 起動したあとで実行ファイルが移された・名前を変えられたときは、Windows が教える
+    // 「自分のパス」は起動したときのままなので、そこにはもう無い。入れ替える先が分からない。
+    if !current.is_file() {
+        log::error!("起動したときの実行ファイルが見つかりません: {}", current.display());
+        return Err(format!(
+            "起動したあとで実行ファイルが移動されたか、名前が変わったため、入れ替える場所が\
+             分かりません。\n{}\n\n\
+             アプリを終了して、今の場所から起動し直してから、もう一度「更新を確認」してください。",
+            current.display()
+        ));
+    }
+
     let old = old_path(&current);
     let staged = staged_path(&current);
     // 前回の残骸があれば先に消しておく（残っていてもリネームは失敗する）。
@@ -515,7 +527,8 @@ fn install(new_exe: &Path) -> Result<PathBuf, String> {
     // 2) 実行中の EXE をリネーム（実行中でも可能）。
     if let Err(e) = std::fs::rename(&current, &old) {
         let _ = std::fs::remove_file(&staged);
-        return Err(format!("現在の実行ファイルを退避できません: {e}"));
+        log::error!("現在の実行ファイルを退避できません（{} → {}）: {e}", current.display(), old.display());
+        return Err(format!("現在の実行ファイルを退避できません: {e}\n{}", current.display()));
     }
 
     // 3) `.new` を本来の場所へリネーム。失敗したら 2 を巻き戻す。
