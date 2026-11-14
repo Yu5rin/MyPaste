@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-11-14
+
 全体を見直し、不具合の修正と、メニュー・画面の作り直しを行った。
 
 ### 変更
@@ -530,6 +532,7 @@ UX と品質の総点検で見つかった問題への対応。
 - ON/OFF 切替は右クリックメニューから行う（左クリックによるトグルは `tray-item` の制約により非対応）。
 - 他ソフトとのキー競合は対象外。
 
+[1.9.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.9.0
 [1.8.2]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.8.2
 [1.8.1]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.8.1
 [1.8.0]: https://github.com/Yu5rin/MyPaste/releases/tag/v1.8.0
