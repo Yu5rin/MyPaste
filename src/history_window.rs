@@ -40,8 +40,8 @@ use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::Ime::ImmAssociateContextEx;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, VK_APPS, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F10, VK_HOME,
-    VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
+    GetKeyState, SetFocus, VK_APPS, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F10, VK_HOME,
+    VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
@@ -53,7 +53,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HWND_TOPMOST, LB_GETITEMRECT, LB_ITEMFROMPOINT, LB_SETCOUNT, LB_SETCURSEL, LB_SETITEMHEIGHT,
     LWA_ALPHA, MA_NOACTIVATE, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SWP_NOACTIVATE,
     SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_CTLCOLORLISTBOX, WM_DRAWITEM,
+    PostMessageW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_CTLCOLORLISTBOX,
+    WM_DRAWITEM, WM_NULL,
     WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_PAINT, WM_QUIT, WM_RBUTTONUP, WM_SYSKEYDOWN, WNDCLASSW, WS_BORDER, WS_CHILD,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
@@ -491,7 +492,10 @@ unsafe fn run_loop(hwnd: HWND) {
         if ours && msg.message == WM_RBUTTONUP {
             let mut point = POINT::default();
             let _ = GetCursorPos(&mut point);
-            context_menu(hwnd, point);
+            // 行の外（見出しや、行の無い所）で押したときは、行に対する操作を選べなくする
+            // （前に選んだ行を、気づかずに消したりしないように）。
+            let on_row = msg.hwnd == list && row_at(list, msg.lParam).is_some();
+            context_menu(hwnd, point, on_row);
             continue;
         }
         let _ = TranslateMessage(&msg);
@@ -557,20 +561,32 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
     };
     let range = clip_history::page_range(page, count, page_size);
     let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+    let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+    let other_tab = with_state(|st| match st.tab {
+        Tab::History => Tab::Snippets,
+        Tab::Snippets => Tab::History,
+    })
+    .unwrap_or(Tab::History);
     match vk {
         v if v == VK_ESCAPE.0 => finish(None),
         v if v == VK_RETURN.0 => choose_current(),
         v if v == VK_UP.0 => move_to(current - 1),
         v if v == VK_DOWN.0 => move_to(current + 1),
+        // Ctrl を押していれば、全体の最初・最後へ。
+        v if v == VK_HOME.0 && ctrl => move_to(0),
+        v if v == VK_END.0 && ctrl => move_to(count as isize - 1),
         v if v == VK_HOME.0 => move_to(range.start as isize),
         v if v == VK_END.0 => move_to(range.end as isize - 1),
+        v if v == VK_TAB.0 => switch_tab(hwnd, other_tab),
+        // P でピン留めを切り替える（一覧では文字を入力しないので、文字のキーを使える）。
+        v if v == u16::from(b'P') && !ctrl => toggle_pin_current(hwnd),
         v if v == VK_PRIOR.0 => turn_page(hwnd, -1),
         v if v == VK_NEXT.0 => turn_page(hwnd, 1),
         v if v == VK_LEFT.0 => switch_tab(hwnd, Tab::History),
         v if v == VK_RIGHT.0 => switch_tab(hwnd, Tab::Snippets),
         v if v == VK_DELETE.0 => remove_current(hwnd),
         v if v == VK_APPS.0 || (v == VK_F10.0 && shift) => {
-            context_menu(hwnd, selected_row_point(hwnd));
+            context_menu(hwnd, selected_row_point(hwnd), true);
         }
         _ => return false,
     }
@@ -644,29 +660,43 @@ unsafe fn remove_current(hwnd: HWND) {
     }
 }
 
-/// 選んでいる履歴を定型文に登録する（すでに同じ本文があれば登録しない）。
+/// 選んでいる履歴を定型文に登録する。登録できないとき（すでに同じ本文がある・長すぎる・
+/// 件数の上限）は、その理由を画面に短く出す。
 unsafe fn register_current(hwnd: HWND) {
-    let registered = with_state(|st| {
+    let result = with_state(|st| {
         if st.tab != Tab::History {
             return None;
         }
         let text = st.selected().and_then(|pos| st.history.get(pos).map(|(t, _)| t.clone()))?;
-        let snippet = snippets::make("", &text).ok()?;
-        if st.snippets.iter().any(|s| s.text == snippet.text)
-            || st.snippets.len() >= snippets::MAX_SNIPPETS
-        {
-            return None;
+        // 定型文は貼り付けるときに {date} などを置き換えるので、履歴の文字にある { } は、
+        // そのまま貼り付けられるよう {{ }} にして登録する。
+        let escaped = text.replace('{', "{{").replace('}', "}}");
+        let Ok(snippet) = snippets::make("", &escaped) else {
+            return Some(Err("長すぎ"));
+        };
+        if st.snippets.iter().any(|s| s.text == snippet.text) {
+            return Some(Err("登録済み"));
         }
+        if st.snippets.len() >= snippets::MAX_SNIPPETS {
+            return Some(Err("上限"));
+        }
+        st.outcome.registered.push(snippet.text.clone());
         st.snippets.push(snippet);
-        st.outcome.registered.push(text);
         if st.places[1].0.is_none() {
             st.places[1].0 = Some(0);
         }
-        Some(())
+        Some(Ok(()))
     })
     .flatten();
-    if registered.is_some() {
-        show_page(hwnd);
+    match result {
+        Some(Ok(())) => {
+            crate::ime_indicator::notify("登録");
+            show_page(hwnd);
+        }
+        Some(Err(reason)) => {
+            crate::ime_indicator::notify(reason);
+        }
+        None => {}
     }
 }
 
@@ -690,11 +720,11 @@ unsafe fn toggle_pin_current(hwnd: HWND) {
 }
 
 /// 右クリックのメニューを出す。
-unsafe fn context_menu(hwnd: HWND, point: POINT) {
+unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
     let Some((tab, has_row, pinned)) = with_state(|st| {
         let pinned = st.tab == Tab::History
             && st.selected().and_then(|p| st.history.get(p)).is_some_and(|(_, p)| *p);
-        (st.tab, st.selected().is_some(), pinned)
+        (st.tab, on_row && st.selected().is_some(), pinned)
     }) else {
         return;
     };
@@ -702,20 +732,20 @@ unsafe fn context_menu(hwnd: HWND, point: POINT) {
         return;
     };
     let row_flag = if has_row { MF_STRING } else { MF_STRING | MF_GRAYED };
-    let _ = AppendMenuW(menu, row_flag, MENU_PASTE, w!("貼り付け(&P)"));
+    let _ = AppendMenuW(menu, row_flag, MENU_PASTE, w!("貼り付け(&V)\tEnter"));
     if tab == Tab::History {
         let pin_label = if pinned {
-            w!("ピン留めを外す(&I)")
+            w!("ピン留めを外す(&I)\tP")
         } else {
-            w!("ピン留めする(&I)")
+            w!("ピン留めする(&I)\tP")
         };
         let _ = AppendMenuW(menu, row_flag, MENU_PIN, pin_label);
         let _ = AppendMenuW(menu, row_flag, MENU_REGISTER, w!("定型文に登録(&T)"));
-        let _ = AppendMenuW(menu, row_flag, MENU_DELETE, w!("この履歴を消す(&D)"));
+        let _ = AppendMenuW(menu, row_flag, MENU_DELETE, w!("この履歴を削除(&D)\tDelete"));
     }
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, MENU_EDIT_SNIPPETS, w!("定型文の編集...(&E)"));
-    let _ = AppendMenuW(menu, MF_STRING, MENU_CLOSE, w!("閉じる(&C)"));
+    let _ = AppendMenuW(menu, MF_STRING, MENU_CLOSE, w!("閉じる(&C)\tEsc"));
     let chosen = TrackPopupMenuEx(
         menu,
         (TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN).0,
@@ -1089,10 +1119,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 with_state(|st| st.outcome.left_for_other_window = true);
                 finish(None);
             }
+            // これは「送られた」メッセージなので、待っているループは起きない。起こして閉じさせる。
+            let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
             LRESULT(0)
         }
         WM_CLOSE => {
             finish(None);
+            let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),

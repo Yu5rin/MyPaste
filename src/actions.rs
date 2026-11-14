@@ -701,7 +701,8 @@ unsafe fn paste_from_history(held: &Hotkey) {
         return;
     };
     // ほかのウィンドウをクリックして閉じたときは、そちらを使いたいので元のウィンドウに戻さない。
-    if !target.is_invalid() && !outcome.left_for_other_window {
+    // 定型文の編集を開くときも戻さない（戻すと、開いた画面が元のウィンドウの後ろに隠れる）。
+    if !target.is_invalid() && !outcome.left_for_other_window && !outcome.edit_snippets {
         let _ = SetForegroundWindow(target);
     }
     if let Some(opacity) = outcome.opacity {
@@ -793,10 +794,8 @@ fn register_snippets(texts: &[String]) {
     let mut list = snippets();
     let mut added = 0;
     for text in texts {
-        // 定型文は貼り付けるときに {date} などを置き換えるので、履歴の文字にある { } は、
-        // そのまま貼り付けられるよう {{ }} にしておく。
-        let escaped = text.replace('{', "{{").replace('}', "}}");
-        let Ok(snippet) = crate::snippets::make("", &escaped) else {
+        // 一覧の側で、{ } を {{ }} にしてある（そのまま貼り付けられるように）。
+        let Ok(snippet) = crate::snippets::make("", text) else {
             continue;
         };
         if list.len() >= crate::snippets::MAX_SNIPPETS || list.iter().any(|s| s.text == snippet.text) {
@@ -815,7 +814,6 @@ fn register_snippets(texts: &[String]) {
     }
     log::info!("履歴から定型文に {added} 件を登録しました");
     set_snippets(list);
-    ime_indicator::notify("登録");
 }
 
 /// 開いている一覧の表示（2 つ以上同時に開かない）。
