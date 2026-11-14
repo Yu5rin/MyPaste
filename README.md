@@ -808,7 +808,7 @@ src/
  ├ process_picker.rs // プロセス名を選ぶ画面（開いているアプリの一覧）
  ├ ui.rs            // 画面の共通部品（コントロールの配置・DPI 対応）
  ├ single_instance.rs // 二重起動の防止（名前付きミューテックス）
- ├ tray.rs          // タスクトレイ制御（tray-item）
+ ├ tray.rs          // タスクトレイ制御（アイコンとメニュー）
  ├ startup.rs       // 自動起動設定（スタートアップの .lnk 作成／削除）
  ├ ime_indicator.rs // 入力モードの表示（IME 状態の監視・表示ウィンドウ）
  ├ ime_logic.rs     // 入力モード表示の判断ロジック（Win32 非依存。Linux でもテスト可）

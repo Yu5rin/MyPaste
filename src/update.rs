@@ -958,27 +958,21 @@ fn install_and_restart(info: &Available, downloaded: &Path, tx: &Sender<TrayMess
     }
 }
 
-/// 尋ねずに更新したあとの起動なら、更新したことを知らせる（別スレッドで出し、起動を止めない）。
-pub fn announce_if_auto_updated(settings: &Settings) {
+/// 尋ねずに更新したあとの起動なら、知らせる文を返す（トレイの吹き出しで出す。作業を止めない）。
+pub fn auto_updated_notice() -> Option<String> {
     if !std::env::args().any(|a| a == AUTO_UPDATED_ARG) {
-        return;
+        return None;
     }
     log::info!("尋ねずに更新したあとの起動です");
-    let page = settings.update.releases_page.clone();
-    std::thread::spawn(move || {
-        message_box(
-            &format!(
-                "アタイの貼り付けを、新しいバージョン {} に更新しました。\n\n\
-                 変更点は、リリースページで確かめられます。\n{page}",
-                Version::current()
-            ),
-            MB_OK | MB_ICONINFORMATION,
-        );
-    });
+    Some(format!(
+        "新しいバージョン {} に更新しました。変更点は、トレイメニューの「使い方を開く」から\
+         リリースのページで確かめられます。",
+        Version::current()
+    ))
 }
 
 /// 既定のブラウザで URL を開く。
-fn open_in_browser(url: &str) {
+pub fn open_in_browser(url: &str) {
     let url_w: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
     let verb: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {

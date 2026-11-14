@@ -198,6 +198,11 @@ pub fn rules_enabled() -> bool {
 }
 
 /// キー割り当ての ON/OFF を反転し、反転後の状態を返す。
+/// キー割り当ての ON/OFF を決める（起動時と、設定を読み込んだとき）。
+pub fn set_rules_enabled(value: bool) {
+    RULES_ENABLED.store(value, Ordering::SeqCst);
+}
+
 pub fn toggle_rules() -> bool {
     !RULES_ENABLED.fetch_xor(true, Ordering::SeqCst)
 }

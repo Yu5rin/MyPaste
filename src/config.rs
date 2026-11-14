@@ -32,7 +32,7 @@ const STATE_FILE: &str = "update_state.json";
 const CLIP_HISTORY_FILE: &str = "clip_history.dat";
 
 /// 設定全体。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// キーリマップ（[`crate::keyboard`]）。
@@ -44,10 +44,27 @@ pub struct Settings {
     pub log: LogSettings,
     /// キー割り当て（[`crate::hotkey_rules`]）。上から順に調べる。
     pub hotkeys: Vec<HotkeyRuleSetting>,
+    /// キー割り当てを使うか（トレイメニューの「キー割り当て」）。
+    pub hotkeys_enabled: bool,
     /// クリップボードの履歴（[`crate::clip_history`]）。
     pub clipboard_history: ClipboardHistorySettings,
     /// 定型文（[`crate::snippets`]）。上から順に一覧に並べる。
     pub snippets: Vec<Snippet>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            remap: RemapSettings::default(),
+            update: UpdateSettings::default(),
+            ime_indicator: ImeIndicatorSettings::default(),
+            log: LogSettings::default(),
+            hotkeys: Vec::new(),
+            hotkeys_enabled: true,
+            clipboard_history: ClipboardHistorySettings::default(),
+            snippets: Vec::new(),
+        }
+    }
 }
 
 /// 定型文 1 つ分。
@@ -163,6 +180,8 @@ pub struct LogSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RemapSettings {
+    /// 値貼り付けを使うか（トレイメニューの「値貼り付け」）。
+    pub enabled: bool,
     /// 値貼り付けを起動するキーの組み合わせ（例 `"Ctrl+B"`）。
     /// 書き方は [`crate::remap_logic::Hotkey::parse`] を参照。
     pub hotkey: String,
@@ -173,6 +192,7 @@ pub struct RemapSettings {
 impl Default for RemapSettings {
     fn default() -> Self {
         Self {
+            enabled: true,
             hotkey: crate::remap_logic::DEFAULT_HOTKEY.to_string(),
             target_apps: vec![crate::remap_logic::DEFAULT_TARGET_APP.to_string()],
         }
@@ -313,6 +333,21 @@ impl Settings {
 }
 
 /// IME 入力モード表示の ON/OFF だけを `settings.json` に書き込む（トレイメニューから使う）。
+/// 値貼り付けの ON/OFF だけを書き込む（トレイメニューで切り替えたとき）。
+pub fn save_remap_enabled(enabled: bool) -> Result<(), String> {
+    save_patch(&serde_json::json!({ "remap": { "enabled": enabled } }))
+}
+
+/// キー割り当ての ON/OFF だけを書き込む（トレイメニューで切り替えたとき）。
+pub fn save_hotkeys_enabled(enabled: bool) -> Result<(), String> {
+    save_patch(&serde_json::json!({ "hotkeys_enabled": enabled }))
+}
+
+/// クリップボードの履歴の ON/OFF だけを書き込む（トレイメニューで切り替えたとき）。
+pub fn save_clipboard_history_enabled(enabled: bool) -> Result<(), String> {
+    save_patch(&serde_json::json!({ "clipboard_history": { "enabled": enabled } }))
+}
+
 pub fn save_ime_indicator_enabled(enabled: bool) -> Result<(), String> {
     save_patch(&serde_json::json!({ "ime_indicator": { "enabled": enabled } }))
 }

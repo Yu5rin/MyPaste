@@ -28,9 +28,6 @@ sha2 = "0.11.0"
 # rustls / OpenSSL 系のクレートは C・アセンブリのビルドを伴い、
 # 環境によってはビルドに失敗するため採用しない。証明書の検証は OS に任せる。
 
-[dependencies.tray-item]
-version = "0.10"
-
 # Windows API バインディング
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"

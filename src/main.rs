@@ -6,9 +6,9 @@
 //! ## スレッド構成
 //! - **フックスレッド**: 低レベルキーボードフックを設置し、メッセージループを回して
 //!   フックのコールバック配信を受ける（LL フックにはメッセージループが必須）。
-//! - **メインスレッド**: タスクトレイ（tray-item）を保持し、メニュー操作を
+//! - **メインスレッド**: タスクトレイ（[`tray`]）を保持し、メニュー操作を
 //!   チャネル経由で受け取ってアイコン切替・自動起動切替・終了処理を行う。
-//!   tray-item は内部で独自のメッセージループを持つため、メインスレッドは
+//!   トレイは専用のスレッドでメッセージループを回すため、メインスレッドは
 //!   チャネル受信に専念できる。終了要求を受けたときは、更新の入れ替えが
 //!   実行中であれば（上限付きで）完了を待ってから終了する
 //!   （[`wait_for_update_to_finish`]）。
@@ -69,6 +69,23 @@ use windows::Win32::Foundation::{LPARAM, WPARAM};
 
 use update_logic::Trigger;
 
+/// 使い方のページ（トレイメニューの「使い方を開く」）。
+const HELP_URL: &str = "https://github.com/Yu5rin/MyPaste#readme";
+
+/// トレイメニューで切り替えた状態を保存できなかったときに知らせる。
+fn report_save(result: Result<(), String>) {
+    if let Err(e) = result {
+        log::error!("設定を保存できませんでした: {e}");
+        update::message_box(
+            &format!(
+                "切り替えた状態を保存できませんでした。\n\
+                 今回の起動中は切り替えた状態で動きますが、次回の起動では元に戻ります。\n\n詳細: {e}"
+            ),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
 /// 動いている間の更新確認の時刻かを確かめる間隔。
 const UPDATE_TICK: Duration = Duration::from_secs(10 * 60);
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK};
@@ -89,6 +106,10 @@ pub enum TrayMessage {
     SettingsImported(Box<config::Settings>),
     /// キー割り当て ON/OFF 切替
     ToggleHotkeys,
+    /// クリップボードの履歴 ON/OFF 切替
+    ToggleHistory,
+    /// 使い方（README）をブラウザで開く
+    OpenHelp,
     /// キー割り当て画面を開く
     OpenHotkeys,
     /// 値貼り付けのキーとキー割り当ての一覧を表示する
@@ -127,6 +148,8 @@ fn main() {
     update::cleanup_old();
 
     // キーリマップのキーと対象アプリを、フックを設置する前に決めておく。
+    keyboard::set_enabled(settings.remap.enabled);
+    keyboard::set_rules_enabled(settings.hotkeys_enabled);
     let hotkey = configure_remap(&settings);
     configure_hotkeys(&settings);
     // キー割り当ての動作を実行するスレッド。フックより先に始めておく。
@@ -172,13 +195,16 @@ fn main() {
     // --- 入力モード表示を開始（失敗してもこの機能が動かないだけで、起動は続ける） ---
     let ime_indicator = ime_indicator::start(&settings.ime_indicator);
 
-    let mut tray = match tray::build(
+    let tray = match tray::build(
         tx.clone(),
-        &hotkey,
-        keyboard::is_enabled(),
-        keyboard::rules_enabled(),
-        startup::is_enabled(),
-        ime_indicator.is_some() && ime_indicator::is_enabled(),
+        tray::State {
+            remap_hotkey: hotkey.format(),
+            remap: keyboard::is_enabled(),
+            hotkeys: keyboard::rules_enabled(),
+            history: settings.clipboard_history.enabled,
+            ime_indicator: ime_indicator.is_some() && ime_indicator::is_enabled(),
+            startup: startup::is_enabled(),
+        },
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -207,7 +233,9 @@ fn main() {
         let settings_for_update = settings.clone();
         thread::spawn(move || update::run(settings_for_update, tx_update, Trigger::Startup));
     }
-    update::announce_if_auto_updated(&settings);
+    if let Some(notice) = update::auto_updated_notice() {
+        tray.notify(&notice);
+    }
 
     // --- 動いている間の定期的な更新確認のきっかけ ---
     // 間隔は設定（check_every_hours）と前回の確認の時刻で、メインスレッドが決める
@@ -227,23 +255,35 @@ fn main() {
         match msg {
             TrayMessage::Toggle => {
                 let on = keyboard::toggle();
-                if let Err(e) = tray.set_icon(on) {
-                    log::warn!("アイコン更新失敗: {e}");
-                }
-                if let Err(e) = tray.set_remap_checked(on) {
-                    log::warn!("メニュー更新失敗: {e}");
-                }
-                log::info!("キーリマップ: {}", if on { "有効" } else { "無効" });
+                settings.remap.enabled = on;
+                tray.update(|s| s.remap = on);
+                report_save(config::save_remap_enabled(on));
+                log::info!("値貼り付け: {}", if on { "有効" } else { "無効" });
             }
             TrayMessage::ToggleStartup => match startup::toggle() {
                 Ok(enabled) => {
-                    if let Err(e) = tray.set_startup_checked(enabled) {
-                        log::warn!("メニュー更新失敗: {e}");
-                    }
+                    tray.update(|s| s.startup = enabled);
                     log::info!("自動起動: {}", if enabled { "有効" } else { "無効" })
                 }
-                Err(e) => log::error!("自動起動設定失敗: {e}"),
+                Err(e) => {
+                    log::error!("自動起動設定失敗: {e}");
+                    tray.update(|s| s.startup = startup::is_enabled());
+                    update::message_box(
+                        &format!("Windows の起動時に実行する設定を、切り替えられませんでした。\n\n詳細: {e}"),
+                        MB_OK | MB_ICONERROR,
+                    );
+                }
             },
+            TrayMessage::ToggleHistory => {
+                let on = !settings.clipboard_history.enabled;
+                settings.clipboard_history.enabled = on;
+                settings.clipboard_history.opacity = actions::history_opacity();
+                configure_hotkeys(&settings);
+                tray.update(|s| s.history = on);
+                report_save(config::save_clipboard_history_enabled(on));
+                log::info!("クリップボードの履歴: {}", if on { "有効" } else { "無効" });
+            }
+            TrayMessage::OpenHelp => update::open_in_browser(HELP_URL),
             TrayMessage::ToggleImeIndicator => {
                 if ime_indicator.is_none() {
                     // 起動時に表示ウィンドウを作れなかった。切り替えても動かないので知らせる。
@@ -256,9 +296,7 @@ fn main() {
                 let on = !ime_indicator::is_enabled();
                 ime_indicator::set_enabled(on);
                 settings.ime_indicator.enabled = on;
-                if let Err(e) = tray.set_ime_indicator_checked(on) {
-                    log::warn!("メニュー更新失敗: {e}");
-                }
+                tray.update(|s| s.ime_indicator = on);
                 // 次回の起動でも同じ状態になるよう settings.json に保存する。
                 if let Err(e) = config::save_ime_indicator_enabled(on) {
                     log::error!("入力モード表示の設定を保存できませんでした: {e}");
@@ -293,20 +331,20 @@ fn main() {
                 settings.update.check_every_hours = saved.update.check_every_hours;
                 settings.update.mode = saved.update.mode;
                 settings.clipboard_history = saved.clipboard_history;
-                apply_settings(&settings, &mut tray, ime_indicator.is_some());
+                apply_settings(&settings, &tray, ime_indicator.is_some());
             }
             TrayMessage::SettingsImported(imported) => {
                 // 読み込んだ設定（キー割り当て・定型文を含む）を、まとめて一度に反映する
                 // （途中の状態で履歴の記録を止めて、保存した履歴を消してしまわないように）。
                 settings = *imported;
                 actions::set_snippets(settings.snippets.clone());
-                apply_settings(&settings, &mut tray, ime_indicator.is_some());
+                apply_settings(&settings, &tray, ime_indicator.is_some());
             }
             TrayMessage::ToggleHotkeys => {
                 let on = keyboard::toggle_rules();
-                if let Err(e) = tray.set_hotkeys_checked(on) {
-                    log::warn!("メニュー更新失敗: {e}");
-                }
+                settings.hotkeys_enabled = on;
+                tray.update(|s| s.hotkeys = on);
+                report_save(config::save_hotkeys_enabled(on));
                 log::info!("キー割り当て: {}", if on { "有効" } else { "無効" });
             }
             TrayMessage::OpenHotkeys => {
@@ -336,14 +374,10 @@ fn main() {
                 }
             }
             TrayMessage::UpdateProgress(percent) => {
-                if let Err(e) = tray.set_progress(percent) {
-                    log::warn!("進捗表示の更新に失敗: {e}");
-                }
+                tray.set_progress(percent);
             }
             TrayMessage::UpdateFinished => {
-                if let Err(e) = tray.clear_progress() {
-                    log::warn!("進捗表示の復帰に失敗: {e}");
-                }
+                tray.clear_progress();
             }
             TrayMessage::Quit => {
                 log::info!("終了要求を受信");
@@ -393,7 +427,7 @@ fn log_startup(settings: &config::Settings) {
 
 /// 設定（設定画面で保存したもの・読み込んだもの）を、フック・入力モード表示・トレイメニューへ
 /// 反映する。
-fn apply_settings(settings: &config::Settings, tray: &mut tray::Menu, indicator_running: bool) {
+fn apply_settings(settings: &config::Settings, tray: &tray::Menu, indicator_running: bool) {
     let hotkey = configure_remap(settings);
     configure_hotkeys(settings);
     let was_logging = logging::is_enabled();
@@ -406,15 +440,16 @@ fn apply_settings(settings: &config::Settings, tray: &mut tray::Menu, indicator_
     if indicator_running {
         ime_indicator::set_enabled(settings.ime_indicator.enabled);
     }
-    if let Err(e) = tray.set_remap_hotkey(&hotkey, keyboard::is_enabled()) {
-        log::warn!("メニュー更新失敗: {e}");
-    }
-    if let Err(e) = tray.set_ime_indicator_checked(indicator_running && ime_indicator::is_enabled()) {
-        log::warn!("メニュー更新失敗: {e}");
-    }
-    if let Err(e) = tray.set_startup_checked(startup::is_enabled()) {
-        log::warn!("メニュー更新失敗: {e}");
-    }
+    keyboard::set_enabled(settings.remap.enabled);
+    keyboard::set_rules_enabled(settings.hotkeys_enabled);
+    tray.update(|s| {
+        s.remap_hotkey = hotkey.format();
+        s.remap = keyboard::is_enabled();
+        s.hotkeys = keyboard::rules_enabled();
+        s.history = settings.clipboard_history.enabled;
+        s.ime_indicator = indicator_running && ime_indicator::is_enabled();
+        s.startup = startup::is_enabled();
+    });
     log::info!("設定を反映しました（キー: {}）", hotkey.format());
 }
 
