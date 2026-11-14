@@ -15,8 +15,9 @@ use windows::Win32::Security::Cryptography::{
 
 use crate::{clip_history, config};
 
-/// 保存しておいた履歴（新しい順）を読む。ファイルが無いときや、別のユーザー・別の PC で
-/// 保存したもので元に戻せないときは空。ファイルがあるのに読めない（ほかのアプリが使っている など）
+/// 保存しておいた履歴（新しい順）を読む。ファイルが無いときは空。別のユーザー・別の PC で
+/// 保存したもので元に戻せないときや、中身が壊れているときは、そのファイルを
+/// `clip_history.unreadable.dat` として残して空を返す。ファイルがあるのに読めない（ほかのアプリが使っている など）
 /// ときは `Err`（呼び出し側は、その間は上書きしない）。
 pub fn load() -> Result<clip_history::Saved, String> {
     let Some(path) = config::clip_history_file() else {
@@ -29,11 +30,24 @@ pub fn load() -> Result<clip_history::Saved, String> {
         }
         Err(e) => return Err(e.to_string()),
     };
-    match unprotect(&data) {
-        Some(plain) => Ok(clip_history::from_json(&String::from_utf8_lossy(&plain))),
-        None => {
-            // 別のユーザーや別の PC で保存したもの。読めないので使わない（次の保存で置き換わる）。
-            log::warn!("クリップボードの履歴を元に戻せませんでした（別のユーザー・PC で保存したもの）");
+    let saved = unprotect(&data)
+        .ok_or_else(|| "元に戻せません（別のユーザー・PC で保存したもの）".to_string())
+        .and_then(|plain| clip_history::from_json(&String::from_utf8_lossy(&plain)));
+    match saved {
+        Ok(saved) => Ok(saved),
+        Err(e) => {
+            // 別のユーザー・別の PC で保存したものや、壊れたもの。使えないが、次の保存で黙って
+            // 上書きすると取り返しがつかないので、別の名前で残しておく。
+            let backup = path.with_extension("unreadable.dat");
+            match std::fs::rename(&path, &backup) {
+                Ok(()) => log::warn!(
+                    "クリップボードの履歴を読めなかったため、{} として残し、空の履歴から始めます: {e}",
+                    backup.display()
+                ),
+                Err(rename_error) => log::warn!(
+                    "クリップボードの履歴を読めませんでした（{e}）。別名で残すこともできませんでした: {rename_error}"
+                ),
+            }
             Ok(clip_history::Saved::default())
         }
     }

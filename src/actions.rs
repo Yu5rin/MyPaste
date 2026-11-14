@@ -154,6 +154,8 @@ const WM_APP_CLEAR_HISTORY: u32 = WM_APP + 3;
 /// 履歴を保存するまでの待ち時間を計るタイマー（続けてコピーしたときに、何度も書かないように）。
 const TIMER_SAVE_HISTORY: usize = 1;
 const SAVE_HISTORY_DELAY_MS: u32 = 2000;
+/// 保存に失敗したとき、もう一度試すまでの時間（ミリ秒）。
+const SAVE_HISTORY_RETRY_MS: u32 = 30_000;
 /// 続けてコピーされても、最初の変更からこの時間がたったら保存する。
 const SAVE_HISTORY_MAX_DELAY: Duration = Duration::from_secs(15);
 
@@ -296,14 +298,15 @@ unsafe fn apply_history_setting(window: HWND) {
     // 二重に登録しないよう、いったん外してから必要なら登録し直す。
     let _ = RemoveClipboardFormatListener(window);
     if !config.record {
-        // 記録をやめたら、覚えている履歴を消す。保存した履歴は、利用者が記録を ON から OFF に
-        // したときだけ消す。
+        // 記録をやめる。保存した履歴（ピン留めを含む）は消さずに残し、記録を ON に戻したときに
+        // 読み直す（消したいときは、設定画面の「履歴をすべて削除」を使う）。残さない設定なら、
+        // 覚えているものはここで捨てる。
+        if previous.is_some_and(|(record, _)| record) {
+            save_history_now();
+        }
         HISTORY.with(|h| h.borrow_mut().clear());
         HISTORY_DIRTY.with(|d| d.set(false));
         HISTORY_LOADED.with(|l| l.set(false));
-        if previous.is_some_and(|(record, _)| record) {
-            clip_store::delete();
-        }
         return;
     }
     if !HISTORY_LOADED.with(Cell::get) {
@@ -378,13 +381,53 @@ fn save_history_now() {
     if !HISTORY_DIRTY.with(|d| d.replace(false)) || !history_config().keep {
         return;
     }
-    if HISTORY_STORE_UNREADABLE.with(Cell::get) {
+    if HISTORY_STORE_UNREADABLE.with(Cell::get) && !reload_history_store() {
+        retry_history_save();
         return;
     }
     let saved = HISTORY.with(|h| h.borrow().to_saved());
     if let Err(e) = clip_store::save(&saved) {
-        log::warn!("クリップボードの履歴を保存できませんでした: {e}");
+        log::warn!("クリップボードの履歴を保存できませんでした（あとでもう一度試します）: {e}");
+        retry_history_save();
     }
+}
+
+/// 保存できなかった履歴を、あとでもう一度保存する。
+fn retry_history_save() {
+    HISTORY_DIRTY.with(|d| d.set(true));
+    let window = clip_window();
+    if !window.is_invalid() {
+        unsafe {
+            SetTimer(window, TIMER_SAVE_HISTORY, SAVE_HISTORY_RETRY_MS, None);
+        }
+    }
+}
+
+/// 起動時に読めなかった保存済みの履歴を読み直し、その後に覚えたものを重ねる。読めたら `true`。
+fn reload_history_store() -> bool {
+    let saved = match clip_store::load() {
+        Ok(saved) => saved,
+        Err(e) => {
+            log::warn!("保存していたクリップボードの履歴を、まだ読めません: {e}");
+            return false;
+        }
+    };
+    let max = history_config().max_items;
+    HISTORY.with(|h| {
+        let mut h = h.borrow_mut();
+        let current = h.entries();
+        let mut merged = History::from_saved(saved, max);
+        for (text, pinned) in current.into_iter().rev() {
+            merged.push(&text);
+            if pinned {
+                merged.pin(&text);
+            }
+        }
+        *h = merged;
+    });
+    HISTORY_STORE_UNREADABLE.with(|u| u.set(false));
+    log::info!("保存していたクリップボードの履歴を読み直しました");
+    true
 }
 
 /// 覚えている履歴と、保存した履歴を消す（ピン留めしたものは残す）。

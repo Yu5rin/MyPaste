@@ -139,6 +139,8 @@ struct Context {
     loaded: Vec<HotkeyRuleSetting>,
     /// 右側に出している割り当ての位置（`None` は新しく作るときの初期値）。
     shown: Option<usize>,
+    /// 右側に割り当てを出したときの、欄の中身の控え（書き換えられたかを比べる）。
+    baseline: String,
 }
 
 thread_local! {
@@ -183,6 +185,7 @@ unsafe fn thread_main(
             tx,
             loaded: rules.clone(),
             shown: (!rules.is_empty()).then_some(0),
+            baseline: String::new(),
             rules,
             font,
             dirty: false,
@@ -269,6 +272,35 @@ unsafe fn load_editor(hwnd: HWND, rule: &HotkeyRuleSetting) {
     set_combo_index(hwnd, ID_SCOPE, usize::from(!apps.is_empty()));
     set_text(hwnd, ID_APPS, &remap_logic::apps_to_line(&apps));
     update_fields(hwnd);
+    mark_editor_clean(hwnd);
+}
+
+/// 右側の欄の中身を、比べられる 1 つの文字にする（検証はしない）。
+unsafe fn editor_snapshot(hwnd: HWND) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for id in [ID_ENABLED, ID_CTRL, ID_SHIFT, ID_ALT, ID_WIN, ID_PASTE] {
+        parts.push(u8::from(is_checked(hwnd, id)).to_string());
+    }
+    for i in 0..TRANSFORMS.len() {
+        parts.push(u8::from(is_checked(hwnd, ID_TRANSFORM_FIRST + i as i32)).to_string());
+    }
+    for id in [ID_KEY, ID_ACTION, ID_SCOPE] {
+        parts.push(combo_index(hwnd, id).map_or(String::new(), |i| i.to_string()));
+    }
+    for id in [ID_VALUE, ID_ARGS, ID_APPS] {
+        parts.push(get_text(hwnd, id));
+    }
+    parts.join("\u{1f}")
+}
+
+/// 今の右側の欄の中身を「書き換えていない状態」として覚える。
+unsafe fn mark_editor_clean(hwnd: HWND) {
+    let snapshot = editor_snapshot(hwnd);
+    CONTEXT.with(|c| {
+        if let Some(ctx) = c.borrow_mut().as_mut() {
+            ctx.baseline = snapshot;
+        }
+    });
 }
 
 /// 動作に合わせて、内容の欄の見出し・説明と、使える欄を切り替える。
@@ -384,8 +416,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             match (id, code) {
                 (ID_LIST, LBN_SELCHANGE) => on_select(hwnd),
                 (ID_ACTION | ID_SCOPE, CBN_SELCHANGE | CBN_CLOSEUP) => update_fields(hwnd),
-                (ID_ADD, BN_CLICKED) => on_add(hwnd),
-                (ID_UPDATE, BN_CLICKED) => on_update(hwnd),
+                (ID_ADD, BN_CLICKED) => {
+                    on_add(hwnd);
+                }
+                (ID_UPDATE, BN_CLICKED) => {
+                    on_update(hwnd);
+                }
                 (ID_DELETE, BN_CLICKED) => on_delete(hwnd),
                 (ID_UP, BN_CLICKED) => on_move(hwnd, -1),
                 (ID_DOWN, BN_CLICKED) => on_move(hwnd, 1),
@@ -443,23 +479,10 @@ unsafe fn on_select(hwnd: HWND) {
     show_selected(hwnd);
 }
 
-/// 右側が、出している割り当て（新しく作るときは初期値）から変えられているか。
-/// 読めない割り当て（知らない動作など）を出しているときは、比べられないので変えていないとみなす。
+/// 右側が、出したとき（新しく作るときは初期値）から書き換えられているか。
 unsafe fn editor_differs(hwnd: HWND) -> bool {
-    let shown = CONTEXT.with(|c| {
-        c.borrow()
-            .as_ref()
-            .map(|ctx| ctx.shown.and_then(|i| ctx.rules.get(i).cloned()))
-    })
-    .flatten();
-    let base = shown.unwrap_or_else(new_rule);
-    if Rule::from_setting(&base).is_err() {
-        return false;
-    }
-    match read_editor(hwnd) {
-        Ok(edited) => !same_rule(&base, &edited),
-        Err(_) => true,
-    }
+    let baseline = CONTEXT.with(|c| c.borrow().as_ref().map(|ctx| ctx.baseline.clone()));
+    baseline.is_some_and(|baseline| baseline != editor_snapshot(hwnd))
 }
 
 /// 一覧で選んでいる割り当てを右側に出す（確かめずに）。
@@ -477,10 +500,13 @@ unsafe fn show_selected(hwnd: HWND) {
 }
 
 /// 右側の内容を、新しい割り当てとして一覧の最後に足す。
-unsafe fn on_add(hwnd: HWND) {
+unsafe fn on_add(hwnd: HWND) -> bool {
     let setting = match read_editor(hwnd) {
         Ok(setting) => setting,
-        Err((id, message)) => return ui::report_invalid(hwnd, id, &message),
+        Err((id, message)) => {
+            ui::report_invalid(hwnd, id, &message);
+            return false;
+        }
     };
     let index = CONTEXT.with(|c| {
         let mut c = c.borrow_mut();
@@ -491,21 +517,26 @@ unsafe fn on_add(hwnd: HWND) {
         Some(ctx.rules.len() - 1)
     });
     refresh_list(hwnd, index);
+    mark_editor_clean(hwnd);
+    true
 }
 
 /// 一覧で選んでいる割り当てを、右側の内容で書き換える。
-unsafe fn on_update(hwnd: HWND) {
+unsafe fn on_update(hwnd: HWND) -> bool {
     let Some(index) = ui::list_index(hwnd, ID_LIST) else {
         show_message(
             hwnd,
             "書き換える割り当てを、左の一覧で選んでください。新しく足すときは「新しい割り当てとして追加」を押します。",
             MB_ICONWARNING,
         );
-        return;
+        return false;
     };
     let setting = match read_editor(hwnd) {
         Ok(setting) => setting,
-        Err((id, message)) => return ui::report_invalid(hwnd, id, &message),
+        Err((id, message)) => {
+            ui::report_invalid(hwnd, id, &message);
+            return false;
+        }
     };
     CONTEXT.with(|c| {
         if let Some(ctx) = c.borrow_mut().as_mut() {
@@ -517,6 +548,8 @@ unsafe fn on_update(hwnd: HWND) {
         }
     });
     refresh_list(hwnd, Some(index));
+    mark_editor_clean(hwnd);
+    true
 }
 
 /// 一覧で選んでいる割り当てを消す。
@@ -544,6 +577,7 @@ unsafe fn on_delete(hwnd: HWND) {
                 ctx.shown = None;
             }
         });
+        mark_editor_clean(hwnd);
     }
 }
 
@@ -577,34 +611,28 @@ unsafe fn on_move(hwnd: HWND, delta: isize) {
 
 /// 「保存」: 同じキーの重なりを確かめて settings.json に書き、メインスレッドへ反映を頼んで閉じる。
 unsafe fn on_save(hwnd: HWND) {
-    // 右側を書き換えたまま「更新」を押し忘れていないか確かめる（押し忘れると、その変更は
-    // 保存されないため）。
-    if let Some(index) = ui::list_index(hwnd, ID_LIST) {
-        if let Ok(edited) = read_editor(hwnd) {
-            let current =
-                CONTEXT.with(|c| c.borrow().as_ref().and_then(|ctx| ctx.rules.get(index).cloned()));
-            let readable = current.as_ref().is_some_and(|c| Rule::from_setting(c).is_ok());
-            if readable
-                && current.is_some_and(|current| !same_rule(&current, &edited))
-                && ui::ask_yes_no(
-                    hwnd,
-                    "右側で変更した内容が、まだ一覧に反映されていません。\n\
-                     選んでいる割り当てに反映してから保存しますか？\n\n\
-                     「いいえ」を選ぶと、右側の変更は保存しません。",
-                )
-            {
-                on_update(hwnd);
-            }
-        }
-    } else if editor_differs(hwnd)
-        && ui::ask_yes_no(
-            hwnd,
+    // 右側を書き換えたまま「更新」「追加」を押し忘れていないか確かめる（押し忘れると、その変更は
+    // 保存されないため）。反映しようとして入力に誤りがあれば、保存をやめて直してもらう。
+    if editor_differs(hwnd) {
+        let selected = ui::list_index(hwnd, ID_LIST).is_some();
+        let question = if selected {
+            "右側で変更した内容が、まだ一覧に反映されていません。\n\
+             選んでいる割り当てに反映してから保存しますか？\n\n\
+             「いいえ」を選ぶと、右側の変更は保存しません。"
+        } else {
             "右側に書いた割り当てが、まだ一覧に追加されていません。\n\
              新しい割り当てとして追加してから保存しますか？\n\n\
-             「いいえ」を選ぶと、右側の内容は保存しません。",
-        )
-    {
-        on_add(hwnd);
+             「いいえ」を選ぶと、右側の内容は保存しません。"
+        };
+        if ui::ask_yes_no(hwnd, question) {
+            if !IsWindow(hwnd).as_bool() {
+                return;
+            }
+            let applied = if selected { on_update(hwnd) } else { on_add(hwnd) };
+            if !applied {
+                return;
+            }
+        }
     }
     // 確かめている間に、アプリの終了で画面が閉じられていたら、保存しない。
     if !IsWindow(hwnd).as_bool() {
@@ -775,31 +803,6 @@ unsafe fn on_import(hwnd: HWND) {
         ));
     }
     show_message(hwnd, &message, MB_ICONINFORMATION);
-}
-
-/// 2 つの割り当てが同じ内容か（書き方の揺れ。例えばキーの大文字小文字や、アプリ名の
-/// `.exe` の有無は区別しない）。
-fn same_rule(a: &HotkeyRuleSetting, b: &HotkeyRuleSetting) -> bool {
-    let key = |s: &HotkeyRuleSetting| Hotkey::parse(&s.hotkey).ok();
-    let kind = |s: &HotkeyRuleSetting| ActionKind::from_setting(&s.action);
-    let apps = |s: &HotkeyRuleSetting| remap_logic::normalize_apps(s.apps.iter().map(String::as_str));
-    let info = kind(a).map(|k| k.info());
-    let uses_value = info.is_some_and(|i| i.value_label.is_some());
-    let uses_args = info.is_some_and(|i| i.uses_args);
-    let is_text = kind(a) == Some(ActionKind::TypeText);
-    let same_value = if info.is_some_and(|i| i.uses_transforms) {
-        text_transform::parse_list(&a.value).ok() == text_transform::parse_list(&b.value).ok()
-    } else {
-        !uses_value || a.value.replace("\r\n", "\n") == b.value.replace("\r\n", "\n")
-    };
-    a.enabled == b.enabled
-        && key(a) == key(b)
-        && kind(a) == kind(b)
-        && same_value
-        && (!uses_args || a.args.trim() == b.args.trim())
-        && apps(a) == apps(b)
-        && (!is_text
-            || hotkey_rules::input_is_paste(&a.input) == hotkey_rules::input_is_paste(&b.input))
 }
 
 /// 「キャンセル」・閉じるボタン: 保存していない変更があれば確かめてから閉じる。

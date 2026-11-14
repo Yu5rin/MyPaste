@@ -175,8 +175,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
             match (id, code) {
                 (ID_LIST, LBN_SELCHANGE) => on_select(hwnd),
-                (ID_ADD, BN_CLICKED) => on_add(hwnd),
-                (ID_UPDATE, BN_CLICKED) => on_update(hwnd),
+                (ID_ADD, BN_CLICKED) => {
+                    on_add(hwnd);
+                }
+                (ID_UPDATE, BN_CLICKED) => {
+                    on_update(hwnd);
+                }
                 (ID_DELETE, BN_CLICKED) => on_delete(hwnd),
                 (ID_UP, BN_CLICKED) => on_move(hwnd, -1),
                 (ID_DOWN, BN_CLICKED) => on_move(hwnd, 1),
@@ -260,10 +264,13 @@ unsafe fn editor_differs(hwnd: HWND) -> bool {
 }
 
 /// 右側の内容を、新しい定型文として一覧の最後に足す。
-unsafe fn on_add(hwnd: HWND) {
+unsafe fn on_add(hwnd: HWND) -> bool {
     let snippet = match read_editor(hwnd) {
         Ok(snippet) => snippet,
-        Err((id, message)) => return ui::report_invalid(hwnd, id, &message),
+        Err((id, message)) => {
+            ui::report_invalid(hwnd, id, &message);
+            return false;
+        }
     };
     if list_snapshot().len() >= snippets::MAX_SNIPPETS {
         show_message(
@@ -271,7 +278,7 @@ unsafe fn on_add(hwnd: HWND) {
             &format!("定型文は {} 件までです。", snippets::MAX_SNIPPETS),
             MB_ICONWARNING,
         );
-        return;
+        return false;
     }
     let index = CONTEXT.with(|c| {
         let mut c = c.borrow_mut();
@@ -282,21 +289,25 @@ unsafe fn on_add(hwnd: HWND) {
         Some(ctx.list.len() - 1)
     });
     refresh_list(hwnd, index);
+    true
 }
 
 /// 一覧で選んでいる定型文を、右側の内容で書き換える。
-unsafe fn on_update(hwnd: HWND) {
+unsafe fn on_update(hwnd: HWND) -> bool {
     let Some(index) = ui::list_index(hwnd, ID_LIST) else {
         show_message(
             hwnd,
             "書き換える定型文を、左の一覧で選んでください。新しく足すときは「新しい定型文として追加」を押します。",
             MB_ICONWARNING,
         );
-        return;
+        return false;
     };
     let snippet = match read_editor(hwnd) {
         Ok(snippet) => snippet,
-        Err((id, message)) => return ui::report_invalid(hwnd, id, &message),
+        Err((id, message)) => {
+            ui::report_invalid(hwnd, id, &message);
+            return false;
+        }
     };
     CONTEXT.with(|c| {
         if let Some(ctx) = c.borrow_mut().as_mut() {
@@ -308,6 +319,7 @@ unsafe fn on_update(hwnd: HWND) {
         }
     });
     refresh_list(hwnd, Some(index));
+    true
 }
 
 /// 一覧で選んでいる定型文を消す。
@@ -473,30 +485,28 @@ unsafe fn on_export(hwnd: HWND) {
 
 /// 「保存」: settings.json に書き、すぐに使えるようにして閉じる。
 unsafe fn on_save(hwnd: HWND) {
-    // 右側を書き換えたまま「更新」を押し忘れていないか確かめる。
-    if let Some(index) = ui::list_index(hwnd, ID_LIST) {
-        if let Ok(edited) = read_editor(hwnd) {
-            let current = list_snapshot().get(index).cloned();
-            if current.is_some_and(|current| current != edited)
-                && ui::ask_yes_no(
-                    hwnd,
-                    "右側で変更した内容が、まだ一覧に反映されていません。\n\
-                     選んでいる定型文に反映してから保存しますか？\n\n\
-                     「いいえ」を選ぶと、右側の変更は保存しません。",
-                )
-            {
-                on_update(hwnd);
-            }
-        }
-    } else if editor_differs(hwnd)
-        && ui::ask_yes_no(
-            hwnd,
+    // 右側を書き換えたまま「更新」「追加」を押し忘れていないか確かめる。反映しようとして
+    // 入力に誤りがあれば、保存をやめて直してもらう（黙って捨てない）。
+    if editor_differs(hwnd) {
+        let selected = ui::list_index(hwnd, ID_LIST).is_some();
+        let question = if selected {
+            "右側で変更した内容が、まだ一覧に反映されていません。\n\
+             選んでいる定型文に反映してから保存しますか？\n\n\
+             「いいえ」を選ぶと、右側の変更は保存しません。"
+        } else {
             "右側に書いた定型文が、まだ一覧に追加されていません。\n\
              新しい定型文として追加してから保存しますか？\n\n\
-             「いいえ」を選ぶと、右側の内容は保存しません。",
-        )
-    {
-        on_add(hwnd);
+             「いいえ」を選ぶと、右側の内容は保存しません。"
+        };
+        if ui::ask_yes_no(hwnd, question) {
+            if !IsWindow(hwnd).as_bool() {
+                return;
+            }
+            let applied = if selected { on_update(hwnd) } else { on_add(hwnd) };
+            if !applied {
+                return;
+            }
+        }
     }
     // 確かめている間に、アプリの終了で画面が閉じられていたら、保存しない。
     if !IsWindow(hwnd).as_bool() {

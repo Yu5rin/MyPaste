@@ -248,14 +248,17 @@ pub fn to_json(saved: &Saved) -> String {
 }
 
 /// 保存しておいた形から読む。前の版の形（文字列の配列、新しい順）も読む。読めなければ空。
-pub fn from_json(text: &str) -> Saved {
+pub fn from_json(text: &str) -> Result<Saved, String> {
     if let Ok(saved) = serde_json::from_str::<Saved>(text) {
-        return saved;
+        return Ok(saved);
     }
-    Saved {
-        pinned: Vec::new(),
-        items: serde_json::from_str(text).unwrap_or_default(),
-    }
+    // 以前の形（文字の配列だけ）。
+    serde_json::from_str(text)
+        .map(|items| Saved {
+            pinned: Vec::new(),
+            items,
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// 一覧を出す操作。
@@ -730,7 +733,7 @@ mod tests {
         h.push("新しい\r\n2 行目");
         h.push("留める");
         h.pin("留める");
-        let saved = from_json(&to_json(&h.to_saved()));
+        let saved = from_json(&to_json(&h.to_saved())).unwrap();
         let restored = History::from_saved(saved, 100);
         assert_eq!(restored.entries(), h.entries());
         // 重複や空のものが混じっていても、新しい方を残して読む。
@@ -743,8 +746,8 @@ mod tests {
         );
         assert_eq!(items(&restored), ["a", "b"]);
         // 前の版の形（文字列の配列）も読める。
-        assert_eq!(from_json(r#"["x","y"]"#).items, ["x", "y"]);
-        assert_eq!(from_json("壊れた"), Saved::default());
+        assert_eq!(from_json(r#"["x","y"]"#).unwrap().items, ["x", "y"]);
+        assert!(from_json("壊れた").is_err());
     }
 
     #[test]
