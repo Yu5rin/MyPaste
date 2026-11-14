@@ -33,7 +33,7 @@
 //! を参照。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -46,7 +46,7 @@ use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    MessageBoxW, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO,
+    MessageBoxW, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
     MESSAGEBOX_STYLE, SW_SHOWNORMAL,
 };
 
@@ -84,7 +84,9 @@ const TEMP_STALE_SECS: u64 = 60 * 60;
 const CHECK_TIMEOUT_MS: i32 = 15_000;
 /// 更新ファイル（数十 MB）のダウンロードのタイムアウト。
 /// 確認より緩やかな回線でも完了できるよう長めに取る。
-const DOWNLOAD_TIMEOUT_MS: i32 = 10 * 60_000;
+const DOWNLOAD_TIMEOUT_MS: i32 = 60_000;
+/// 更新ファイルのダウンロード全体にかけてよい時間。
+const DOWNLOAD_TOTAL_LIMIT: Duration = Duration::from_secs(10 * 60);
 
 /// 更新処理（[`run`]）が現在実行中かどうか。多重実行の防止に使う。
 ///
@@ -133,13 +135,13 @@ pub fn is_running() -> bool {
 
 /// 更新処理が、利用者の返事（メッセージボックス）を待っているか。この間はファイルを
 /// 入れ替えていないので、アプリを終了しても壊れない（終了するときに待たなくてよい）。
-static WAITING_FOR_USER: AtomicBool = AtomicBool::new(false);
+static WAITING_FOR_USER: AtomicUsize = AtomicUsize::new(0);
 /// アプリが終了に向かっているか（終了の途中で「更新する」を押されても入れ替えない）。
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 /// 利用者の返事を待っているか。
 pub fn is_waiting_for_user() -> bool {
-    WAITING_FOR_USER.load(Ordering::SeqCst)
+    WAITING_FOR_USER.load(Ordering::SeqCst) > 0
 }
 
 /// アプリの終了を始めたことを知らせる。
@@ -242,7 +244,7 @@ pub fn check(settings: &Settings) -> Result<Option<Available>, CheckError> {
     let mut known_newer: Option<(Version, String)> = None;
 
     if let Some(atom_url) = &atom_url {
-        match http::get(atom_url, None, CHECK_TIMEOUT_MS, |_, _| {}) {
+        match http::get(atom_url, None, CHECK_TIMEOUT_MS, |_, _| !SHUTTING_DOWN.load(Ordering::SeqCst)) {
             Ok(body) => match String::from_utf8(body) {
                 Ok(xml) => match update_logic::extract_latest_tag_from_atom(&xml) {
                     Some(tag) => match Version::parse(&tag) {
@@ -269,7 +271,7 @@ pub fn check(settings: &Settings) -> Result<Option<Available>, CheckError> {
 
     // API を呼び、添付ファイルの詳細（ダウンロード URL・SHA256）を取得する。
     // Atom の時点で「最新」と確定していれば、ここへは来ない（上で return 済み）。
-    match http::get(&settings.update.api_url, Some(GITHUB_ACCEPT), CHECK_TIMEOUT_MS, |_, _| {}) {
+    match http::get(&settings.update.api_url, Some(GITHUB_ACCEPT), CHECK_TIMEOUT_MS, |_, _| !SHUTTING_DOWN.load(Ordering::SeqCst)) {
         Ok(body) => {
             let release: Release = serde_json::from_slice(&body)
                 .map_err(|e| CheckError::Other(format!("応答の解析に失敗: {e}")))?;
@@ -361,7 +363,7 @@ pub fn check(settings: &Settings) -> Result<Option<Available>, CheckError> {
 /// 会社などの共有回線で API が HTTP 403 を返すときでも読めることが多い。
 fn sha256_from_release_page(atom_url: &str, tag: &str, asset_name: &str) -> Option<String> {
     let url = update_logic::build_expanded_assets_url(atom_url, tag)?;
-    let body = match http::get(&url, Some("text/html"), CHECK_TIMEOUT_MS, |_, _| {}) {
+    let body = match http::get(&url, Some("text/html"), CHECK_TIMEOUT_MS, |_, _| !SHUTTING_DOWN.load(Ordering::SeqCst)) {
         Ok(body) => body,
         Err(e) => {
             log::warn!("リリースのページの添付ファイル一覧を取得できませんでした: {e}");
@@ -393,7 +395,13 @@ fn download_and_verify(
     }
 
     let mut last_percent = u64::MAX;
+    let started = std::time::Instant::now();
     let bytes = http::get(&info.download_url, None, DOWNLOAD_TIMEOUT_MS, |done, total| {
+        // アプリの終了が始まったら、すぐにやめる（終了を待たせない）。少しずつしか届かない
+        // 回線でいつまでも続かないよう、全体の時間にも上限を設ける。
+        if SHUTTING_DOWN.load(Ordering::SeqCst) || started.elapsed() > DOWNLOAD_TOTAL_LIMIT {
+            return false;
+        }
         // 進捗はトレイのツールチップに出す。更新のたびに送ると煩いので
         // パーセントが変わったときだけ通知する。
         let percent = match total {
@@ -404,6 +412,7 @@ fn download_and_verify(
             last_percent = percent;
             let _ = tx.send(TrayMessage::UpdateProgress(percent));
         }
+        true
     })
     .map_err(|e| e.to_string())?;
 
@@ -434,7 +443,13 @@ fn download_and_verify(
         }
         log::info!("SHA256 検証に成功しました");
     } else {
-        log::warn!("リリースに SHA256 が無いため検証を省略しました");
+        // 確かめられないものは入れない（ダウンロードしたものをそのまま実行することになるため）。
+        log::error!("リリースに SHA256 が無く、検証できないため、更新を中止しました");
+        return Err(
+            "配布元から検証用の情報（SHA256）を取れなかったため、安全のため更新を中止しました。\
+             しばらくしてから、もう一度お試しください。"
+                .to_string(),
+        );
     }
 
     // 一時フォルダへ書き出す。途中で失敗した場合は中途半端なファイルを残さない。
@@ -669,11 +684,9 @@ pub fn run(settings: Settings, tx: Sender<TrayMessage>, trigger: Trigger) {
                 log::info!("前回の確認から {interval} 時間経っていないため、更新確認を省略しました");
                 return;
             }
-            config::mark_checked();
         }
         // 間隔はメインスレッドで確かめてある。
-        Trigger::Periodic => config::mark_checked(),
-        Trigger::Manual => {}
+        Trigger::Periodic | Trigger::Manual => {}
     }
 
     let found = match check(&settings) {
@@ -706,6 +719,10 @@ pub fn run(settings: Settings, tx: Sender<TrayMessage>, trigger: Trigger) {
             return;
         }
     };
+
+    // 確認できたときだけ「確認した」ことにする（失敗した回を数えると、スリープから戻った直後の
+    // 失敗で、次の確認が何時間も先になる）。
+    config::mark_checked();
 
     let Some(info) = found else {
         log::info!("最新版を使用しています");
@@ -845,7 +862,7 @@ fn install_when_idle(info: &Available, tx: &Sender<TrayMessage>) {
 /// しばらく操作が無く、編集中の画面も開いていなくなるまで待つ。アプリの終了が始まったら
 /// `false`。待っている間は、終了のときに待たせない（入れ替えはまだ始めていない）。
 fn wait_until_idle() -> bool {
-    let was_waiting = WAITING_FOR_USER.swap(true, Ordering::SeqCst);
+    WAITING_FOR_USER.fetch_add(1, Ordering::SeqCst);
     let mut logged = false;
     let ready = loop {
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
@@ -864,7 +881,7 @@ fn wait_until_idle() -> bool {
         }
         std::thread::sleep(IDLE_POLL);
     };
-    WAITING_FOR_USER.store(was_waiting, Ordering::SeqCst);
+    WAITING_FOR_USER.fetch_sub(1, Ordering::SeqCst);
     ready && !SHUTTING_DOWN.load(Ordering::SeqCst)
 }
 
@@ -886,6 +903,13 @@ fn idle_time() -> Duration {
 /// ダウンロードしたファイルで入れ替え、新しい版を起動して自分は終了する。
 /// `auto` なら、新しい版に「尋ねずに更新した」ことを伝える（起動したら知らせる）。
 fn install_and_restart(info: &Available, downloaded: &Path, tx: &Sender<TrayMessage>, auto: bool) {
+    // ダウンロードの間にアプリの終了が始まっていたら、入れ替えない（終了を選んだのに、
+    // 新しい版が立ち上がってしまわないように）。
+    if SHUTTING_DOWN.load(Ordering::SeqCst) {
+        log::info!("アプリの終了中のため、更新しません");
+        let _ = std::fs::remove_file(downloaded);
+        return;
+    }
     // 入れ替え。
     let installed = match install(downloaded) {
         Ok(p) => p,
@@ -894,6 +918,11 @@ fn install_and_restart(info: &Available, downloaded: &Path, tx: &Sender<TrayMess
             let _ = std::fs::remove_file(downloaded);
             // 動いている間の定期的な確認で、同じ版で何度も失敗して知らせないように。
             remember_offered(info.version);
+            if auto {
+                // 尋ねずに更新するときは、失敗も画面に出さない（記録にだけ残す）。
+                let _ = tx.send(TrayMessage::UpdateFinished);
+                return;
+            }
             // 自動で置き換えられない場合（書き込み権限が無いなど）は、
             // 手動で入れ替えられるようリリースページを開く。
             let summary = "更新を適用できませんでした。リリースページを開きますので、\
@@ -987,17 +1016,18 @@ pub(crate) fn message_box(text: &str, style: MESSAGEBOX_STYLE) -> i32 {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let was_waiting = WAITING_FOR_USER.swap(true, Ordering::SeqCst);
+    WAITING_FOR_USER.fetch_add(1, Ordering::SeqCst);
     let answer = unsafe {
         MessageBoxW(
             None,
             PCWSTR(text_w.as_ptr()),
             PCWSTR(title_w.as_ptr()),
-            style,
+            // 持ち主の画面が無いので、ほかのウィンドウの後ろに隠れないよう手前に出す。
+            style | MB_SETFOREGROUND | MB_TOPMOST,
         )
         .0
     };
-    WAITING_FOR_USER.store(was_waiting, Ordering::SeqCst);
+    WAITING_FOR_USER.fetch_sub(1, Ordering::SeqCst);
     answer
 }
 

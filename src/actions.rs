@@ -662,7 +662,7 @@ unsafe fn paste_from_history(held: &Hotkey) {
     if !outcome.removed.is_empty() {
         let changed = HISTORY.with(|h| {
             let mut h = h.borrow_mut();
-            outcome.removed.iter().fold(false, |changed, text| h.remove(text) || changed)
+            outcome.removed.iter().map(|text| h.remove(text)).filter(|removed| *removed).count() > 0
         });
         if changed {
             log::debug!("クリップボードの履歴: {} 件を消しました", outcome.removed.len());

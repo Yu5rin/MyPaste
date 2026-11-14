@@ -161,12 +161,13 @@ fn crack_url(url: &str) -> Result<CrackedUrl, HttpError> {
 ///   [`WinHttpSetTimeouts`] に 4 つとも同じ値で渡す。これを呼ばないと既定値
 ///   （環境によっては最大 90 秒程度）まかせになり、応答が無いときに長時間
 ///   無反応になる。確認用には短め、ダウンロード用には長めの値を呼び出し側が渡す。
-/// - `progress`: 受信バイト数と全体サイズ（判れば）を受け取るコールバック
+/// - `progress`: 受信バイト数と全体サイズ（判れば）を受け取るコールバック。`false` を返すと
+///   受信をやめる（アプリの終了や、全体の制限時間を超えたとき）
 pub fn get(
     url: &str,
     accept: Option<&str>,
     timeout_ms: i32,
-    mut progress: impl FnMut(u64, Option<u64>),
+    mut progress: impl FnMut(u64, Option<u64>) -> bool,
 ) -> Result<Vec<u8>, HttpError> {
     let parts = crack_url(url)?;
 
@@ -295,7 +296,9 @@ pub fn get(
             if body.len() as u64 > MAX_BODY_BYTES {
                 return Err(HttpError::Other("応答が大きすぎます".to_string()));
             }
-            progress(body.len() as u64, total);
+            if !progress(body.len() as u64, total) {
+                return Err(HttpError::Other("中止しました".to_string()));
+            }
         }
 
         // Content-Length が判っている場合、受信し終えたバイト数と一致するか確かめる。
