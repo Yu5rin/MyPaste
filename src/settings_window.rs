@@ -1,20 +1,20 @@
 //! 設定画面。
 //!
-//! トレイメニューの「設定...」から開く。編集できるのは次の項目で、「保存」を押すと
-//! `settings.json` に書き込み、メインスレッドへ [`TrayMessage::SettingsSaved`] を送って
-//! その場で反映させる（再起動は要らない）。
+//! トレイメニューの「設定...」から開く。4 つのタブ（ページ）に分けてあり、「OK」か「適用」を
+//! 押すと `settings.json` に書き込み、メインスレッドへ [`TrayMessage::SettingsSaved`] を送って
+//! その場で反映させる（再起動は要らない）。「適用」は閉じずに保存する。保存していない変更が
+//! あるまま閉じようとしたら、確かめる。
 //!
-//! - キーリマップ: 値貼り付けを起動するキーの組み合わせ（Ctrl / Shift / Alt + キー）と、
-//!   対象アプリ（プロセス名）
-//! - 入力モードの表示: ON/OFF、表示位置（画面中央・マウスの近く・入力位置の近く）、色、
-//!   表示時間とフェードアウトの時間（秒）、大きさ、不透明度、全画面のアプリでは出さない
-//!   （プレビュー付き）
-//! - トラブル調査用の動作の記録（`log.txt`）の ON/OFF と「記録を開く」
-//! - 自動起動、更新の確認（起動時・動いている間の数時間おき）と、新しい版が出たときの動き
-//!   （尋ねてから更新・尋ねずに更新・知らせるだけ）
+//! - 全般: 自動起動、更新の確認（起動時・起動している間の数時間おき）と、新しいバージョンが
+//!   見つかったときの動き、ログ（`log.txt`）、設定の書き出し・読み込み、既定値に戻す
+//! - 値貼り付け: 押すキー（Ctrl / Shift / Alt + キー）と、対象アプリ（プロセス名）
+//! - 入力モード: 表示の ON/OFF、位置、配色、表示時間とフェードアウトの時間（秒）、大きさ、
+//!   不透明度、全画面のアプリでは出さない（プレビュー付き）
 //! - クリップボードの履歴: ON/OFF、一覧を出す操作（キーの組み合わせ、Ctrl・Shift・Alt の
-//!   2 回押し）、2 回押しの間隔、覚えておく件数、一覧を出す位置、終了後も残すか、履歴を消す
-//! - 設定の書き出し・読み込み（PC の引っ越し用。キー割り当てと自動起動の状態も含む）
+//!   2 回押し）、一覧の見た目、残す件数、終了後も残すか、履歴に残さないアプリ、履歴の削除
+//!
+//! タブは見出しの並びだけを使い、すべてのコントロールを同じ画面の上に作って、選ばれた
+//! ページのものだけを見せる（[`show_page`]）。
 //!
 //! 外部のクレートを足さず、Win32 の標準コントロール（ボタン・エディット・コンボボックス）
 //! だけで組み立てている。画面は専用スレッドで動かし、メインスレッドのメニュー処理を
@@ -30,11 +30,13 @@ use std::sync::mpsc::Sender;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HFONT};
+use windows::Win32::UI::Controls::NMHDR;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     IsWindow,
-    DefWindowProcW, DestroyWindow, PostQuitMessage, SetForegroundWindow, ShowWindow,
+    DefWindowProcW, DestroyWindow, PostQuitMessage, SetForegroundWindow, ShowWindow, WM_CLOSE,
+    WM_NOTIFY,
     MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, SW_SHOW, SW_SHOWNORMAL, WM_COMMAND,
     WM_DESTROY, WM_DPICHANGED,
 };
@@ -105,105 +107,170 @@ const ID_EXPORT: i32 = 160;
 const ID_IMPORT: i32 = 161;
 const ID_PICK_APP: i32 = 162;
 const ID_CH_PICK_EXCLUDE: i32 = 163;
+const ID_CH_KEY_LABEL: i32 = 164;
+const ID_CH_PLUS: i32 = 165;
+const ID_CH_INTERVAL_LABEL: i32 = 166;
+const ID_CH_INTERVAL_UNIT: i32 = 167;
 
 
-/// 画面の中身の大きさ（96 DPI 基準）。
-const CLIENT_W: i32 = 948;
-const CLIENT_H: i32 = 640;
+const ID_APPLY: i32 = 170;
+const ID_TABS: i32 = 171;
 
-/// 画面の構成。並び順がそのまま Tab キーで移る順になる。
-/// 見出しや枠など、ID で触らないものは 200 番台の通し番号にしている。
-const ITEMS: &[Item] = &[
-    // キーリマップ
-    item(200, Kind::Group, "値貼り付け（Ctrl+Shift+V）を送るキー", 12, 8, 456, 147),
-    item(201, Kind::Label, "キーの組み合わせ", 24, 30, 112, 24),
-    item(ID_CTRL, Kind::Check, "Ctrl", 140, 31, 58, 22),
-    item(ID_SHIFT, Kind::Check, "Shift", 200, 31, 64, 22),
-    item(ID_ALT, Kind::Check, "Alt", 266, 31, 52, 22),
-    item(202, Kind::Label, "+", 322, 30, 16, 24),
-    item(ID_KEY, Kind::Combo, "", 342, 30, 110, 300),
-    item(203, Kind::Label, "対象アプリ（1 行に 1 つ。例: EXCEL.EXE）", 24, 58, 340, 24),
-    item(ID_APPS, Kind::MultiEdit, "", 24, 84, 428, 58),
-    item(ID_PICK_APP, Kind::Button, "選ぶ...", 372, 55, 80, 26),
-    // 入力モードの表示
-    item(210, Kind::Group, "入力モードの表示", 12, 163, 456, 238),
-    item(ID_IME_ENABLED, Kind::Check, "IME の入力モードを切り替えたら大きく表示する", 24, 185, 428, 22),
-    item(217, Kind::Label, "表示位置", 24, 214, 112, 24),
-    item(ID_POSITION, Kind::Combo, "", 140, 214, 150, 200),
-    item(218, Kind::Label, "色", 306, 214, 40, 24),
-    item(ID_THEME, Kind::Combo, "", 350, 214, 102, 200),
-    item(211, Kind::Label, "表示時間", 24, 246, 112, 24),
-    item(ID_HOLD, Kind::Edit, "", 140, 246, 70, 24),
-    item(212, Kind::Label, "秒（0.1〜5）", 216, 246, 160, 24),
-    item(215, Kind::Label, "フェードアウト", 24, 278, 112, 24),
-    item(ID_FADE, Kind::Edit, "", 140, 278, 70, 24),
-    item(216, Kind::Label, "秒（0〜2。0 ですぐ消す）", 216, 278, 200, 24),
-    item(213, Kind::Label, "大きさ", 24, 310, 112, 24),
-    item(ID_SIZE, Kind::NumberEdit, "", 140, 310, 70, 24),
-    item(214, Kind::Label, "px（40〜600）", 216, 310, 130, 24),
-    item(ID_PREVIEW, Kind::Button, "プレビュー", 362, 308, 90, 28),
-    item(219, Kind::Label, "不透明度", 24, 342, 112, 24),
-    item(ID_OPACITY, Kind::NumberEdit, "", 140, 342, 70, 24),
-    item(221, Kind::Label, "%（30〜100）", 216, 342, 130, 24),
-    item(ID_FULLSCREEN, Kind::Check, "全画面のアプリ（ゲーム・動画・発表など）の間は表示しない", 24, 371, 428, 22),
-    // 起動・更新・記録
-    item(220, Kind::Group, "起動・更新・記録", 12, 409, 456, 170),
-    item(ID_STARTUP, Kind::Check, "Windows にサインインしたら自動で起動する", 24, 431, 428, 22),
-    item(ID_UPDATE, Kind::Check, "起動時に新しいバージョンを確認する", 24, 458, 428, 22),
-    item(ID_UPDATE_PERIODIC, Kind::Check, "動いている間も 6 時間おきに確認する", 24, 485, 428, 22),
-    item(222, Kind::Label, "新しい版が出たら", 24, 513, 130, 24),
-    item(ID_UPDATE_MODE, Kind::Combo, "", 158, 513, 200, 200),
-    item(ID_LOG, Kind::Check, "トラブル調査用に動作を記録する（log.txt）", 24, 548, 330, 22),
-    item(ID_OPEN_LOG, Kind::Button, "記録を開く", 362, 545, 90, 28),
-    // クリップボードの履歴（右の列）
-    item(230, Kind::Group, "クリップボードの履歴", 480, 8, 456, 456),
-    item(ID_CH_ENABLED, Kind::Check, "コピーした文字を記録して、一覧から選んで貼り付ける", 492, 30, 432, 22),
-    item(231, Kind::Label, "一覧を出す操作", 492, 60, 120, 24),
-    item(ID_CH_TRIGGER, Kind::Combo, "", 616, 60, 308, 200),
-    item(232, Kind::Label, "キー", 492, 92, 120, 24),
-    item(ID_CH_CTRL, Kind::Check, "Ctrl", 616, 93, 54, 22),
-    item(ID_CH_SHIFT, Kind::Check, "Shift", 672, 93, 60, 22),
-    item(ID_CH_ALT, Kind::Check, "Alt", 734, 93, 48, 22),
-    item(ID_CH_WIN, Kind::Check, "Win", 784, 93, 52, 22),
-    item(233, Kind::Label, "+", 616, 122, 16, 24),
-    item(ID_CH_KEY, Kind::Combo, "", 634, 122, 150, 300),
-    item(234, Kind::Label, "2 回押す間隔", 492, 154, 120, 24),
-    item(ID_CH_INTERVAL, Kind::Edit, "", 616, 154, 70, 24),
-    item(235, Kind::Label, "秒以内（0.2〜1）", 692, 154, 200, 24),
-    item(236, Kind::Label, "覚えておく件数", 492, 186, 120, 24),
-    item(ID_CH_MAX, Kind::NumberEdit, "", 616, 186, 70, 24),
-    item(237, Kind::Label, "件（10〜10000）", 692, 186, 200, 24),
-    item(238, Kind::Label, "一覧を出す位置", 492, 218, 120, 24),
-    item(ID_CH_POSITION, Kind::Combo, "", 616, 218, 200, 200),
-    item(242, Kind::Label, "一覧の幅", 492, 250, 120, 24),
-    item(ID_CH_WIDTH, Kind::NumberEdit, "", 616, 250, 54, 24),
-    item(243, Kind::Label, "px", 674, 250, 30, 24),
-    item(244, Kind::Label, "不透明度", 712, 250, 70, 24),
-    item(ID_CH_OPACITY, Kind::NumberEdit, "", 784, 250, 46, 24),
-    item(245, Kind::Label, "%", 834, 250, 30, 24),
-    item(246, Kind::Label, "1 ページの件数", 492, 282, 120, 24),
-    item(ID_CH_PAGE, Kind::NumberEdit, "", 616, 282, 54, 24),
-    item(247, Kind::Label, "件", 674, 282, 30, 24),
-    item(248, Kind::Label, "配色", 712, 282, 64, 24),
-    item(ID_CH_THEME, Kind::Combo, "", 784, 282, 140, 200),
-    item(ID_CH_KEEP, Kind::Check, "アプリを終了しても履歴を残す（暗号化して保存）", 492, 312, 432, 22),
-    item(ID_CH_MOVE_TOP, Kind::Check, "一覧から貼り付けたものを、いちばん上に移す", 492, 338, 432, 22),
-    item(249, Kind::Label, "記録しないアプリ", 492, 366, 120, 24),
-    item(ID_CH_EXCLUDE, Kind::Edit, "", 616, 366, 222, 24),
-    item(ID_CH_PICK_EXCLUDE, Kind::Button, "選ぶ...", 844, 364, 80, 28),
-    item(239, Kind::Note, "一覧はクリックか矢印キーと Enter で選び、右クリックでピン留めできます。記録しないアプリはプロセス名を空白で区切って書きます（例: KeePass.exe）。", 492, 398, 334, 58),
-    item(ID_CH_CLEAR, Kind::Button, "履歴を消す", 834, 404, 90, 28),
-    // 設定の書き出し・読み込み（右の列）
-    item(240, Kind::Group, "設定の書き出し・読み込み（PC の引っ越しに）", 480, 472, 456, 116),
-    item(241, Kind::Note, "保存済みの設定・キー割り当て・定型文・自動起動の状態を 1 つのファイルにまとめます。新しい PC では、このアプリを置いてから「読み込む」を押します（履歴の中身は含めません）。", 492, 494, 432, 52),
-    item(ID_EXPORT, Kind::Button, "設定を書き出す...", 492, 550, 150, 28),
-    item(ID_IMPORT, Kind::Button, "設定を読み込む...", 650, 550, 150, 28),
-    // 操作ボタン
-    item(ID_OPEN_FOLDER, Kind::Button, "設定ファイルの場所を開く", 12, 600, 178, 28),
-    item(ID_DEFAULTS, Kind::Button, "既定に戻す", 198, 600, 86, 28),
-    item(ID_SAVE, Kind::DefaultButton, "保存", 758, 600, 86, 28),
-    item(ID_CANCEL, Kind::Button, "キャンセル", 850, 600, 86, 28),
+/// 画面の中身の大きさ（96 DPI 基準）。ノート PC（1366x768、表示 125%）でも収まる大きさにする。
+const CLIENT_W: i32 = 500;
+const CLIENT_H: i32 = 472;
+
+/// タブの見出し（[`PAGES`] と同じ順）。
+const TAB_NAMES: [&str; 4] = ["全般", "値貼り付け", "入力モード", "クリップボードの履歴"];
+
+/// どのページでも出すもの（タブ。作る順が Tab キーで移る順になるので、最初に作る）。
+const HEAD: &[Item] = &[item(ID_TABS, Kind::Tabs, "", 8, 8, 484, 28)];
+
+/// どのページでも出すもの（下のボタン。最後に作る）。
+const FOOT: &[Item] = &[
+    item(ID_SAVE, Kind::DefaultButton, "OK", 230, 432, 84, 28),
+    item(ID_CANCEL, Kind::Button, "キャンセル", 320, 432, 84, 28),
+    item(ID_APPLY, Kind::Button, "適用(&A)", 410, 432, 78, 28),
 ];
+
+// 見出しや枠など、ID で触らないものは 200 番台の通し番号にしている。
+
+/// 「全般」のページ。
+const PAGE_GENERAL: &[Item] = &[
+    item(200, Kind::Group, "起動と更新", 12, 44, 476, 136),
+    item(ID_STARTUP, Kind::Check, "Windows の起動時に自動で実行する", 24, 64, 452, 22),
+    item(ID_UPDATE, Kind::Check, "起動時に新しいバージョンを確認する", 24, 90, 452, 22),
+    item(ID_UPDATE_PERIODIC, Kind::Check, "起動している間も 6 時間おきに確認する", 24, 116, 452, 22),
+    item(201, Kind::Label, "新しいバージョンが見つかったら", 24, 144, 210, 24),
+    item(ID_UPDATE_MODE, Kind::Combo, "", 238, 144, 200, 200),
+    item(202, Kind::Group, "ログ（トラブル調査用）", 12, 188, 476, 58),
+    item(ID_LOG, Kind::Check, "動作のログを保存する（log.txt）", 24, 211, 330, 22),
+    item(ID_OPEN_LOG, Kind::Button, "ログを開く(&L)", 376, 207, 100, 28),
+    item(203, Kind::Group, "設定の引っ越しとバックアップ", 12, 254, 476, 116),
+    item(204, Kind::Note, "設定・キー割り当て・定型文を 1 つのファイルにまとめます。新しい PC では、このアプリを置いてから「読み込む」を押します（履歴の中身は含みません）。", 24, 274, 452, 44),
+    item(ID_EXPORT, Kind::Button, "書き出す(&E)...", 24, 328, 120, 28),
+    item(ID_IMPORT, Kind::Button, "読み込む(&I)...", 150, 328, 120, 28),
+    item(ID_OPEN_FOLDER, Kind::Button, "設定フォルダーを開く(&F)", 306, 328, 170, 28),
+    item(ID_DEFAULTS, Kind::Button, "すべて既定値に戻す(&R)...", 12, 382, 190, 28),
+];
+
+/// 「値貼り付け」のページ。
+const PAGE_REMAP: &[Item] = &[
+    item(210, Kind::Note, "対象アプリで下のキーを押すと、値貼り付け（Ctrl+Shift+V）を送ります。Excel で、書式を付けずに値だけを貼り付けるのに使います。", 16, 48, 468, 40),
+    item(211, Kind::Group, "押すキー", 12, 92, 476, 62),
+    item(ID_CTRL, Kind::Check, "Ctrl", 24, 116, 58, 22),
+    item(ID_SHIFT, Kind::Check, "Shift", 84, 116, 64, 22),
+    item(ID_ALT, Kind::Check, "Alt", 150, 116, 52, 22),
+    item(212, Kind::Label, "+", 206, 115, 16, 24),
+    item(ID_KEY, Kind::Combo, "", 226, 115, 110, 300),
+    item(213, Kind::Group, "対象アプリ", 12, 162, 476, 208),
+    item(214, Kind::Label, "プロセス名を 1 行に 1 つ（例: EXCEL.EXE）", 24, 184, 320, 24),
+    item(ID_PICK_APP, Kind::Button, "アプリを選ぶ(&B)...", 346, 182, 130, 28),
+    item(ID_APPS, Kind::MultiEdit, "", 24, 216, 452, 142),
+];
+
+/// 「入力モード」のページ。
+const PAGE_IME: &[Item] = &[
+    item(ID_IME_ENABLED, Kind::Check, "入力モード（あ / A）を切り替えたら、画面に大きく表示する", 16, 48, 468, 22),
+    item(220, Kind::Group, "表示のしかた", 12, 76, 476, 236),
+    item(221, Kind::Label, "表示する位置", 24, 100, 112, 24),
+    item(ID_POSITION, Kind::Combo, "", 140, 100, 170, 200),
+    item(222, Kind::Label, "配色", 24, 132, 112, 24),
+    item(ID_THEME, Kind::Combo, "", 140, 132, 170, 200),
+    item(223, Kind::Label, "表示時間", 24, 164, 112, 24),
+    item(ID_HOLD, Kind::Edit, "", 140, 164, 70, 24),
+    item(224, Kind::Label, "秒（0.1〜5）", 216, 164, 200, 24),
+    item(225, Kind::Label, "フェードアウト", 24, 196, 112, 24),
+    item(ID_FADE, Kind::Edit, "", 140, 196, 70, 24),
+    item(226, Kind::Label, "秒（0〜2。0 ですぐに消す）", 216, 196, 220, 24),
+    item(227, Kind::Label, "大きさ", 24, 228, 112, 24),
+    item(ID_SIZE, Kind::NumberEdit, "", 140, 228, 70, 24),
+    item(228, Kind::Label, "px（40〜600）", 216, 228, 150, 24),
+    item(229, Kind::Label, "不透明度", 24, 260, 112, 24),
+    item(ID_OPACITY, Kind::NumberEdit, "", 140, 260, 70, 24),
+    item(230, Kind::Label, "%（30〜100）", 216, 260, 150, 24),
+    item(ID_PREVIEW, Kind::Button, "プレビュー(&P)", 366, 258, 110, 28),
+    item(ID_FULLSCREEN, Kind::Check, "全画面のアプリ（ゲーム・動画・発表など）では表示しない", 16, 322, 468, 22),
+];
+
+/// 「クリップボードの履歴」のページ。
+const PAGE_HISTORY: &[Item] = &[
+    item(ID_CH_ENABLED, Kind::Check, "コピーした文字を履歴に残し、一覧から選んで貼り付ける", 16, 48, 468, 22),
+    item(240, Kind::Group, "一覧を出す操作", 12, 76, 476, 94),
+    item(241, Kind::Label, "操作", 24, 98, 100, 24),
+    item(ID_CH_TRIGGER, Kind::Combo, "", 128, 98, 348, 200),
+    // キーの組み合わせのときはキーの欄を、2 回押しのときは間隔の欄を、同じ行に出し分ける。
+    item(ID_CH_KEY_LABEL, Kind::Label, "キー", 24, 130, 100, 24),
+    item(ID_CH_CTRL, Kind::Check, "Ctrl", 128, 131, 54, 22),
+    item(ID_CH_SHIFT, Kind::Check, "Shift", 184, 131, 60, 22),
+    item(ID_CH_ALT, Kind::Check, "Alt", 246, 131, 48, 22),
+    item(ID_CH_WIN, Kind::Check, "Win", 296, 131, 52, 22),
+    item(ID_CH_PLUS, Kind::Label, "+", 350, 130, 14, 24),
+    item(ID_CH_KEY, Kind::Combo, "", 366, 130, 110, 300),
+    item(ID_CH_INTERVAL_LABEL, Kind::Label, "2 回押しの間隔", 24, 130, 100, 24),
+    item(ID_CH_INTERVAL, Kind::Edit, "", 128, 130, 70, 24),
+    item(ID_CH_INTERVAL_UNIT, Kind::Label, "秒以内（0.2〜1）", 204, 130, 200, 24),
+    item(242, Kind::Group, "一覧の見た目", 12, 178, 476, 94),
+    item(243, Kind::Label, "出す位置", 24, 200, 100, 24),
+    item(ID_CH_POSITION, Kind::Combo, "", 128, 200, 150, 200),
+    item(244, Kind::Label, "配色", 296, 200, 40, 24),
+    item(ID_CH_THEME, Kind::Combo, "", 340, 200, 136, 200),
+    item(245, Kind::Label, "幅（px）", 24, 232, 100, 24),
+    item(ID_CH_WIDTH, Kind::NumberEdit, "", 128, 232, 50, 24),
+    item(246, Kind::Label, "不透明度（%）", 196, 232, 90, 24),
+    item(ID_CH_OPACITY, Kind::NumberEdit, "", 288, 232, 44, 24),
+    item(247, Kind::Label, "1 ページの件数", 346, 232, 86, 24),
+    item(ID_CH_PAGE, Kind::NumberEdit, "", 436, 232, 40, 24),
+    item(248, Kind::Group, "履歴の保存", 12, 280, 476, 140),
+    item(249, Kind::Label, "残す件数", 24, 302, 100, 24),
+    item(ID_CH_MAX, Kind::NumberEdit, "", 128, 302, 70, 24),
+    item(250, Kind::Label, "件（10〜10000）", 204, 302, 110, 24),
+    item(ID_CH_CLEAR, Kind::Button, "履歴をすべて削除(&D)...", 316, 300, 160, 28),
+    item(ID_CH_KEEP, Kind::Check, "アプリを終了しても履歴を残す（暗号化して保存）", 24, 332, 452, 22),
+    item(ID_CH_MOVE_TOP, Kind::Check, "一覧から貼り付けたものを、いちばん上に移す", 24, 356, 452, 22),
+    item(251, Kind::Label, "履歴に残さないアプリ", 24, 384, 130, 24),
+    item(ID_CH_EXCLUDE, Kind::Edit, "", 158, 384, 208, 24),
+    item(ID_CH_PICK_EXCLUDE, Kind::Button, "アプリを選ぶ...", 372, 382, 104, 28),
+];
+
+/// ページ（[`TAB_NAMES`] と同じ順）。
+const PAGES: [&[Item]; 4] = [PAGE_GENERAL, PAGE_REMAP, PAGE_IME, PAGE_HISTORY];
+
+/// すべてのコントロール（作る順 = Tab キーで移る順）。
+fn all_items() -> Vec<Item> {
+    HEAD.iter()
+        .chain(PAGES.iter().flat_map(|page| page.iter()))
+        .chain(FOOT.iter())
+        .copied()
+        .collect()
+}
+
+/// そのコントロールがあるページ。
+fn page_of(id: i32) -> Option<usize> {
+    PAGES.iter().position(|page| page.iter().any(|item| item.id == id))
+}
+
+/// 選ばれているタブのページだけを見せる。
+unsafe fn show_page(hwnd: HWND, index: usize) {
+    for (i, page) in PAGES.iter().enumerate() {
+        for item in page.iter() {
+            ui::set_visible(hwnd, item.id, i == index);
+        }
+    }
+    if index == 3 {
+        // 履歴のページは、出す操作に合わせてキーの欄・間隔の欄を出し分ける。
+        update_history_fields(hwnd);
+    }
+}
+
+/// 入力の誤りを知らせる。その欄のあるページへ切り替えてから、欄に移る。
+unsafe fn report_invalid_on_page(hwnd: HWND, id: i32, message: &str) {
+    if let Some(page) = page_of(id) {
+        ui::set_tab_index(hwnd, ID_TABS, page);
+        show_page(hwnd, page);
+    }
+    report_invalid(hwnd, id, message);
+}
 
 /// 画面に表示する値。
 struct Form {
@@ -244,6 +311,8 @@ struct Context {
     /// 開いたときの設定。保存時はこれに編集した項目を重ねてメインスレッドへ渡す。
     settings: Settings,
     font: HFONT,
+    /// 開いたとき（最後に保存・適用したとき）の、欄の中身の控え。
+    baseline: String,
 }
 
 thread_local! {
@@ -282,9 +351,13 @@ unsafe fn thread_main(tx: Sender<TrayMessage>, settings: Settings, startup: bool
     let dpi = GetDpiForWindow(hwnd);
     let font = ui::create_ui_font(dpi);
     let form = Form::from_settings(&settings, startup);
-    CONTEXT.with(|c| *c.borrow_mut() = Some(Context { tx, settings, font }));
+    CONTEXT.with(|c| {
+        *c.borrow_mut() = Some(Context { tx, settings, font, baseline: String::new() })
+    });
 
-    ui::create_controls(hwnd, ITEMS, font);
+    let items = all_items();
+    ui::create_controls(hwnd, &items, font);
+    ui::add_tabs(hwnd, ID_TABS, &TAB_NAMES);
     ui::add_combo_items(hwnd, ID_KEY, KEYS.iter().map(|(name, _)| *name));
     ui::add_combo_items(hwnd, ID_POSITION, Position::ALL.iter().map(|(_, _, name)| *name));
     ui::add_combo_items(hwnd, ID_THEME, Theme::ALL.iter().map(|(_, _, name)| *name));
@@ -295,12 +368,14 @@ unsafe fn thread_main(tx: Sender<TrayMessage>, settings: Settings, startup: bool
     ui::add_combo_items(hwnd, ID_CH_THEME, HistoryTheme::ALL.iter().map(|(_, _, name)| *name));
     fill_form(hwnd, &form);
     ui::place_window(hwnd, dpi, CLIENT_W, CLIENT_H);
-    ui::layout(hwnd, ITEMS, dpi);
+    ui::layout(hwnd, &items, dpi);
+    show_page(hwnd, 0);
+    mark_clean(hwnd);
     WINDOW.set_window(hwnd);
 
     let _ = ShowWindow(hwnd, SW_SHOW);
     let _ = SetForegroundWindow(hwnd);
-    ui::focus(hwnd, ID_KEY);
+    ui::focus(hwnd, ID_TABS);
 
     ui::run_message_loop(hwnd);
 
@@ -336,12 +411,50 @@ unsafe fn fill_form(hwnd: HWND, form: &Form) {
     set_text(
         hwnd,
         ID_UPDATE_PERIODIC,
-        &format!("動いている間も {} 時間おきに確認する", periodic_hours(form.update_every_hours)),
+        &format!("起動している間も {} 時間おきに確認する", periodic_hours(form.update_every_hours)),
     );
     let mode_index = UpdateMode::ALL.iter().position(|(m, _, _)| *m == form.update_mode).unwrap_or(0);
     set_combo_index(hwnd, ID_UPDATE_MODE, mode_index);
     set_checked(hwnd, ID_LOG, form.log);
     fill_history(hwnd, &form.history);
+    update_ime_fields(hwnd);
+}
+
+/// 入力モードの表示を使わないときは、表示のしかたの欄を使えなくする。
+unsafe fn update_ime_fields(hwnd: HWND) {
+    let on = is_checked(hwnd, ID_IME_ENABLED);
+    for id in [
+        ID_POSITION,
+        ID_THEME,
+        ID_HOLD,
+        ID_FADE,
+        ID_SIZE,
+        ID_OPACITY,
+        ID_PREVIEW,
+        ID_FULLSCREEN,
+    ] {
+        ui::set_enabled(hwnd, id, on);
+    }
+}
+
+/// 今の欄の中身を「保存済みの状態」として覚える。
+unsafe fn mark_clean(hwnd: HWND) {
+    let snapshot = ui::snapshot(hwnd, &all_items());
+    CONTEXT.with(|c| {
+        if let Some(context) = c.borrow_mut().as_mut() {
+            context.baseline = snapshot;
+        }
+    });
+}
+
+/// 「キャンセル」・閉じるボタン・Esc: 保存していない変更があれば確かめてから閉じる。
+unsafe fn on_close(hwnd: HWND) {
+    let baseline = CONTEXT.with(|c| c.borrow().as_ref().map(|context| context.baseline.clone()));
+    let changed = baseline.is_some_and(|baseline| baseline != ui::snapshot(hwnd, &all_items()));
+    if changed && !ui::ask_yes_no(hwnd, "保存していない変更があります。保存せずに閉じますか？") {
+        return;
+    }
+    let _ = DestroyWindow(hwnd);
 }
 
 /// クリップボードの履歴の設定を画面に入れる。
@@ -350,9 +463,10 @@ unsafe fn fill_history(hwnd: HWND, settings: &ClipboardHistorySettings) {
     set_checked(hwnd, ID_CH_ENABLED, config.enabled);
     let trigger_index = Trigger::ALL.iter().position(|(t, _, _)| *t == config.trigger).unwrap_or(0);
     set_combo_index(hwnd, ID_CH_TRIGGER, trigger_index);
-    // 読めないキーが書かれていた場合は、既定のキーを出す。
-    let hotkey = config
-        .hotkey
+    // 一覧を出す操作がキーの組み合わせでないときも、保存してあるキーをそのまま出す（出さないと、
+    // 次に保存したときに既定のキーで上書きしてしまう）。読めないキーなら、既定のキーを出す。
+    let hotkey = clip_history::parse_hotkey(&settings.hotkey)
+        .ok()
         .or_else(|| Hotkey::parse(&ClipboardHistorySettings::default().hotkey).ok())
         .unwrap_or_default();
     set_checked(hwnd, ID_CH_CTRL, hotkey.ctrl);
@@ -386,11 +500,18 @@ unsafe fn update_history_fields(hwnd: HWND) {
     let trigger = combo_index(hwnd, ID_CH_TRIGGER)
         .and_then(|i| Trigger::ALL.get(i))
         .map_or(Trigger::Hotkey, |(t, _, _)| *t);
-    let uses_key = on && trigger == Trigger::Hotkey;
-    for id in [ID_CH_CTRL, ID_CH_SHIFT, ID_CH_ALT, ID_CH_WIN, ID_CH_KEY] {
-        ui::set_enabled(hwnd, id, uses_key);
+    let uses_key = trigger == Trigger::Hotkey;
+    // キーの欄と間隔の欄は同じ行にあり、出す操作に合わせて片方だけを見せる
+    // （このページを出しているときだけ）。
+    let visible = ui::tab_index(hwnd, ID_TABS) == 3;
+    for id in [ID_CH_KEY_LABEL, ID_CH_CTRL, ID_CH_SHIFT, ID_CH_ALT, ID_CH_WIN, ID_CH_PLUS, ID_CH_KEY] {
+        ui::set_visible(hwnd, id, visible && uses_key);
+        ui::set_enabled(hwnd, id, on);
     }
-    ui::set_enabled(hwnd, ID_CH_INTERVAL, on && trigger != Trigger::Hotkey);
+    for id in [ID_CH_INTERVAL_LABEL, ID_CH_INTERVAL, ID_CH_INTERVAL_UNIT] {
+        ui::set_visible(hwnd, id, visible && !uses_key);
+        ui::set_enabled(hwnd, id, on);
+    }
     for id in [
         ID_CH_TRIGGER,
         ID_CH_MAX,
@@ -402,6 +523,7 @@ unsafe fn update_history_fields(hwnd: HWND) {
         ID_CH_THEME,
         ID_CH_MOVE_TOP,
         ID_CH_EXCLUDE,
+        ID_CH_PICK_EXCLUDE,
     ] {
         ui::set_enabled(hwnd, id, on);
     }
@@ -409,6 +531,19 @@ unsafe fn update_history_fields(hwnd: HWND) {
 
 /// クリップボードの履歴の設定を読み、検証する。
 unsafe fn read_history(hwnd: HWND) -> Result<ClipboardHistorySettings, (i32, String)> {
+    let stored = CONTEXT.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|context| context.settings.clipboard_history.clone())
+            .unwrap_or_default()
+    });
+    if !is_checked(hwnd, ID_CH_ENABLED) {
+        // 使わないときは、欄は使えなくなっている。中身を検証せず、保存してある値を残す。
+        return Ok(ClipboardHistorySettings {
+            enabled: false,
+            ..stored
+        });
+    }
     let trigger = combo_index(hwnd, ID_CH_TRIGGER)
         .and_then(|i| Trigger::ALL.get(i))
         .map_or(Trigger::Hotkey, |(t, _, _)| *t);
@@ -429,17 +564,22 @@ unsafe fn read_history(hwnd: HWND) -> Result<ClipboardHistorySettings, (i32, Str
             .validate_trigger()
             .map_err(|e| (ID_CH_KEY, format!("一覧を出すキー: {e}")))?;
     }
-    let interval = ime_logic::parse_seconds(
-        &get_text(hwnd, ID_CH_INTERVAL),
-        u64::from(clip_history::DOUBLE_TAP_MS_MIN),
-        u64::from(clip_history::DOUBLE_TAP_MS_MAX),
-    )
-    .ok_or_else(|| {
-        (
-            ID_CH_INTERVAL,
-            "2 回押す間隔は 0.2〜1 秒の数で入力してください（例: 0.4）。".to_string(),
+    let interval = if trigger == Trigger::Hotkey {
+        // 間隔の欄は出していない。保存してある値を残す。
+        u64::from(stored.double_tap_ms)
+    } else {
+        ime_logic::parse_seconds(
+            &get_text(hwnd, ID_CH_INTERVAL),
+            u64::from(clip_history::DOUBLE_TAP_MS_MIN),
+            u64::from(clip_history::DOUBLE_TAP_MS_MAX),
         )
-    })?;
+        .ok_or_else(|| {
+            (
+                ID_CH_INTERVAL,
+                "2 回押しの間隔は 0.2〜1 秒の数で入力してください（例: 0.4）。".to_string(),
+            )
+        })?
+    };
     let max_items = parse_in_range(
         &get_text(hwnd, ID_CH_MAX),
         clip_history::MIN_ITEMS as u64,
@@ -449,7 +589,7 @@ unsafe fn read_history(hwnd: HWND) -> Result<ClipboardHistorySettings, (i32, Str
         (
             ID_CH_MAX,
             format!(
-                "覚えておく件数は {}〜{} の数で入力してください。",
+                "残す件数は {}〜{} の数で入力してください。",
                 clip_history::MIN_ITEMS,
                 clip_history::MAX_ITEMS_LIMIT
             ),
@@ -636,12 +776,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             {
                 update_history_fields(hwnd);
             }
+            if id == ID_IME_ENABLED && code == BN_CLICKED {
+                update_ime_fields(hwnd);
+            }
             if code == BN_CLICKED {
                 match id {
-                    ID_SAVE => on_save(hwnd),
-                    ID_CANCEL => {
-                        let _ = DestroyWindow(hwnd);
-                    }
+                    ID_SAVE => on_save(hwnd, true),
+                    ID_APPLY => on_save(hwnd, false),
+                    ID_CANCEL => on_close(hwnd),
                     ID_PREVIEW => on_preview(hwnd),
                     ID_DEFAULTS => on_defaults(hwnd),
                     ID_OPEN_FOLDER => on_open_folder(hwnd),
@@ -656,10 +798,22 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             LRESULT(0)
         }
+        WM_NOTIFY => {
+            let header = &*(lparam.0 as *const NMHDR);
+            if header.idFrom == ID_TABS as usize && header.code == ui::TCN_SELCHANGE {
+                show_page(hwnd, ui::tab_index(hwnd, ID_TABS));
+            }
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            on_close(hwnd);
+            LRESULT(0)
+        }
         WM_DPICHANGED => {
             // 別の DPI のモニターへ移った。勧められた大きさに合わせ、文字と配置を作り直す。
             let old = CONTEXT.with(|c| c.borrow().as_ref().map(|context| context.font));
-            let font = ui::on_dpi_changed(hwnd, ITEMS, wparam, lparam, old.unwrap_or_default());
+            let font =
+                ui::on_dpi_changed(hwnd, &all_items(), wparam, lparam, old.unwrap_or_default());
             CONTEXT.with(|c| {
                 if let Some(context) = c.borrow_mut().as_mut() {
                     context.font = font;
@@ -698,12 +852,12 @@ unsafe fn on_pick_app(hwnd: HWND, id: i32) {
     ui::focus(hwnd, id);
 }
 
-/// 「保存」: 検証して settings.json に書き、メインスレッドへ反映を頼んで閉じる。
-unsafe fn on_save(hwnd: HWND) {
+/// 「OK」「適用」: 検証して settings.json に書き、メインスレッドへ反映を頼む。`close` なら閉じる。
+unsafe fn on_save(hwnd: HWND, close: bool) {
     let form = match read_form(hwnd) {
         Ok(form) => form,
         Err((id, message)) => {
-            report_invalid(hwnd, id, &message);
+            report_invalid_on_page(hwnd, id, &message);
             return;
         }
     };
@@ -722,13 +876,26 @@ unsafe fn on_save(hwnd: HWND) {
     if let Some(message) =
         hotkey_rules::find_conflict(&hotkeys, (form.hotkey, &form.target_apps))
     {
-        show_message(hwnd, &message, MB_ICONWARNING);
-        ui::focus(hwnd, ID_KEY);
+        report_invalid_on_page(hwnd, ID_KEY, &message);
         return;
     }
     if let Some(message) = history_conflict(&form, &hotkeys) {
-        show_message(hwnd, &message, MB_ICONWARNING);
-        ui::focus(hwnd, ID_CH_KEY);
+        report_invalid_on_page(hwnd, ID_CH_KEY, &message);
+        return;
+    }
+    // 履歴を残さない設定に変えると、保存してある履歴（ピン留めを含む）が消える。確かめる。
+    if settings.clipboard_history.keep_after_exit
+        && form.history.enabled
+        && !form.history.keep_after_exit
+        && !ui::ask_yes_no(
+            hwnd,
+            "「アプリを終了しても履歴を残す」を OFF にすると、保存してある履歴\
+             （ピン留めしたものを含む）は消えます。よろしいですか？",
+        )
+    {
+        return;
+    }
+    if !IsWindow(hwnd).as_bool() {
         return;
     }
     settings.remap.hotkey = form.hotkey.format();
@@ -768,8 +935,15 @@ unsafe fn on_save(hwnd: HWND) {
         }
     }
 
-    let _ = tx.send(TrayMessage::SettingsSaved(Box::new(settings)));
+    let _ = tx.send(TrayMessage::SettingsSaved(Box::new(settings.clone())));
     log::info!("設定を保存しました");
+    // 「適用」のあとも続けて編集できるよう、保存した内容を今の状態として覚える。
+    CONTEXT.with(|c| {
+        if let Some(context) = c.borrow_mut().as_mut() {
+            context.settings = settings;
+        }
+    });
+    mark_clean(hwnd);
 
     if let Some(e) = startup_error {
         show_message(
@@ -778,7 +952,9 @@ unsafe fn on_save(hwnd: HWND) {
             MB_ICONWARNING,
         );
     }
-    let _ = DestroyWindow(hwnd);
+    if close && IsWindow(hwnd).as_bool() {
+        let _ = DestroyWindow(hwnd);
+    }
 }
 
 /// 履歴の一覧を出すキーが、値貼り付けのキーやキー割り当てと重なっていれば、その説明を返す。
@@ -814,9 +990,9 @@ fn history_conflict_with(
 
 /// 「履歴を消す」: 覚えている履歴と、保存した履歴を消す。
 unsafe fn on_clear_history(hwnd: HWND) {
-    if ui::ask_yes_no(hwnd, "クリップボードの履歴をすべて消しますか？（元には戻せません）") {
+    if ui::ask_yes_no(hwnd, "クリップボードの履歴をすべて削除しますか？\n\nピン留めしたものは残ります。削除した履歴は元に戻せません。") {
         actions::clear_history();
-        show_message(hwnd, "クリップボードの履歴を消しました。", MB_ICONINFORMATION);
+        show_message(hwnd, "クリップボードの履歴を削除しました。", MB_ICONINFORMATION);
     }
 }
 
@@ -965,23 +1141,37 @@ fn periodic_hours(saved: u64) -> u64 {
     }
 }
 
-/// 「既定に戻す」: 画面の値を既定値にする（保存するまでは反映しない）。
+/// 「すべて既定値に戻す」: 確かめてから、画面の値を既定値にする（保存するまでは反映しない）。
 /// 自動起動は既定値を持たない（ショートカットの有無で決まる）ので、今の選択のままにする。
 unsafe fn on_defaults(hwnd: HWND) {
+    if !ui::ask_yes_no(
+        hwnd,
+        "すべてのページの設定を、既定値に戻しますか？\n\n\
+         キー割り当て・定型文・履歴は変わりません。「OK」か「適用」を押すまでは保存しません。",
+    ) || !IsWindow(hwnd).as_bool()
+    {
+        return;
+    }
     let startup = is_checked(hwnd, ID_STARTUP);
+    // 確認の間隔も既定に戻す（画面に出している「6 時間おき」と、保存する値を合わせる）。
+    CONTEXT.with(|c| {
+        if let Some(context) = c.borrow_mut().as_mut() {
+            context.settings.update.check_every_hours = config::DEFAULT_CHECK_EVERY_HOURS;
+        }
+    });
     fill_form(hwnd, &Form::from_settings(&Settings::default(), startup));
 }
 
-/// 「記録を開く」: log.txt を既定のアプリ（メモ帳など）で開く。
+/// 「ログを開く」: log.txt を既定のアプリ（メモ帳など）で開く。
 unsafe fn on_open_log(hwnd: HWND) {
     let Some(path) = logging::log_file() else {
-        show_message(hwnd, "記録の場所を決められませんでした。", MB_ICONERROR);
+        show_message(hwnd, "ログの場所を決められませんでした。", MB_ICONERROR);
         return;
     };
     if !path.exists() {
         show_message(
             hwnd,
-            "まだ記録はありません。\n\n「トラブル調査用に動作を記録する」を ON にして保存すると、記録を始めます。",
+            "まだログはありません。\n\n「動作のログを保存する」を ON にして「適用」を押すと、ログを残し始めます。",
             MB_ICONINFORMATION,
         );
         return;
@@ -1006,10 +1196,10 @@ unsafe fn on_open_log(hwnd: HWND) {
     }
 }
 
-/// 「設定ファイルの場所を開く」: エクスプローラーで settings.json を選んだ状態で開く。
+/// 「設定フォルダーを開く」: エクスプローラーで settings.json を選んだ状態で開く。
 unsafe fn on_open_folder(hwnd: HWND) {
     let Some(path) = config::settings_file() else {
-        show_message(hwnd, "設定ファイルの場所を決められませんでした。", MB_ICONERROR);
+        show_message(hwnd, "設定フォルダーの場所を決められませんでした。", MB_ICONERROR);
         return;
     };
     let (file, params) = if path.exists() {

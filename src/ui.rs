@@ -22,7 +22,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
     CheckDlgButton, InitCommonControlsEx, IsDlgButtonChecked, BST_CHECKED, BST_UNCHECKED,
-    ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
+    ICC_STANDARD_CLASSES, ICC_TAB_CLASSES, INITCOMMONCONTROLSEX,
 };
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, SystemParametersInfoForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
@@ -36,7 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MB_OK, MESSAGEBOX_STYLE, MSG, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE,
     SWP_NOZORDER, SW_RESTORE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT, WNDCLASSW,
     WNDPROC, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
-    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    WS_CLIPSIBLINGS, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::ime_logic;
@@ -114,9 +114,12 @@ pub enum Kind {
     OwnerList,
     Button,
     DefaultButton,
+    /// ページを切り替えるタブ（見出しの並びだけを使い、中身は同じ画面の上に出し分ける）。
+    Tabs,
 }
 
 /// 1 つのコントロールの定義。位置と大きさは 96 DPI 基準で、表示時に DPI に合わせて拡大する。
+#[derive(Clone, Copy)]
 pub struct Item {
     pub id: i32,
     pub kind: Kind,
@@ -224,7 +227,7 @@ impl SingleWindow {
 pub unsafe fn init_common_controls() {
     let icc = INITCOMMONCONTROLSEX {
         dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-        dwICC: ICC_STANDARD_CLASSES,
+        dwICC: ICC_STANDARD_CLASSES | ICC_TAB_CLASSES,
     };
     let _ = InitCommonControlsEx(&icc);
 }
@@ -263,7 +266,13 @@ pub unsafe fn create_owned_window(
         WINDOW_EX_STYLE::default(),
         class_name,
         PCWSTR(title.as_ptr()),
-        WINDOW_STYLE_FRAME,
+        // 持ち主のある画面（持ち主を操作できなくして出す画面）には、最小化ボタンを付けない
+        // （最小化すると、持ち主が固まったように見える）。
+        if owner.is_invalid() {
+            WINDOW_STYLE_FRAME
+        } else {
+            WINDOW_STYLE(WINDOW_STYLE_FRAME.0 & !WS_MINIMIZEBOX.0)
+        },
         work.left,
         work.top,
         100,
@@ -409,6 +418,7 @@ pub unsafe fn create_controls(hwnd: HWND, items: &[Item], font: HFONT) {
                 0x0010 | 0x2000 | 0x0100 | LBS_NOTIFY as u32,
                 0,
             ),
+            Kind::Tabs => (w!("SysTabControl32"), WS_TABSTOP.0 | WS_CLIPSIBLINGS.0, 0),
             Kind::Button => (w!("BUTTON"), BS_PUSHBUTTON as u32 | WS_TABSTOP.0, 0),
             Kind::DefaultButton => (w!("BUTTON"), BS_DEFPUSHBUTTON as u32 | WS_TABSTOP.0, 0),
         };
@@ -484,6 +494,61 @@ pub unsafe fn on_dpi_changed(
         let _ = DeleteObject(old_font);
     }
     font
+}
+
+/// `TCN_SELCHANGE`（タブが切り替わった通知コード。`WM_NOTIFY` で届く）。
+pub const TCN_SELCHANGE: u32 = -551i32 as u32;
+
+/// タブに見出しを入れる。
+pub unsafe fn add_tabs(hwnd: HWND, id: i32, names: &[&str]) {
+    use windows::Win32::UI::Controls::{TCIF_TEXT, TCITEMW, TCM_INSERTITEMW};
+    let Ok(tabs) = GetDlgItem(hwnd, id) else {
+        return;
+    };
+    for (i, name) in names.iter().enumerate() {
+        let mut text = wide(name);
+        let item = TCITEMW {
+            mask: TCIF_TEXT,
+            pszText: windows::core::PWSTR(text.as_mut_ptr()),
+            ..Default::default()
+        };
+        SendMessageW(tabs, TCM_INSERTITEMW, WPARAM(i), LPARAM(&item as *const TCITEMW as isize));
+    }
+}
+
+/// 選ばれているタブ。
+pub unsafe fn tab_index(hwnd: HWND, id: i32) -> usize {
+    use windows::Win32::UI::Controls::TCM_GETCURSEL;
+    GetDlgItem(hwnd, id)
+        .map(|tabs| SendMessageW(tabs, TCM_GETCURSEL, WPARAM(0), LPARAM(0)).0)
+        .ok()
+        .and_then(|i| usize::try_from(i).ok())
+        .unwrap_or(0)
+}
+
+/// タブを選ぶ（通知は届かないので、呼び出し側でページを出し分ける）。
+pub unsafe fn set_tab_index(hwnd: HWND, id: i32, index: usize) {
+    use windows::Win32::UI::Controls::TCM_SETCURSEL;
+    if let Ok(tabs) = GetDlgItem(hwnd, id) {
+        SendMessageW(tabs, TCM_SETCURSEL, WPARAM(index), LPARAM(0));
+    }
+}
+
+/// 入力できるコントロール（チェック・選択・入力欄）の中身を、比べられる 1 つの文字にする。
+/// 開いたときと比べて、保存していない変更があるかを調べるのに使う。
+pub unsafe fn snapshot(hwnd: HWND, items: &[Item]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for item in items {
+        match item.kind {
+            Kind::Check => parts.push(u8::from(is_checked(hwnd, item.id)).to_string()),
+            Kind::Combo => {
+                parts.push(combo_index(hwnd, item.id).map_or(String::new(), |i| i.to_string()))
+            }
+            Kind::Edit | Kind::NumberEdit | Kind::MultiEdit => parts.push(get_text(hwnd, item.id)),
+            _ => {}
+        }
+    }
+    parts.join("\u{1f}")
 }
 
 pub unsafe fn add_combo_items<'a>(hwnd: HWND, id: i32, items: impl Iterator<Item = &'a str>) {

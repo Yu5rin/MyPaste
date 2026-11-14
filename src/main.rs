@@ -324,7 +324,9 @@ fn main() {
                 // 設定画面で変えられる項目だけを入れ替える（キー割り当て・定型文や、画面を開いて
                 // いる間にトレイで切り替えたものを、画面を開いたときの古い値で戻さないように）。
                 let saved = *saved;
-                settings.remap = saved.remap;
+                // 値貼り付けの ON/OFF はトレイで切り替えるので、画面を開いたときの値で戻さない。
+                settings.remap.hotkey = saved.remap.hotkey;
+                settings.remap.target_apps = saved.remap.target_apps;
                 settings.ime_indicator = saved.ime_indicator;
                 settings.log = saved.log;
                 settings.update.check_on_startup = saved.update.check_on_startup;

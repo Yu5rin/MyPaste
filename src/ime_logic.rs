@@ -77,7 +77,7 @@ pub enum Theme {
 impl Theme {
     /// 設定画面の一覧の順（設定値, 設定値の名前, 表示名）。
     pub const ALL: [(Theme, &'static str, &'static str); 2] =
-        [(Theme::Dark, "dark", "濃い色"), (Theme::Light, "light", "明るい色")];
+        [(Theme::Dark, "dark", "ダーク"), (Theme::Light, "light", "ライト")];
 
     /// settings.json の値から読む。知らない値は濃い色。
     pub fn from_setting(text: &str) -> Theme {
