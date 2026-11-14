@@ -588,6 +588,9 @@ unsafe fn on_save(hwnd: HWND) {
     let added: Vec<Snippet> = config::Settings::load()
         .snippets
         .into_iter()
+        // 開いたときと同じそろえ方をしてから比べる（そろえないと、手で書いた定型文を
+        // 「ほかの場所で足された」と数えてしまう）。
+        .map(|s| snippets::make(&s.name, &s.text).unwrap_or(s))
         .filter(|s| !loaded.contains(s) && !current.contains(s))
         .collect();
     if !added.is_empty()

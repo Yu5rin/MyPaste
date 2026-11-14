@@ -401,10 +401,13 @@ static LOAD_PROBLEM: Mutex<Option<String>> = Mutex::new(None);
 /// settings.json に読めない所があったことを覚えておく。最初の 1 回は、直す前の中身を
 /// `settings.json.bak` に写しておく（このあとの保存で、読めなかった所が既定値に置き換わるため）。
 fn report_load_problem(path: &Path, error: &str, problems: &[String]) {
-    let mut slot = LOAD_PROBLEM.lock().unwrap_or_else(|p| p.into_inner());
-    if slot.is_some() {
+    // 知らせるのも写しを作るのも、起動してから最初の 1 回だけ（あとの読み込みで写しを
+    // 作り直すと、保存で変わったあとの中身で、元の中身の写しを上書きしてしまう）。
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if REPORTED.swap(true, Ordering::SeqCst) {
         return;
     }
+    let mut slot = LOAD_PROBLEM.lock().unwrap_or_else(|p| p.into_inner());
     let mut backup = path.as_os_str().to_owned();
     backup.push(".bak");
     let backup = PathBuf::from(backup);

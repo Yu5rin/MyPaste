@@ -40,6 +40,7 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetAncestor,
     GetForegroundWindow, GetMessageW, GetShellWindow, GetWindowLongPtrW, IsHungAppWindow,
+    SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_NULL,
     GetWindowThreadProcessId, KillTimer, MessageBoxW, PeekMessageW, PostMessageW,
     PostQuitMessage, PostThreadMessageW, RegisterClassW, SetForegroundWindow, SetTimer,
     SetWindowPos, TranslateMessage, GA_ROOT, GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOPMOST,
@@ -67,6 +68,8 @@ const PASTE_ACCEPT_WAIT: Duration = Duration::from_millis(500);
 /// 貼り付け先が文字を読みに来てから、元のクリップボードに戻すまでの待ち時間
 /// （同じ貼り付けの中で、別の形式を続けて読みに来ることがあるため）。
 const PASTE_SETTLE_WAIT: Duration = Duration::from_millis(300);
+/// 貼り付け先が応答するかを確かめるときに、返事を待つ時間（ミリ秒）。
+const HUNG_PROBE_MS: u32 = 200;
 /// 貼り付け先が固まっているとき、動き出すのを待つ上限。
 const PASTE_HUNG_WAIT: Duration = Duration::from_secs(10);
 
@@ -936,7 +939,25 @@ unsafe fn paste_text(held: &Hotkey, text: &str) {
 /// 前面のウィンドウが、メッセージに応答していないか。
 unsafe fn foreground_is_hung() -> bool {
     let window = GetForegroundWindow();
-    !window.is_invalid() && IsHungAppWindow(window).as_bool()
+    if window.is_invalid() {
+        return false;
+    }
+    if IsHungAppWindow(window).as_bool() {
+        return true;
+    }
+    // IsHungAppWindow が「固まっている」と言うのは 5 秒ほどたってから。数秒だけ忙しい相手も
+    // 見分けられるよう、何もしないメッセージを送って、すぐに返事が来るかを確かめる。
+    let mut result = 0usize;
+    SendMessageTimeoutW(
+        window,
+        WM_NULL,
+        WPARAM(0),
+        LPARAM(0),
+        SMTO_ABORTIFHUNG,
+        HUNG_PROBE_MS,
+        Some(&mut result),
+    )
+    .0 == 0
 }
 
 /// 文字を、遅延レンダリングでクリップボードに予約する（中身は求められたときに渡す）。

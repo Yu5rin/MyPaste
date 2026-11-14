@@ -62,6 +62,19 @@ const IDLE_BEFORE_AUTO_INSTALL: Duration = Duration::from_secs(120);
 /// 操作が無くなるのを待つ間の、確かめる間隔。
 const IDLE_POLL: Duration = Duration::from_secs(5);
 
+/// 確認に失敗したあと、次に自動で試すまで空ける時間。
+const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60 * 60);
+/// 確認に失敗したあと、次に自動で試してよい時刻。
+static RETRY_AFTER: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// 確認に失敗したばかりで、自動の確認を控える間か（起動している間の定期的な確認が見る）。
+pub fn is_backing_off() -> bool {
+    RETRY_AFTER
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_some_and(|at| std::time::Instant::now() < at)
+}
+
 /// 尋ねずに更新する設定で、ダウンロードを済ませて入れ替える時を待っている版。
 static PENDING_INSTALL: Mutex<Option<Version>> = Mutex::new(None);
 
@@ -704,6 +717,9 @@ pub fn run(settings: Settings, tx: Sender<TrayMessage>, trigger: Trigger) {
         Err(e) => {
             // 通信の失敗は起動を妨げない。手動確認のときだけ知らせる。
             log::warn!("更新の確認に失敗しました: {e}");
+            // つながらない間に、10 分おきに問い合わせ続けないよう、次に試すまで間を空ける。
+            *RETRY_AFTER.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some(std::time::Instant::now() + RETRY_AFTER_FAILURE);
             if manual {
                 // 403（問い合わせ回数の上限）は利用者の操作が原因ではないため、
                 // それ以外の失敗と案内文を分ける。「403」とだけ出しても、
@@ -1018,13 +1034,22 @@ fn with_detail(summary: &str, detail: &str) -> String {
 ///
 /// `main.rs` からも（初期化失敗時の通知に）呼べるよう `pub(crate)` にしている。
 pub(crate) fn message_box(text: &str, style: MESSAGEBOX_STYLE) -> i32 {
+    // 更新の途中で利用者の返事を待っている間は、終了のときに待たせない（数えておく）。
+    WAITING_FOR_USER.fetch_add(1, Ordering::SeqCst);
+    let answer = notice_box(text, style);
+    WAITING_FOR_USER.fetch_sub(1, Ordering::SeqCst);
+    answer
+}
+
+/// 更新とは関係のないお知らせのメッセージボックス（[`message_box`] と違い、「更新が利用者の
+/// 返事を待っている」とは数えない）。
+pub(crate) fn notice_box(text: &str, style: MESSAGEBOX_STYLE) -> i32 {
     let text_w: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     let title_w: Vec<u16> = DIALOG_TITLE
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    WAITING_FOR_USER.fetch_add(1, Ordering::SeqCst);
-    let answer = unsafe {
+    unsafe {
         MessageBoxW(
             None,
             PCWSTR(text_w.as_ptr()),
@@ -1033,9 +1058,7 @@ pub(crate) fn message_box(text: &str, style: MESSAGEBOX_STYLE) -> i32 {
             style | MB_SETFOREGROUND | MB_TOPMOST,
         )
         .0
-    };
-    WAITING_FOR_USER.fetch_sub(1, Ordering::SeqCst);
-    answer
+    }
 }
 
 #[cfg(test)]

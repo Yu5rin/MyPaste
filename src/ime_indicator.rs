@@ -519,7 +519,9 @@ unsafe fn query_foreground_ime() -> Option<Observed> {
 
     // 日本語の入力方式のときだけ表示する（韓国語・中国語の入力方式では「あ」「A」が当てはまらない）。
     const LANG_JAPANESE: usize = 0x0411;
-    if GetKeyboardLayout(thread_id).0 as usize & 0xFFFF != LANG_JAPANESE {
+    // 0 は「分からない」（コンソールのウィンドウなど）。そのときは表示をやめない。
+    let layout = GetKeyboardLayout(thread_id).0 as usize & 0xFFFF;
+    if layout != 0 && layout != LANG_JAPANESE {
         return None;
     }
 

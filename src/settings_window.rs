@@ -872,7 +872,8 @@ unsafe fn on_save(hwnd: HWND, close: bool) {
     // 値貼り付けのキーが、キー割り当てと重なっていないか確かめる（値貼り付けが先に効くので、
     // 重なった割り当ては使われなくなる）。割り当ては、この画面を開いたあとにキー割り当て画面で
     // 保存されていることもあるので、settings.json から読み直す。
-    let hotkeys = config::Settings::load().hotkeys;
+    let saved_now = config::Settings::load();
+    let hotkeys = saved_now.hotkeys;
     if let Some(message) =
         hotkey_rules::find_conflict(&hotkeys, (form.hotkey, &form.target_apps))
     {
@@ -900,7 +901,13 @@ unsafe fn on_save(hwnd: HWND, close: bool) {
     }
     settings.remap.hotkey = form.hotkey.format();
     settings.remap.target_apps = form.target_apps;
-    settings.ime_indicator.enabled = form.ime_enabled;
+    // ON/OFF は、この画面を開いている間にトレイメニューで切り替えられていることがある。
+    // この画面で変えていなければ、いま保存されている値を残す。
+    settings.ime_indicator.enabled = if form.ime_enabled == settings.ime_indicator.enabled {
+        saved_now.ime_indicator.enabled
+    } else {
+        form.ime_enabled
+    };
     let ime = &form.ime;
     settings.ime_indicator.hold_ms = ime.timing.hold_ms;
     settings.ime_indicator.fade_ms = ime.timing.fade_ms;
@@ -913,7 +920,13 @@ unsafe fn on_save(hwnd: HWND, close: bool) {
     settings.update.check_on_startup = form.check_update;
     settings.update.check_every_hours = form.update_every_hours;
     settings.update.mode = form.update_mode.as_setting().to_string();
+    let history_enabled = if form.history.enabled == settings.clipboard_history.enabled {
+        saved_now.clipboard_history.enabled
+    } else {
+        form.history.enabled
+    };
     settings.clipboard_history = form.history;
+    settings.clipboard_history.enabled = history_enabled;
 
     if let Err(e) = config::save_from_settings_window(&settings) {
         log::error!("設定の保存に失敗: {e}");

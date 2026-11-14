@@ -76,13 +76,16 @@ const HELP_URL: &str = "https://github.com/Yu5rin/MyPaste#readme";
 fn report_save(result: Result<(), String>) {
     if let Err(e) = result {
         log::error!("設定を保存できませんでした: {e}");
-        update::message_box(
-            &format!(
-                "切り替えた状態を保存できませんでした。\n\
-                 今回の起動中は切り替えた状態で動きますが、次回の起動では元に戻ります。\n\n詳細: {e}"
-            ),
-            MB_OK | MB_ICONERROR,
-        );
+        // メインスレッドを止めないよう、別のスレッドで知らせる。
+        thread::spawn(move || {
+            update::notice_box(
+                &format!(
+                    "切り替えた状態を保存できませんでした。\n\
+                     今回の起動中は切り替えた状態で動きますが、次回の起動では元に戻ります。\n\n詳細: {e}"
+                ),
+                MB_OK | MB_ICONERROR,
+            );
+        });
     }
 }
 
@@ -147,7 +150,7 @@ fn main() {
         // 黙って既定値で動くと、設定が消えたように見える。起動を止めないよう別のスレッドで知らせる。
         log::warn!("{problem}");
         thread::spawn(move || {
-            update::message_box(&problem, MB_OK | windows::Win32::UI::WindowsAndMessaging::MB_ICONWARNING);
+            update::notice_box(&problem, MB_OK | windows::Win32::UI::WindowsAndMessaging::MB_ICONWARNING);
         });
     }
 
@@ -177,7 +180,7 @@ fn main() {
             log::error!("フックスレッドの初期化に失敗したため終了します: {e}");
             // 本番ビルドはロガーを初期化しないため、これを出さないと利用者には
             // 「起動しても何も起きない」ようにしか見えない。
-            update::message_box(
+            update::notice_box(
                 &format!(
                     "キーボードフックの設置に失敗したため、アプリを起動できません。\n\n\
                      他のキーボード関連ソフトと競合している可能性があります。\n\n詳細: {e}"
@@ -190,7 +193,7 @@ fn main() {
         Err(_) => {
             // フックスレッドが応答を送らずに終了した（パニックなど）。
             log::error!("フックスレッドから応答がなかったため終了します");
-            update::message_box(
+            update::notice_box(
                 "キーボードフックの初期化中に問題が発生したため、アプリを起動できません。",
                 MB_OK | MB_ICONERROR,
             );
@@ -221,7 +224,7 @@ fn main() {
             log::error!("トレイ初期化失敗: {e}");
             // フック設置失敗の場合と同様、本番ビルドではログが出ないため
             // MessageBox で知らせる（さもないと無言で終了してしまう）。
-            update::message_box(
+            update::notice_box(
                 &format!(
                     "タスクトレイの初期化に失敗したため、アプリを起動できません。\n\n詳細: {e}"
                 ),
@@ -278,7 +281,7 @@ fn main() {
                 Err(e) => {
                     log::error!("自動起動設定失敗: {e}");
                     tray.update(|s| s.startup = startup::is_enabled());
-                    update::message_box(
+                    update::notice_box(
                         &format!("Windows の起動時に実行する設定を、切り替えられませんでした。\n\n詳細: {e}"),
                         MB_OK | MB_ICONERROR,
                     );
@@ -297,7 +300,7 @@ fn main() {
             TrayMessage::ToggleImeIndicator => {
                 if ime_indicator.is_none() {
                     // 起動時に表示ウィンドウを作れなかった。切り替えても動かないので知らせる。
-                    update::message_box(
+                    update::notice_box(
                         "入力モード表示を開始できなかったため、切り替えられません。",
                         MB_OK | MB_ICONERROR,
                     );
@@ -310,7 +313,7 @@ fn main() {
                 // 次回の起動でも同じ状態になるよう settings.json に保存する。
                 if let Err(e) = config::save_ime_indicator_enabled(on) {
                     log::error!("入力モード表示の設定を保存できませんでした: {e}");
-                    update::message_box(
+                    update::notice_box(
                         &format!(
                             "入力モード表示の設定を保存できませんでした。\n\
                              今回の起動中は切り替えた状態で動きますが、次回の起動では元に戻ります。\n\n詳細: {e}"
@@ -378,7 +381,11 @@ fn main() {
             }
             TrayMessage::UpdateTick => {
                 let hours = settings.update.check_every_hours;
-                if hours > 0 && !update::is_running() && config::should_check_now(hours) {
+                if hours > 0
+                    && !update::is_running()
+                    && !update::is_backing_off()
+                    && config::should_check_now(hours)
+                {
                     log::info!("動いている間の更新確認（{hours} 時間おき）");
                     let tx_update = tx.clone();
                     let settings_for_update = settings.clone();

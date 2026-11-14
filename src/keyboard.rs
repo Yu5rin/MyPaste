@@ -351,10 +351,16 @@ fn modifiers_match(hotkey: &Hotkey) -> bool {
         ours = 0;
     }
     let held = |vk_down: bool, bit: u32| vk_down || ours & bit != 0;
-    held(is_down(VK_CONTROL), MOD_CTRL) == hotkey.ctrl
+    let matched = held(is_down(VK_CONTROL), MOD_CTRL) == hotkey.ctrl
         && held(is_down(VK_SHIFT), MOD_SHIFT) == hotkey.shift
         && held(is_down(VK_MENU), MOD_ALT) == hotkey.alt
-        && held(is_down(VK_LWIN) || is_down(VK_RWIN), MOD_WIN) == hotkey.win
+        && held(is_down(VK_LWIN) || is_down(VK_RWIN), MOD_WIN) == hotkey.win;
+    if matched && ours != 0 {
+        // 印のおかげで一致した（Alt を押したまま続けて押している）。使われている間は、印を
+        // 古くなったとみなさない。
+        RELEASED_AT.store(unsafe { GetTickCount() }, Ordering::SeqCst);
+    }
+    matched
 }
 
 /// 低レベルキーボードフックのコールバック。

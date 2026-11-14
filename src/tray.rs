@@ -27,7 +27,8 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, LoadIconW, LoadImageW,
+    DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, KillTimer, LoadIconW,
+    LoadImageW, SetTimer, WM_TIMER,
     PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
     TrackPopupMenu, TranslateMessage, HICON, IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, MF_CHECKED,
     MF_DISABLED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SM_CXSMICON, SM_CYSMICON,
@@ -49,6 +50,9 @@ const APP_NAME: &str = "アタイの貼り付け";
 
 /// トレイのアイコンからの知らせに使うメッセージ。
 const WM_APP_TRAY: u32 = WM_APP + 1;
+/// アイコンの登録に失敗したとき、もう一度試すためのタイマーと、その間隔（ミリ秒）。
+const TIMER_RETRY_ADD: usize = 1;
+const RETRY_ADD_MS: u32 = 3000;
 /// トレイのアイコンの番号（このアプリのアイコンは 1 つだけ）。
 const ICON_ID: u32 = 1;
 
@@ -240,7 +244,8 @@ unsafe fn thread_main(
     });
     if !notify_icon(hwnd, NIM_ADD, NIF_ICON | NIF_TIP | NIF_MESSAGE, &shared, None) {
         // サインイン直後など、タスクバーがまだ無いことがある。TaskbarCreated が届いたら登録する。
-        log::warn!("トレイのアイコンを登録できませんでした（タスクバーの準備ができたら、もう一度試します）");
+        log::warn!("トレイのアイコンを登録できませんでした（少し待って、もう一度試します）");
+        SetTimer(hwnd, TIMER_RETRY_ADD, RETRY_ADD_MS, None);
     }
     let _ = ready.send(Ok(hwnd.0 as isize));
 
@@ -332,6 +337,17 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 == TIMER_RETRY_ADD => {
+            // サインイン直後は、エクスプローラーが忙しくて登録に失敗することがある。
+            let shared = CONTEXT.with(|c| c.borrow().as_ref().map(|ctx| Arc::clone(&ctx.shared)));
+            if let Some(shared) = shared {
+                if notify_icon(hwnd, NIM_ADD, NIF_ICON | NIF_TIP | NIF_MESSAGE, &shared, None) {
+                    let _ = KillTimer(hwnd, TIMER_RETRY_ADD);
+                    log::info!("トレイのアイコンを登録しました");
+                }
+            }
+            LRESULT(0)
+        }
         WM_CLOSE => {
             let shared = CONTEXT.with(|c| c.borrow().as_ref().map(|ctx| Arc::clone(&ctx.shared)));
             if let Some(shared) = shared {
@@ -354,7 +370,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             if let Some(shared) = restarted {
                 // エクスプローラーが再起動した。アイコンを登録し直す。
                 log::info!("タスクバーが作り直されたため、トレイのアイコンを登録し直します");
-                notify_icon(hwnd, NIM_ADD, NIF_ICON | NIF_TIP | NIF_MESSAGE, &shared, None);
+                if notify_icon(hwnd, NIM_ADD, NIF_ICON | NIF_TIP | NIF_MESSAGE, &shared, None) {
+                    let _ = KillTimer(hwnd, TIMER_RETRY_ADD);
+                }
                 return LRESULT(0);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
