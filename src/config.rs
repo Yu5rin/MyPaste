@@ -219,6 +219,12 @@ pub struct ImeIndicatorSettings {
     pub opacity: u32,
     /// 全画面のアプリ（ゲーム・動画・プレゼンテーションなど）の間は表示しないか。
     pub hide_in_fullscreen: bool,
+    /// 切り替えたときに、画面に大きく表示するか。
+    pub flash: bool,
+    /// いまの入力モードを小さな印で出し続ける場所（`"off"` / `"caret"` / `"mouse"`）。
+    pub badge: String,
+    /// 小さな印の一辺（96 DPI 基準のピクセル。12〜48）。
+    pub badge_size: u32,
 }
 
 impl Default for ImeIndicatorSettings {
@@ -232,6 +238,9 @@ impl Default for ImeIndicatorSettings {
             theme: "dark".to_string(),
             opacity: crate::ime_logic::DEFAULT_OPACITY,
             hide_in_fullscreen: false,
+            flash: true,
+            badge: "caret".to_string(),
+            badge_size: crate::ime_logic::DEFAULT_BADGE_SIZE,
         }
     }
 }
@@ -475,6 +484,9 @@ pub fn save_from_settings_window(settings: &Settings) -> Result<(), String> {
             "theme": settings.ime_indicator.theme,
             "opacity": settings.ime_indicator.opacity,
             "hide_in_fullscreen": settings.ime_indicator.hide_in_fullscreen,
+            "flash": settings.ime_indicator.flash,
+            "badge": settings.ime_indicator.badge,
+            "badge_size": settings.ime_indicator.badge_size,
         },
         "log": {
             "enabled": settings.log.enabled,

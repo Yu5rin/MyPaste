@@ -46,7 +46,7 @@ use crate::config::{self, ClipboardHistorySettings, Settings};
 use crate::hotkey_rules;
 use crate::ime_indicator::{Params, Timing};
 use crate::ime_logic::{
-    self, Position, Theme, FADE_MS_MAX, FADE_MS_MIN, HOLD_MS_MAX, HOLD_MS_MIN, OPACITY_MAX,
+    self, Badge, Position, Theme, FADE_MS_MAX, FADE_MS_MIN, HOLD_MS_MAX, HOLD_MS_MIN, OPACITY_MAX,
     OPACITY_MIN, SIZE_MAX, SIZE_MIN,
 };
 use crate::remap_logic::{self, Hotkey, KEYS};
@@ -115,6 +115,9 @@ const ID_CH_INTERVAL_UNIT: i32 = 167;
 
 const ID_APPLY: i32 = 170;
 const ID_TABS: i32 = 171;
+const ID_BADGE: i32 = 180;
+const ID_BADGE_SIZE: i32 = 181;
+const ID_FLASH: i32 = 182;
 
 /// 画面の中身の大きさ（96 DPI 基準）。ノート PC（1366x768、表示 125%）でも収まる大きさにする。
 const CLIENT_W: i32 = 500;
@@ -171,26 +174,33 @@ const PAGE_REMAP: &[Item] = &[
 
 /// 「入力モード」のページ。
 const PAGE_IME: &[Item] = &[
-    item(ID_IME_ENABLED, Kind::Check, "入力モード（あ / A）を切り替えたら、画面に大きく表示する", 16, 48, 468, 22),
-    item(220, Kind::Group, "表示のしかた", 12, 76, 476, 236),
-    item(221, Kind::Label, "表示する位置", 24, 100, 112, 24),
-    item(ID_POSITION, Kind::Combo, "", 140, 100, 170, 200),
-    item(222, Kind::Label, "配色", 24, 132, 112, 24),
-    item(ID_THEME, Kind::Combo, "", 140, 132, 170, 200),
-    item(223, Kind::Label, "表示時間", 24, 164, 112, 24),
-    item(ID_HOLD, Kind::Edit, "", 140, 164, 70, 24),
-    item(224, Kind::Label, "秒（0.1〜5）", 216, 164, 200, 24),
-    item(225, Kind::Label, "フェードアウト", 24, 196, 112, 24),
-    item(ID_FADE, Kind::Edit, "", 140, 196, 70, 24),
-    item(226, Kind::Label, "秒（0〜2。0 ですぐに消す）", 216, 196, 220, 24),
-    item(227, Kind::Label, "大きさ", 24, 228, 112, 24),
-    item(ID_SIZE, Kind::NumberEdit, "", 140, 228, 70, 24),
-    item(228, Kind::Label, "px（40〜600）", 216, 228, 150, 24),
-    item(229, Kind::Label, "不透明度", 24, 260, 112, 24),
-    item(ID_OPACITY, Kind::NumberEdit, "", 140, 260, 70, 24),
-    item(230, Kind::Label, "%（30〜100）", 216, 260, 150, 24),
-    item(ID_PREVIEW, Kind::Button, "プレビュー(&P)", 366, 258, 110, 28),
-    item(ID_FULLSCREEN, Kind::Check, "全画面のアプリ（ゲーム・動画・発表など）では表示しない", 16, 322, 468, 22),
+    item(ID_IME_ENABLED, Kind::Check, "入力モード（あ / A）を表示する（メニューの「入力モードの表示」と同じ）", 16, 48, 468, 22),
+    item(220, Kind::Group, "切り替えたとき", 12, 74, 476, 222),
+    item(ID_FLASH, Kind::Check, "切り替えたときに、画面に大きく表示する", 24, 94, 440, 22),
+    item(221, Kind::Label, "表示する位置", 24, 122, 112, 24),
+    item(ID_POSITION, Kind::Combo, "", 140, 122, 170, 200),
+    item(222, Kind::Label, "配色", 24, 150, 112, 24),
+    item(ID_THEME, Kind::Combo, "", 140, 150, 170, 200),
+    item(223, Kind::Label, "表示時間", 24, 178, 112, 24),
+    item(ID_HOLD, Kind::Edit, "", 140, 178, 70, 24),
+    item(224, Kind::Label, "秒（0.1〜5）", 216, 178, 200, 24),
+    item(225, Kind::Label, "フェードアウト", 24, 206, 112, 24),
+    item(ID_FADE, Kind::Edit, "", 140, 206, 70, 24),
+    item(226, Kind::Label, "秒（0〜2。0 ですぐに消す）", 216, 206, 220, 24),
+    item(227, Kind::Label, "大きさ", 24, 234, 112, 24),
+    item(ID_SIZE, Kind::NumberEdit, "", 140, 234, 70, 24),
+    item(228, Kind::Label, "px（40〜600）", 216, 234, 150, 24),
+    item(229, Kind::Label, "不透明度", 24, 262, 112, 24),
+    item(ID_OPACITY, Kind::NumberEdit, "", 140, 262, 70, 24),
+    item(230, Kind::Label, "%（30〜100）", 216, 262, 150, 24),
+    item(ID_PREVIEW, Kind::Button, "プレビュー(&P)", 366, 260, 110, 28),
+    item(231, Kind::Group, "いまの入力モードを、小さな印で出し続ける", 12, 302, 476, 58),
+    item(232, Kind::Label, "出す場所", 24, 324, 66, 24),
+    item(ID_BADGE, Kind::Combo, "", 92, 324, 262, 200),
+    item(233, Kind::Label, "大きさ", 364, 324, 44, 24),
+    item(ID_BADGE_SIZE, Kind::NumberEdit, "", 410, 324, 40, 24),
+    item(234, Kind::Label, "px", 454, 324, 24, 24),
+    item(ID_FULLSCREEN, Kind::Check, "全画面のアプリ（ゲーム・動画・発表など）では表示しない", 16, 368, 468, 22),
 ];
 
 /// 「クリップボードの履歴」のページ。
@@ -361,6 +371,7 @@ unsafe fn thread_main(tx: Sender<TrayMessage>, settings: Settings, startup: bool
     ui::add_combo_items(hwnd, ID_KEY, KEYS.iter().map(|(name, _)| *name));
     ui::add_combo_items(hwnd, ID_POSITION, Position::ALL.iter().map(|(_, _, name)| *name));
     ui::add_combo_items(hwnd, ID_THEME, Theme::ALL.iter().map(|(_, _, name)| *name));
+    ui::add_combo_items(hwnd, ID_BADGE, Badge::ALL.iter().map(|(_, _, name)| *name));
     ui::add_combo_items(hwnd, ID_UPDATE_MODE, UpdateMode::ALL.iter().map(|(_, _, name)| *name));
     ui::add_combo_items(hwnd, ID_CH_TRIGGER, Trigger::ALL.iter().map(|(_, _, name)| *name));
     ui::add_combo_items(hwnd, ID_CH_KEY, KEYS.iter().map(|(name, _)| *name));
@@ -405,6 +416,10 @@ unsafe fn fill_form(hwnd: HWND, form: &Form) {
     set_text(hwnd, ID_SIZE, &ime.size.to_string());
     set_text(hwnd, ID_OPACITY, &ime.opacity.to_string());
     set_checked(hwnd, ID_FULLSCREEN, ime.hide_in_fullscreen);
+    set_checked(hwnd, ID_FLASH, ime.flash);
+    let badge_index = Badge::ALL.iter().position(|(b, _, _)| *b == ime.badge).unwrap_or(0);
+    set_combo_index(hwnd, ID_BADGE, badge_index);
+    set_text(hwnd, ID_BADGE_SIZE, &ime.badge_size.to_string());
     set_checked(hwnd, ID_STARTUP, form.startup);
     set_checked(hwnd, ID_UPDATE, form.check_update);
     set_checked(hwnd, ID_UPDATE_PERIODIC, form.update_every_hours > 0);
@@ -423,16 +438,11 @@ unsafe fn fill_form(hwnd: HWND, form: &Form) {
 /// 入力モードの表示を使わないときは、表示のしかたの欄を使えなくする。
 unsafe fn update_ime_fields(hwnd: HWND) {
     let on = is_checked(hwnd, ID_IME_ENABLED);
-    for id in [
-        ID_POSITION,
-        ID_THEME,
-        ID_HOLD,
-        ID_FADE,
-        ID_SIZE,
-        ID_OPACITY,
-        ID_PREVIEW,
-        ID_FULLSCREEN,
-    ] {
+    let flash = on && is_checked(hwnd, ID_FLASH);
+    for id in [ID_POSITION, ID_THEME, ID_HOLD, ID_FADE, ID_SIZE, ID_OPACITY, ID_PREVIEW] {
+        ui::set_enabled(hwnd, id, flash);
+    }
+    for id in [ID_FLASH, ID_FULLSCREEN, ID_BADGE, ID_BADGE_SIZE] {
         ui::set_enabled(hwnd, id, on);
     }
 }
@@ -724,6 +734,25 @@ unsafe fn read_ime_params(hwnd: HWND) -> Result<Params, (i32, String)> {
         theme,
         opacity,
         hide_in_fullscreen: is_checked(hwnd, ID_FULLSCREEN),
+        flash: is_checked(hwnd, ID_FLASH),
+        badge: combo_index(hwnd, ID_BADGE)
+            .and_then(|i| Badge::ALL.get(i))
+            .map_or(Badge::Off, |(b, _, _)| *b),
+        badge_size: parse_in_range(
+            &get_text(hwnd, ID_BADGE_SIZE),
+            u64::from(ime_logic::BADGE_SIZE_MIN),
+            u64::from(ime_logic::BADGE_SIZE_MAX),
+        )
+        .ok_or_else(|| {
+            (
+                ID_BADGE_SIZE,
+                format!(
+                    "小さな印の大きさは {}〜{} の数で入力してください。",
+                    ime_logic::BADGE_SIZE_MIN,
+                    ime_logic::BADGE_SIZE_MAX
+                ),
+            )
+        })? as u32,
     })
 }
 
@@ -776,7 +805,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             {
                 update_history_fields(hwnd);
             }
-            if id == ID_IME_ENABLED && code == BN_CLICKED {
+            if (id == ID_IME_ENABLED || id == ID_FLASH) && code == BN_CLICKED {
                 update_ime_fields(hwnd);
             }
             if code == BN_CLICKED {
@@ -916,6 +945,9 @@ unsafe fn on_save(hwnd: HWND, close: bool) {
     settings.ime_indicator.theme = ime.theme.as_setting().to_string();
     settings.ime_indicator.opacity = ime.opacity;
     settings.ime_indicator.hide_in_fullscreen = ime.hide_in_fullscreen;
+    settings.ime_indicator.flash = ime.flash;
+    settings.ime_indicator.badge = ime.badge.as_setting().to_string();
+    settings.ime_indicator.badge_size = ime.badge_size;
     settings.log.enabled = form.log;
     settings.update.check_on_startup = form.check_update;
     settings.update.check_every_hours = form.update_every_hours;

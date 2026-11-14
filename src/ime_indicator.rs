@@ -58,13 +58,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, PostThreadMessageW, RegisterClassW, SendMessageTimeoutW,
     SetLayeredWindowAttributes, SetTimer, SetWindowPos, ShowWindow, TranslateMessage,
     GUITHREADINFO, HTTRANSPARENT, HWND_TOPMOST, LWA_ALPHA, MA_NOACTIVATE, MSG, SMTO_ABORTIFHUNG,
-    SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, WM_APP, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WM_APP, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT,
     WM_QUIT, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use crate::config::ImeIndicatorSettings;
-use crate::ime_logic::{self, ImeMode, ModeTracker, Position, ReadabilityLog, Theme};
+use crate::ime_logic::{self, Badge, ImeMode, ModeTracker, Position, ReadabilityLog, Theme};
 
 /// IME の状態を調べる間隔（ミリ秒）。
 const POLL_INTERVAL_MS: u32 = 100;
@@ -86,6 +86,17 @@ const IMC_GETOPENSTATUS: usize = 0x0005;
 const TIMER_POLL: usize = 1;
 /// タイマーの識別子: フェード。
 const TIMER_ANIM: usize = 2;
+/// マウスカーソルに付いて動かす小さな印の、位置を直すタイマー。
+const TIMER_BADGE: usize = 3;
+/// 小さな印をマウスに付いて動かすときの、位置を直す間隔（ミリ秒）。
+const BADGE_FOLLOW_INTERVAL_MS: u32 = 30;
+/// 小さな印の不透明度（0〜255）。
+const BADGE_ALPHA: u8 = 230;
+/// 小さな印と入力位置の間（96 DPI 基準のピクセル）。
+const BADGE_CARET_GAP: i32 = 3;
+/// 小さな印とマウスカーソルの間（96 DPI 基準のピクセル）と、カーソルの絵の高さの見込み。
+const BADGE_MOUSE_GAP: i32 = 14;
+const BADGE_MOUSE_BELOW: i32 = 8;
 
 /// 試しに表示する（設定画面のプレビュー）。表示の設定は [`PREVIEW`] に置いてから送る。
 const WM_APP_PREVIEW: u32 = WM_APP + 1;
@@ -124,6 +135,12 @@ pub struct Params {
     pub opacity: u32,
     /// 全画面のアプリの間は表示しない。
     pub hide_in_fullscreen: bool,
+    /// 切り替えたときに、画面に大きく表示する。
+    pub flash: bool,
+    /// いまの入力モードを小さな印で出し続ける場所。
+    pub badge: Badge,
+    /// 小さな印の一辺（96 DPI 基準のピクセル）。
+    pub badge_size: u32,
 }
 
 impl Params {
@@ -137,6 +154,9 @@ impl Params {
         theme: Theme::Dark,
         opacity: ime_logic::DEFAULT_OPACITY,
         hide_in_fullscreen: false,
+        flash: true,
+        badge: Badge::Off,
+        badge_size: ime_logic::DEFAULT_BADGE_SIZE,
     };
 
     /// 設定ファイルの値から作る（範囲外は丸め、知らない値は既定にする）。
@@ -151,6 +171,9 @@ impl Params {
             theme: Theme::from_setting(&settings.theme),
             opacity: settings.opacity,
             hide_in_fullscreen: settings.hide_in_fullscreen,
+            flash: settings.flash,
+            badge: Badge::from_setting(&settings.badge),
+            badge_size: settings.badge_size,
         }
         .clamped()
     }
@@ -172,6 +195,9 @@ impl Params {
             opacity: self
                 .opacity
                 .clamp(ime_logic::OPACITY_MIN, ime_logic::OPACITY_MAX),
+            badge_size: self
+                .badge_size
+                .clamp(ime_logic::BADGE_SIZE_MIN, ime_logic::BADGE_SIZE_MAX),
             ..self
         }
     }
@@ -300,6 +326,21 @@ struct State {
     size: i32,
     /// IME の状態を取れたかの記録を、増やしすぎないための控え。
     readability: ReadabilityLog,
+    /// いまの入力モードを出し続ける小さな印（[`Badge`]）。
+    badge: BadgeState,
+}
+
+/// 小さな印の状態。
+struct BadgeState {
+    hwnd: HWND,
+    /// 出しているモード（出していなければ `None`）。
+    mode: Option<ImeMode>,
+    /// 出している一辺（実際のピクセル）。
+    size: i32,
+    /// マウスカーソルに付いて動かしているか（入力位置が分からないときも）。
+    follows_mouse: bool,
+    /// 作成済みのフォントと、その文字の高さ。
+    font: Option<(HFONT, i32)>,
 }
 
 /// 表示中の内容。
@@ -335,6 +376,8 @@ fn thread_main(ready: mpsc::Sender<u32>) {
             let _ = ready.send(0);
             return;
         };
+        // 小さな印のウィンドウ。作れなくても、切り替えたときの表示は使える。
+        let badge_hwnd = create_badge_window().unwrap_or_default();
         STATE.with(|s| {
             *s.borrow_mut() = Some(State {
                 hwnd,
@@ -343,6 +386,13 @@ fn thread_main(ready: mpsc::Sender<u32>) {
                 font: None,
                 size: 0,
                 readability: ReadabilityLog::default(),
+                badge: BadgeState {
+                    hwnd: badge_hwnd,
+                    mode: None,
+                    size: 0,
+                    follows_mouse: false,
+                    font: None,
+                },
             })
         });
         WINDOW.store(hwnd.0 as isize, Ordering::SeqCst);
@@ -365,10 +415,17 @@ fn thread_main(ready: mpsc::Sender<u32>) {
         WINDOW.store(0, Ordering::SeqCst);
         let _ = KillTimer(hwnd, TIMER_POLL);
         let _ = KillTimer(hwnd, TIMER_ANIM);
+        let _ = KillTimer(hwnd, TIMER_BADGE);
         STATE.with(|s| {
             if let Some(state) = s.borrow_mut().take() {
                 if let Some((font, _)) = state.font {
                     let _ = DeleteObject(font);
+                }
+                if let Some((font, _)) = state.badge.font {
+                    let _ = DeleteObject(font);
+                }
+                if !state.badge.hwnd.is_invalid() {
+                    let _ = DestroyWindow(state.badge.hwnd);
                 }
             }
         });
@@ -418,6 +475,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             match wparam.0 {
                 TIMER_POLL => on_poll(),
                 TIMER_ANIM => on_anim(),
+                TIMER_BADGE => follow_mouse_with_badge(),
                 _ => {}
             }
             LRESULT(0)
@@ -469,6 +527,8 @@ unsafe fn on_poll() {
             .observe(observed.as_ref().map(|o| (o.focus.0 as isize, o.mode)))
     });
 
+    update_badge(if enabled { observed.as_ref() } else { None });
+
     if !enabled {
         // OFF にしたら表示中のものも消す。ただし設定画面のプレビューは残す。
         let previewing = STATE.with(|s| {
@@ -484,6 +544,9 @@ unsafe fn on_poll() {
     }
     if let (Some(mode), Some(observed)) = (to_show, observed) {
         let params = current_params();
+        if !params.flash {
+            return;
+        }
         if params.hide_in_fullscreen && is_fullscreen_app_running() {
             log::debug!("入力モード: {} に切り替わりました（全画面のアプリのため表示しません）", mode.label());
             return;
@@ -491,6 +554,250 @@ unsafe fn on_poll() {
         log::debug!("入力モード: {} を表示します（位置: {}）", mode.label(), params.position.as_setting());
         show(mode.label(), observed.caret, &params, false);
     }
+}
+
+/// 小さな印のウィンドウを作る（最初は非表示）。
+unsafe fn create_badge_window() -> Option<HWND> {
+    let instance = GetModuleHandleW(None).ok()?;
+    let class_name = w!("AtaiPasteImeBadge");
+    let class = WNDCLASSW {
+        lpfnWndProc: Some(badge_wnd_proc),
+        hInstance: instance.into(),
+        lpszClassName: class_name,
+        ..Default::default()
+    };
+    if RegisterClassW(&class) == 0 {
+        log::warn!("入力モードの小さな印のウィンドウクラスを登録できませんでした");
+        return None;
+    }
+    CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        class_name,
+        w!("アタイの貼り付け 入力モードの印"),
+        WS_POPUP,
+        0,
+        0,
+        1,
+        1,
+        None,
+        None,
+        instance,
+        None,
+    )
+    .ok()
+}
+
+unsafe extern "system" fn badge_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+        WM_PAINT => {
+            paint_badge(hwnd);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// いまの入力モードを、小さな印で出し続ける（設定で選んだ場所に）。読み取れないとき・
+/// 出さない設定のとき・全画面のアプリの間（その設定のとき）は消す。
+unsafe fn update_badge(observed: Option<&Observed>) {
+    let params = current_params();
+    let target = match (params.badge, observed) {
+        (Badge::Off, _) | (_, None) => None,
+        (_, Some(_)) if params.hide_in_fullscreen && is_fullscreen_app_running() => None,
+        (badge, Some(observed)) => {
+            // 入力位置の横に出す設定でも、入力位置が分からないアプリではマウスの横に出す。
+            let caret = if badge == Badge::Caret { observed.caret } else { None };
+            Some((observed.mode, caret))
+        }
+    };
+    let Some((mode, caret)) = target else {
+        hide_badge();
+        return;
+    };
+    let anchor = match caret {
+        Some(rc) => Some((POINT { x: rc.right, y: rc.top }, rc.bottom, BADGE_CARET_GAP)),
+        None => {
+            let mut cursor = POINT::default();
+            // マウスカーソルの絵にかからないよう、その右下に置く。
+            GetCursorPos(&mut cursor)
+                .is_ok()
+                .then_some((cursor, cursor.y + BADGE_MOUSE_BELOW, BADGE_MOUSE_GAP))
+        }
+    };
+    let Some((point, below, gap)) = anchor else {
+        hide_badge();
+        return;
+    };
+    let Some((work, dpi)) = monitor_info(MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST)) else {
+        hide_badge();
+        return;
+    };
+    let size = ime_logic::scale_for_dpi(params.badge_size as i32, dpi);
+    let (x, y) = ime_logic::origin_near_point(
+        point.x,
+        point.y,
+        below,
+        (work.left, work.top, work.right, work.bottom),
+        size,
+        ime_logic::scale_for_dpi(gap, dpi),
+    );
+    let follows_mouse = caret.is_none();
+
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let Some(state) = s.as_mut() else { return };
+        let main = state.hwnd;
+        let badge = &mut state.badge;
+        if badge.hwnd.is_invalid() {
+            return;
+        }
+        let font_height = size * 70 / 100;
+        if badge.font.map(|(_, h)| h) != Some(font_height) {
+            if let Some((old, _)) = badge.font.take() {
+                let _ = DeleteObject(old);
+            }
+            let font = CreateFontW(
+                -font_height,
+                0,
+                0,
+                0,
+                FW_BOLD.0 as i32,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET.0 as u32,
+                OUT_DEFAULT_PRECIS.0 as u32,
+                CLIP_DEFAULT_PRECIS.0 as u32,
+                ANTIALIASED_QUALITY.0 as u32,
+                (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+                w!("Yu Gothic UI"),
+            );
+            if !font.is_invalid() {
+                badge.font = Some((font, font_height));
+            }
+        }
+        let changed = badge.mode != Some(mode) || badge.size != size;
+        if badge.size != size {
+            let radius = size / 3;
+            let region = CreateRoundRectRgn(0, 0, size + 1, size + 1, radius, radius);
+            // SetWindowRgn が成功すると、リージョンの所有権はウィンドウへ移る（削除しない）。
+            SetWindowRgn(badge.hwnd, region, true);
+        }
+        let was_hidden = badge.mode.is_none();
+        badge.mode = Some(mode);
+        badge.size = size;
+        if was_hidden {
+            let _ = SetLayeredWindowAttributes(badge.hwnd, COLORREF(0), BADGE_ALPHA, LWA_ALPHA);
+        }
+        let _ = SetWindowPos(
+            badge.hwnd,
+            HWND_TOPMOST,
+            x,
+            y,
+            size,
+            size,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        if changed {
+            let _ = InvalidateRect(badge.hwnd, None, true);
+        }
+        // マウスに付いて動かす間は、なめらかに動くよう短い間隔で位置を直す。
+        if follows_mouse != badge.follows_mouse || was_hidden {
+            badge.follows_mouse = follows_mouse;
+            if follows_mouse {
+                SetTimer(main, TIMER_BADGE, BADGE_FOLLOW_INTERVAL_MS, None);
+            } else {
+                let _ = KillTimer(main, TIMER_BADGE);
+            }
+        }
+    });
+}
+
+/// マウスカーソルに付いて動かしている印の位置を直す（短い間隔で呼ばれる）。
+unsafe fn follow_mouse_with_badge() {
+    let Some((hwnd, size)) = STATE.with(|s| {
+        s.borrow().as_ref().and_then(|state| {
+            let badge = &state.badge;
+            (badge.mode.is_some() && badge.follows_mouse).then_some((badge.hwnd, badge.size))
+        })
+    }) else {
+        return;
+    };
+    let mut cursor = POINT::default();
+    if GetCursorPos(&mut cursor).is_err() {
+        return;
+    }
+    let Some((work, dpi)) = monitor_info(MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST)) else {
+        return;
+    };
+    let (x, y) = ime_logic::origin_near_point(
+        cursor.x,
+        cursor.y,
+        cursor.y + BADGE_MOUSE_BELOW,
+        (work.left, work.top, work.right, work.bottom),
+        size,
+        ime_logic::scale_for_dpi(BADGE_MOUSE_GAP, dpi),
+    );
+    let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER);
+}
+
+/// 小さな印を消す。
+unsafe fn hide_badge() {
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let Some(state) = s.as_mut() else { return };
+        if state.badge.mode.take().is_some() {
+            let _ = KillTimer(state.hwnd, TIMER_BADGE);
+            state.badge.follows_mouse = false;
+            let _ = ShowWindow(state.badge.hwnd, SW_HIDE);
+        }
+    });
+}
+
+/// 小さな印を描く（モードごとの色の角丸に、モードの文字）。
+unsafe fn paint_badge(hwnd: HWND) {
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    STATE.with(|s| {
+        let s = s.borrow();
+        let Some(state) = s.as_ref() else { return };
+        let Some(mode) = state.badge.mode else { return };
+        let (background, foreground) = ime_logic::badge_colors(mode);
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: state.badge.size,
+            bottom: state.badge.size,
+        };
+        let brush = CreateSolidBrush(COLORREF(background));
+        FillRect(hdc, &rect, brush);
+        let _ = DeleteObject(brush);
+        let old_font = state
+            .badge
+            .font
+            .map(|(font, _)| SelectObject(hdc, font))
+            .unwrap_or(HGDIOBJ::default());
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, COLORREF(foreground));
+        let mut text: Vec<u16> = mode.label().encode_utf16().collect();
+        DrawTextW(
+            hdc,
+            &mut text,
+            &mut rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        if !old_font.is_invalid() {
+            SelectObject(hdc, old_font);
+        }
+    });
+    let _ = EndPaint(hwnd, &ps);
 }
 
 /// 全画面のアプリ（ゲーム・動画・プレゼンテーションなど）が前面にあるか。

@@ -137,6 +137,54 @@ pub fn origin_near_point(
     (ox, oy)
 }
 
+/// いまの入力モードを、小さな印で出し続ける場所。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Badge {
+    /// 出さない。
+    Off,
+    /// 入力位置（キャレット）の横。入力位置が分からないアプリでは、マウスカーソルの横。
+    Caret,
+    /// マウスカーソルの横。
+    Mouse,
+}
+
+/// 小さな印の一辺の範囲と既定（96 DPI 基準のピクセル）。
+pub const BADGE_SIZE_MIN: u32 = 12;
+pub const BADGE_SIZE_MAX: u32 = 48;
+pub const DEFAULT_BADGE_SIZE: u32 = 20;
+
+impl Badge {
+    /// 設定ファイルの値・画面の表示名との対応（画面の並び順）。
+    pub const ALL: [(Badge, &'static str, &'static str); 3] = [
+        (Badge::Off, "off", "出さない"),
+        (Badge::Caret, "caret", "入力位置の横（分からないときはマウスの横）"),
+        (Badge::Mouse, "mouse", "マウスカーソルの横"),
+    ];
+
+    /// settings.json の値から読む。知らない値は「出さない」。
+    pub fn from_setting(text: &str) -> Badge {
+        let text = text.trim();
+        Self::ALL
+            .iter()
+            .find(|(_, name, _)| name.eq_ignore_ascii_case(text))
+            .map_or(Badge::Off, |(badge, _, _)| *badge)
+    }
+
+    /// settings.json に書く値。
+    pub fn as_setting(self) -> &'static str {
+        Self::ALL.iter().find(|(b, _, _)| *b == self).map_or("off", |(_, n, _)| *n)
+    }
+}
+
+/// 小さな印の色（背景, 文字。`0x00BBGGRR`）。日本語を入力するモードは赤、半角英数は青にして、
+/// 文字を読まなくても色で見分けられるようにする。
+pub fn badge_colors(mode: ImeMode) -> (u32, u32) {
+    match mode {
+        ImeMode::AlnumHalf => (0x00C8_6E26, 0x00FF_FFFF),
+        _ => (0x002F_32DC, 0x00FF_FFFF),
+    }
+}
+
 /// 画面に出す入力モード。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImeMode {
@@ -552,5 +600,18 @@ mod tests {
             log.observe(true, || unreachable!());
         }
         assert_eq!(log.observe(false, || "MORE.EXE".into()), None);
+    }
+
+    #[test]
+    fn badge_round_trip() {
+        for (badge, name, _) in Badge::ALL {
+            assert_eq!(Badge::from_setting(name), badge);
+            assert_eq!(badge.as_setting(), name);
+        }
+        assert_eq!(Badge::from_setting(" CARET "), Badge::Caret);
+        assert_eq!(Badge::from_setting("unknown"), Badge::Off);
+        // 日本語を入力するモードと半角英数で、色が違う。
+        assert_ne!(badge_colors(ImeMode::Hiragana).0, badge_colors(ImeMode::AlnumHalf).0);
+        assert_eq!(badge_colors(ImeMode::Hiragana), badge_colors(ImeMode::KatakanaHalf));
     }
 }
