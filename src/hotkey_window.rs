@@ -1,12 +1,13 @@
 //! キー割り当て画面。
 //!
-//! トレイメニューの「キー割り当て...」から開く。左に割り当ての一覧、右に選んだ割り当ての
-//! 内容を出す。内容を書いて「追加」で一覧に足し、一覧で選んで内容を直したら「更新」で
-//! 書き換える。「保存」を押すと `settings.json` の `hotkeys` に書き込み、メインスレッドへ
-//! [`TrayMessage::HotkeysSaved`] を送って、その場で使えるようにする（再起動は要らない）。
+//! トレイメニューの「キー割り当ての編集...」から開く。左に割り当ての一覧、右に選んだ割り当ての
+//! 内容を出す。「新規」で書き始め、内容を書いて「追加」で一覧に足し、一覧で選んで内容を
+//! 直したら「上書き」で書き換える。「OK」を押すと `settings.json` の `hotkeys` に書き込み、
+//! メインスレッドへ [`TrayMessage::HotkeysSaved`] を送って、その場で使えるようにする
+//! （再起動は要らない）。
 //!
 //! 「書き出す...」「読み込む...」で、割り当てをファイル（JSON）に書き出したり、ほかの PC で
-//! 書き出したものを読み込んだりできる（読み込んだものも「保存」を押すまでは使わない）。
+//! 書き出したものを読み込んだりできる（読み込んだものも「OK」を押すまでは使わない）。
 //!
 //! 割り当ての解釈と検証は [`crate::hotkey_rules`] にあり、Linux でもテストできる。
 //! 画面の部品は設定画面と共通（[`crate::ui`]）。
@@ -64,67 +65,69 @@ const ID_EXPORT: i32 = 327;
 const ID_IMPORT: i32 = 328;
 /// 整え方のチェック（[`TRANSFORMS`] の順に 330〜339）。
 const ID_TRANSFORM_FIRST: i32 = 330;
+const ID_NEW: i32 = 345;
 
 /// 画面の中身の大きさ（96 DPI 基準）。
-const CLIENT_W: i32 = 680;
-const CLIENT_H: i32 = 524;
+const CLIENT_W: i32 = 760;
+const CLIENT_H: i32 = 536;
 
-/// 効くアプリの選択肢。
-const SCOPES: [&str; 2] = ["すべてのアプリ", "下に書いたアプリだけ"];
+/// 対象アプリの選択肢。
+const SCOPES: [&str; 2] = ["すべてのアプリ", "指定したアプリだけ"];
 
 /// 画面の構成。並び順がそのまま Tab キーで移る順になる。
 const ITEMS: &[Item] = &[
-    item(400, Kind::Label, "割り当て（上にあるものから順に調べます）", 12, 8, 304, 22),
-    item(ID_LIST, Kind::ListBox, "", 12, 32, 304, 368),
-    item(ID_UP, Kind::Button, "上へ", 12, 408, 70, 28),
-    item(ID_DOWN, Kind::Button, "下へ", 86, 408, 70, 28),
-    item(ID_DELETE, Kind::Button, "削除", 234, 408, 82, 28),
-    item(ID_EXPORT, Kind::Button, "書き出す...", 12, 444, 148, 28),
-    item(ID_IMPORT, Kind::Button, "読み込む...", 168, 444, 148, 28),
+    item(400, Kind::Label, "割り当て（上にあるものが優先）", 12, 8, 300, 22),
+    item(ID_LIST, Kind::ListBox, "", 12, 32, 300, 376),
+    item(ID_UP, Kind::Button, "上へ(&U)", 12, 416, 68, 28),
+    item(ID_DOWN, Kind::Button, "下へ(&W)", 84, 416, 68, 28),
+    item(ID_NEW, Kind::Button, "新規(&N)", 172, 416, 68, 28),
+    item(ID_DELETE, Kind::Button, "削除(&D)", 244, 416, 68, 28),
+    item(ID_EXPORT, Kind::Button, "書き出す(&E)...", 12, 452, 146, 28),
+    item(ID_IMPORT, Kind::Button, "読み込む(&I)...", 166, 452, 146, 28),
     // 内容
-    item(401, Kind::Group, "割り当ての内容", 324, 8, 344, 428),
-    item(ID_ENABLED, Kind::Check, "この割り当てを使う", 336, 30, 320, 22),
+    item(401, Kind::Group, "割り当ての内容", 324, 8, 424, 436),
+    item(ID_ENABLED, Kind::Check, "この割り当てを使う", 336, 30, 400, 22),
     item(402, Kind::Label, "キー", 336, 58, 48, 24),
     item(ID_CTRL, Kind::Check, "Ctrl", 388, 59, 52, 22),
     item(ID_SHIFT, Kind::Check, "Shift", 442, 59, 58, 22),
     item(ID_ALT, Kind::Check, "Alt", 502, 59, 46, 22),
     item(ID_WIN, Kind::Check, "Win", 550, 59, 52, 22),
-    item(403, Kind::Label, "+", 388, 88, 16, 24),
-    item(ID_KEY, Kind::Combo, "", 406, 88, 150, 300),
-    item(404, Kind::Label, "動作", 336, 120, 48, 24),
-    item(ID_ACTION, Kind::Combo, "", 388, 120, 268, 300),
-    item(ID_VALUE_LABEL, Kind::Label, "", 336, 152, 320, 22),
-    item(ID_VALUE, Kind::MultiEdit, "", 336, 176, 320, 64),
-    item(ID_HINT, Kind::Note, "", 336, 246, 320, 62),
+    item(403, Kind::Label, "+", 606, 58, 14, 24),
+    item(ID_KEY, Kind::Combo, "", 622, 58, 114, 300),
+    item(404, Kind::Label, "動作", 336, 90, 48, 24),
+    item(ID_ACTION, Kind::Combo, "", 388, 90, 348, 300),
+    item(ID_VALUE_LABEL, Kind::Label, "", 336, 122, 400, 22),
+    item(ID_VALUE, Kind::MultiEdit, "", 336, 146, 400, 64),
+    item(ID_HINT, Kind::Note, "", 336, 216, 400, 90),
     // 整え方（「文字を整えて貼り付け」のときだけ、内容の欄と説明の代わりに出す）
-    transform_item(0, 336, 176),
-    transform_item(1, 336, 200),
-    transform_item(2, 336, 224),
-    transform_item(3, 336, 248),
-    transform_item(4, 336, 272),
-    transform_item(5, 498, 176),
-    transform_item(6, 498, 200),
-    transform_item(7, 498, 224),
-    transform_item(8, 498, 248),
-    transform_item(9, 498, 272),
-    item(ID_PASTE, Kind::Check, "まとめて貼り付ける（クリップボードを一時的に使う）", 336, 312, 320, 22),
+    transform_item(0, 336, 146),
+    transform_item(1, 336, 170),
+    transform_item(2, 336, 194),
+    transform_item(3, 336, 218),
+    transform_item(4, 336, 242),
+    transform_item(5, 538, 146),
+    transform_item(6, 538, 170),
+    transform_item(7, 538, 194),
+    transform_item(8, 538, 218),
+    transform_item(9, 538, 242),
+    item(ID_PASTE, Kind::Check, "一度に貼り付ける（速い。クリップボードを一時的に使う）", 336, 312, 400, 22),
     item(405, Kind::Label, "引数", 336, 340, 48, 24),
-    item(ID_ARGS, Kind::Edit, "", 388, 340, 268, 24),
-    item(406, Kind::Label, "効くアプリ", 336, 372, 80, 24),
-    item(ID_SCOPE, Kind::Combo, "", 420, 372, 236, 200),
-    item(ID_APPS, Kind::Edit, "", 336, 402, 236, 24),
-    item(ID_PICK_APP, Kind::Button, "選ぶ...", 578, 400, 78, 28),
-    item(ID_ADD, Kind::Button, "新しい割り当てとして追加", 324, 444, 172, 28),
-    item(ID_UPDATE, Kind::Button, "選んだ割り当てを更新", 500, 444, 168, 28),
+    item(ID_ARGS, Kind::Edit, "", 388, 340, 348, 24),
+    item(406, Kind::Label, "対象アプリ", 336, 372, 80, 24),
+    item(ID_SCOPE, Kind::Combo, "", 420, 372, 316, 200),
+    item(ID_APPS, Kind::Edit, "", 336, 404, 280, 24),
+    item(ID_PICK_APP, Kind::Button, "アプリを選ぶ...", 622, 402, 114, 28),
+    item(ID_ADD, Kind::Button, "新しい割り当てとして追加(&A)", 324, 452, 208, 28),
+    item(ID_UPDATE, Kind::Button, "選んだ割り当てに上書き(&R)", 540, 452, 208, 28),
     // 操作ボタン
-    item(407, Kind::Note, "「保存」を押すと、すぐに使えるようになります。効くアプリはプロセス名を空白で区切って書きます（例: EXCEL.EXE WINWORD.EXE）。", 12, 480, 472, 40),
-    item(ID_SAVE, Kind::DefaultButton, "保存", 496, 484, 82, 28),
-    item(ID_CANCEL, Kind::Button, "キャンセル", 586, 484, 82, 28),
+    item(407, Kind::Note, "右側で内容を決めて「追加」か「上書き」を押し、最後に「OK」を押すと保存して、すぐに使えるようになります。", 12, 490, 540, 40),
+    item(ID_SAVE, Kind::DefaultButton, "OK", 578, 496, 82, 28),
+    item(ID_CANCEL, Kind::Button, "キャンセル", 666, 496, 82, 28),
 ];
 
 /// 整え方のチェック 1 つ分。
 const fn transform_item(index: usize, x: i32, y: i32) -> Item {
-    item(ID_TRANSFORM_FIRST + index as i32, Kind::Check, TRANSFORMS[index].2, x, y, 158, 22)
+    item(ID_TRANSFORM_FIRST + index as i32, Kind::Check, TRANSFORMS[index].2, x, y, 198, 22)
 }
 
 /// 画面のスレッドが持つ状態。
@@ -309,7 +312,7 @@ unsafe fn update_fields(hwnd: HWND) {
     set_text(
         hwnd,
         ID_VALUE_LABEL,
-        info.value_label.unwrap_or("（この動作には内容はありません）"),
+        info.value_label.unwrap_or("（この動作に設定する内容はありません）"),
     );
     set_text(hwnd, ID_HINT, info.hint);
     // 「文字を整えて貼り付け」では、内容の欄と説明の代わりに整え方のチェックを出す。
@@ -345,7 +348,7 @@ unsafe fn read_editor(hwnd: HWND) -> Result<HotkeyRuleSetting, (i32, String)> {
         if apps.is_empty() {
             return Err((
                 ID_APPS,
-                "効くアプリを 1 つ以上入力してください（例: EXCEL.EXE）。すべてのアプリで使うときは「すべてのアプリ」を選びます。".into(),
+                "対象アプリを 1 つ以上入力してください（例: EXCEL.EXE）。すべてのアプリで使うときは「すべてのアプリ」を選びます。".into(),
             ));
         }
         apps
@@ -395,7 +398,7 @@ unsafe fn read_editor(hwnd: HWND) -> Result<HotkeyRuleSetting, (i32, String)> {
     Ok(setting)
 }
 
-/// 「選ぶ...」: 開いているアプリの一覧からプロセス名を選び、効くアプリの欄に足す。
+/// 「選ぶ...」: 開いているアプリの一覧からプロセス名を選び、対象アプリの欄に足す。
 unsafe fn on_pick_app(hwnd: HWND) {
     let Some(name) = process_picker::choose(hwnd) else {
         return;
@@ -423,6 +426,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     on_update(hwnd);
                 }
                 (ID_DELETE, BN_CLICKED) => on_delete(hwnd),
+                (ID_NEW, BN_CLICKED) => on_new(hwnd),
                 (ID_UP, BN_CLICKED) => on_move(hwnd, -1),
                 (ID_DOWN, BN_CLICKED) => on_move(hwnd, 1),
                 (ID_EXPORT, BN_CLICKED) => on_export(hwnd),
@@ -479,6 +483,30 @@ unsafe fn on_select(hwnd: HWND) {
     show_selected(hwnd);
 }
 
+/// 「新規」: 一覧の選択を外し、右側を新しい割り当ての初期値にする。
+unsafe fn on_new(hwnd: HWND) {
+    if editor_differs(hwnd)
+        && !ui::ask_yes_no(
+            hwnd,
+            "右側で変更した内容が、まだ一覧に反映されていません。\n\
+             変更を捨てて、新しい割り当てを書き始めますか？",
+        )
+    {
+        return;
+    }
+    if !IsWindow(hwnd).as_bool() {
+        return;
+    }
+    CONTEXT.with(|c| {
+        if let Some(ctx) = c.borrow_mut().as_mut() {
+            ctx.shown = None;
+        }
+    });
+    refresh_list(hwnd, None);
+    load_editor(hwnd, &new_rule());
+    ui::focus(hwnd, ID_KEY);
+}
+
 /// 右側が、出したとき（新しく作るときは初期値）から書き換えられているか。
 unsafe fn editor_differs(hwnd: HWND) -> bool {
     let baseline = CONTEXT.with(|c| c.borrow().as_ref().map(|ctx| ctx.baseline.clone()));
@@ -526,7 +554,7 @@ unsafe fn on_update(hwnd: HWND) -> bool {
     let Some(index) = ui::list_index(hwnd, ID_LIST) else {
         show_message(
             hwnd,
-            "書き換える割り当てを、左の一覧で選んでください。新しく足すときは「新しい割り当てとして追加」を押します。",
+            "上書きする割り当てを、左の一覧で選んでください。新しく足すときは「新しい割り当てとして追加」を押します。",
             MB_ICONWARNING,
         );
         return false;
@@ -796,7 +824,7 @@ unsafe fn on_import(hwnd: HWND) {
     refresh_list(hwnd, first);
     show_selected(hwnd);
     log::info!("キー割り当てを読み込みました（{count} 件、{}）", path.display());
-    let mut message = format!("{count} 件の割り当てを読み込みました。「保存」を押すと使えるようになります。");
+    let mut message = format!("{count} 件の割り当てを読み込みました。「OK」を押すと保存して、使えるようになります。");
     if unusable > 0 {
         message.push_str(&format!(
             "\n\nこのうち {unusable} 件は、このままでは使えません（一覧に［誤りあり］と出ます）。選んで直してください。"

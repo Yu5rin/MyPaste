@@ -496,6 +496,23 @@ pub unsafe fn on_dpi_changed(
     font
 }
 
+/// Shift_JIS（コードページ 932）の文字を読む。読めない並びがあれば `None`。
+pub fn decode_shift_jis(bytes: &[u8]) -> Option<String> {
+    use windows::Win32::Globalization::{MultiByteToWideChar, MB_ERR_INVALID_CHARS};
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    unsafe {
+        let len = MultiByteToWideChar(932, MB_ERR_INVALID_CHARS, bytes, None);
+        if len <= 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; len as usize];
+        let written = MultiByteToWideChar(932, MB_ERR_INVALID_CHARS, bytes, Some(&mut buf));
+        (written > 0).then(|| String::from_utf16_lossy(&buf[..written as usize]))
+    }
+}
+
 /// `TCN_SELCHANGE`（タブが切り替わった通知コード。`WM_NOTIFY` で届く）。
 pub const TCN_SELCHANGE: u32 = -551i32 as u32;
 

@@ -1,11 +1,12 @@
 //! 定型文の画面。
 //!
-//! トレイメニューの「定型文...」（または履歴の一覧の右クリック「定型文の編集...」）から開く。
-//! 左に定型文の一覧、右に選んだ定型文の名前と本文を出す。書いて「追加」で一覧に足し、
-//! 一覧で選んで書き換えたら「更新」で直す。「保存」を押すと `settings.json` の `snippets` に
-//! 書き込み、すぐに履歴の一覧の「定型文」タブで使えるようにする（再起動は要らない）。
+//! トレイメニューの「定型文の編集...」（または履歴の一覧の右クリック「定型文の編集...」）から開く。
+//! 左に定型文の一覧、右に選んだ定型文の名前と本文を出す。「新規」で書き始め、書いて「追加」で
+//! 一覧に足し、一覧で選んで書き換えたら「上書き」で直す。「OK」を押すと `settings.json` の
+//! `snippets` に書き込み、すぐに履歴の一覧の「定型文」タブで使えるようにする（再起動は要らない）。
 //!
-//! CSV での読み込み・書き出しもできる（1 列目が名前、2 列目が本文。Excel で編集できる）。
+//! CSV での読み込み・書き出しもできる（1 列目が名前、2 列目が本文。Excel で編集できる。
+//! 読み込みは UTF-8 と Shift_JIS のどちらでもよい）。
 //! 名前の決め方・検証・CSV の読み書きは [`crate::snippets`] にあり、Linux でもテストできる。
 
 use std::cell::RefCell;
@@ -40,29 +41,31 @@ const ID_ADD: i32 = 507;
 const ID_UPDATE: i32 = 508;
 const ID_IMPORT: i32 = 509;
 const ID_EXPORT: i32 = 510;
+const ID_NEW: i32 = 511;
 
 /// 画面の中身の大きさ（96 DPI 基準）。
-const CLIENT_W: i32 = 600;
-const CLIENT_H: i32 = 440;
+const CLIENT_W: i32 = 700;
+const CLIENT_H: i32 = 460;
 
 /// 画面の構成。並び順がそのまま Tab キーで移る順になる。
 const ITEMS: &[Item] = &[
-    item(600, Kind::Label, "定型文（この順に一覧に並びます）", 12, 8, 250, 22),
-    item(ID_LIST, Kind::ListBox, "", 12, 32, 250, 312),
-    item(ID_UP, Kind::Button, "上へ", 12, 352, 64, 28),
-    item(ID_DOWN, Kind::Button, "下へ", 80, 352, 64, 28),
-    item(ID_DELETE, Kind::Button, "削除", 180, 352, 82, 28),
-    item(601, Kind::Label, "名前（空なら本文の最初の行を一覧に出します）", 276, 8, 312, 22),
-    item(ID_NAME, Kind::Edit, "", 276, 32, 312, 24),
-    item(602, Kind::Label, "本文（改行もそのまま貼り付けます）", 276, 64, 312, 22),
-    item(ID_TEXT, Kind::MultiEdit, "", 276, 88, 312, 200),
-    item(603, Kind::Note, "{date} は今日の日付、{time} は今の時刻、{datetime} は両方に置き換えて貼り付けます。", 276, 294, 312, 44),
-    item(ID_ADD, Kind::Button, "新しい定型文として追加", 276, 352, 152, 28),
-    item(ID_UPDATE, Kind::Button, "選んだ定型文を更新", 436, 352, 152, 28),
-    item(ID_IMPORT, Kind::Button, "CSV から読み込む...", 12, 400, 150, 28),
-    item(ID_EXPORT, Kind::Button, "CSV に書き出す...", 168, 400, 150, 28),
-    item(ID_SAVE, Kind::DefaultButton, "保存", 412, 400, 86, 28),
-    item(ID_CANCEL, Kind::Button, "キャンセル", 502, 400, 86, 28),
+    item(600, Kind::Label, "定型文（この順に一覧に並びます）", 12, 8, 270, 22),
+    item(ID_LIST, Kind::ListBox, "", 12, 32, 270, 332),
+    item(ID_UP, Kind::Button, "上へ(&U)", 12, 372, 62, 28),
+    item(ID_DOWN, Kind::Button, "下へ(&W)", 78, 372, 62, 28),
+    item(ID_NEW, Kind::Button, "新規(&N)", 154, 372, 62, 28),
+    item(ID_DELETE, Kind::Button, "削除(&D)", 220, 372, 62, 28),
+    item(601, Kind::Label, "名前（空なら、本文の最初の行を一覧に出します）", 296, 8, 392, 22),
+    item(ID_NAME, Kind::Edit, "", 296, 32, 392, 24),
+    item(602, Kind::Label, "本文（改行もそのまま貼り付けます）", 296, 64, 392, 22),
+    item(ID_TEXT, Kind::MultiEdit, "", 296, 88, 392, 226),
+    item(603, Kind::Note, "{date} は今日の日付、{time} は今の時刻、{datetime} は両方に置き換えて貼り付けます。{ そのものは {{、} は }} と書きます。", 296, 320, 392, 44),
+    item(ID_ADD, Kind::Button, "新しい定型文として追加(&A)", 296, 372, 192, 28),
+    item(ID_UPDATE, Kind::Button, "選んだ定型文に上書き(&R)", 496, 372, 192, 28),
+    item(ID_IMPORT, Kind::Button, "CSV から読み込む(&I)...", 12, 420, 160, 28),
+    item(ID_EXPORT, Kind::Button, "CSV に書き出す(&E)...", 178, 420, 160, 28),
+    item(ID_SAVE, Kind::DefaultButton, "OK", 518, 420, 82, 28),
+    item(ID_CANCEL, Kind::Button, "キャンセル", 606, 420, 82, 28),
 ];
 
 /// 画面のスレッドが持つ状態。
@@ -102,6 +105,12 @@ pub fn close() {
 }
 
 unsafe fn thread_main(list: Vec<Snippet>) {
+    // 手で書き換えた設定ファイルの定型文は、改行や名前の前後の空白がそろっていないことがある。
+    // そろえておかないと、何も変えていないのに「変更があります」と尋ねてしまう。
+    let list: Vec<Snippet> = list
+        .into_iter()
+        .map(|s| snippets::make(&s.name, &s.text).unwrap_or(s))
+        .collect();
     ui::init_common_controls();
     let title = format!("定型文 - アタイの貼り付け v{}", env!("CARGO_PKG_VERSION"));
     let Some(hwnd) = ui::create_top_window(w!("AtaiPasteSnippets"), Some(wnd_proc), &title) else {
@@ -182,6 +191,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     on_update(hwnd);
                 }
                 (ID_DELETE, BN_CLICKED) => on_delete(hwnd),
+                (ID_NEW, BN_CLICKED) => on_new(hwnd),
                 (ID_UP, BN_CLICKED) => on_move(hwnd, -1),
                 (ID_DOWN, BN_CLICKED) => on_move(hwnd, 1),
                 (ID_IMPORT, BN_CLICKED) => on_import(hwnd),
@@ -248,6 +258,52 @@ unsafe fn show_selected(hwnd: HWND) {
     load_editor(hwnd, snippet.as_ref());
 }
 
+/// 「新規」: 一覧の選択を外し、右側を空にして、新しい定型文を書き始める。
+unsafe fn on_new(hwnd: HWND) {
+    if editor_differs(hwnd)
+        && !ui::ask_yes_no(
+            hwnd,
+            "右側で変更した内容が、まだ一覧に反映されていません。\n\
+             変更を捨てて、新しい定型文を書き始めますか？",
+        )
+    {
+        return;
+    }
+    if !IsWindow(hwnd).as_bool() {
+        return;
+    }
+    CONTEXT.with(|c| {
+        if let Some(ctx) = c.borrow_mut().as_mut() {
+            ctx.shown = None;
+        }
+    });
+    refresh_list(hwnd, None);
+    load_editor(hwnd, None);
+    ui::focus(hwnd, ID_NAME);
+}
+
+/// 同じ名前（一覧に出る名前）の定型文が、`except` 以外にあるか。キー割り当ての
+/// 「定型文を貼り付け」は名前で選ぶので、同じ名前が 2 つあると後ろのものを選べない。
+fn name_taken(list: &[Snippet], snippet: &Snippet, except: Option<usize>) -> bool {
+    let name = snippets::display_name(snippet);
+    list.iter()
+        .enumerate()
+        .any(|(i, s)| Some(i) != except && snippets::display_name(s) == name)
+}
+
+/// 同じ名前の定型文があることを知らせ、それでも続けるかを尋ねる。
+unsafe fn confirm_same_name(hwnd: HWND, snippet: &Snippet) -> bool {
+    ui::ask_yes_no(
+        hwnd,
+        &format!(
+            "同じ名前の定型文「{}」がすでにあります。\n\n\
+             キー割り当ての「定型文を貼り付け」は名前で選ぶため、同じ名前が 2 つあると、\
+             上にあるものだけが貼り付けられます。このまま続けますか？",
+            snippets::display_name(snippet)
+        ),
+    ) && IsWindow(hwnd).as_bool()
+}
+
 /// 右側が、出している定型文（新しく書くときは空）から変えられているか。
 unsafe fn editor_differs(hwnd: HWND) -> bool {
     let shown = CONTEXT.with(|c| {
@@ -280,6 +336,9 @@ unsafe fn on_add(hwnd: HWND) -> bool {
         );
         return false;
     }
+    if name_taken(&list_snapshot(), &snippet, None) && !confirm_same_name(hwnd, &snippet) {
+        return false;
+    }
     let index = CONTEXT.with(|c| {
         let mut c = c.borrow_mut();
         let ctx = c.as_mut()?;
@@ -297,7 +356,7 @@ unsafe fn on_update(hwnd: HWND) -> bool {
     let Some(index) = ui::list_index(hwnd, ID_LIST) else {
         show_message(
             hwnd,
-            "書き換える定型文を、左の一覧で選んでください。新しく足すときは「新しい定型文として追加」を押します。",
+            "上書きする定型文を、左の一覧で選んでください。新しく足すときは「新しい定型文として追加」を押します。",
             MB_ICONWARNING,
         );
         return false;
@@ -309,6 +368,9 @@ unsafe fn on_update(hwnd: HWND) -> bool {
             return false;
         }
     };
+    if name_taken(&list_snapshot(), &snippet, Some(index)) && !confirm_same_name(hwnd, &snippet) {
+        return false;
+    }
     CONTEXT.with(|c| {
         if let Some(ctx) = c.borrow_mut().as_mut() {
             if let Some(slot) = ctx.list.get_mut(index) {
@@ -327,6 +389,11 @@ unsafe fn on_delete(hwnd: HWND) {
     let Some(index) = ui::list_index(hwnd, ID_LIST) else {
         return;
     };
+    let name = list_snapshot().get(index).map(snippets::display_name).unwrap_or_default();
+    if !ui::ask_yes_no(hwnd, &format!("定型文「{name}」を削除しますか？")) || !IsWindow(hwnd).as_bool()
+    {
+        return;
+    }
     let next = CONTEXT.with(|c| {
         let mut c = c.borrow_mut();
         let ctx = c.as_mut()?;
@@ -385,9 +452,11 @@ unsafe fn on_import(hwnd: HWND) {
                 std::fs::read(&path).map_err(|e| e.to_string())
             }
         })
-        .and_then(|bytes| {
-            String::from_utf8(bytes)
-                .map_err(|_| "UTF-8 の CSV ではありません（Excel では「CSV UTF-8」で保存してください）".to_string())
+        // Excel の「CSV（コンマ区切り）」は Shift_JIS で保存される。UTF-8 でなければ、そちらで読む。
+        .and_then(|bytes| match String::from_utf8(bytes) {
+            Ok(text) => Ok(text),
+            Err(e) => ui::decode_shift_jis(e.as_bytes())
+                .ok_or_else(|| "文字コードを読み取れません（UTF-8 か Shift_JIS の CSV にしてください）".to_string()),
         })
         .and_then(|text| snippets::from_csv(&text));
     let imported = match read {
@@ -446,7 +515,7 @@ unsafe fn on_import(hwnd: HWND) {
             log::info!("定型文を CSV から読み込みました（{count} 件）");
             show_message(
                 hwnd,
-                &format!("{count} 件の定型文を読み込みました。「保存」を押すと使えるようになります。"),
+                &format!("{count} 件の定型文を読み込みました。「OK」を押すと保存して、使えるようになります。"),
                 MB_ICONINFORMATION,
             );
         }

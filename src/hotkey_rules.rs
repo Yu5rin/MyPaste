@@ -182,7 +182,7 @@ pub enum Action {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
     pub hotkey: Hotkey,
-    /// 効くアプリ（大文字のプロセス名）。空ならすべてのアプリ。
+    /// 対象アプリ（大文字のプロセス名）。空ならすべてのアプリ。
     pub apps: Vec<String>,
     pub action: Action,
 }

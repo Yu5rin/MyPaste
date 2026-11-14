@@ -147,7 +147,7 @@ pub struct HotkeyRuleSetting {
     pub value: String,
     /// プログラムを開くときの引数。
     pub args: String,
-    /// 効くアプリ（プロセス名）。空ならすべてのアプリ。
+    /// 対象アプリ（プロセス名）。空ならすべてのアプリ。
     pub apps: Vec<String>,
     /// 「文字を入力する」の入れ方。`"paste"`（クリップボードを使って一度に貼り付ける。既定）か
     /// `"keys"`（1 文字ずつキー入力として送る）。ほかの動作では使わない。
