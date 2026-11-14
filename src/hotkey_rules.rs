@@ -270,7 +270,7 @@ impl Rule {
         };
         Ok(Rule {
             hotkey,
-            apps: remap_logic::normalize_apps(setting.apps.iter().map(String::as_str)),
+            apps: remap_logic::normalize_app_list(&setting.apps),
             action,
         })
     }
@@ -411,7 +411,7 @@ pub fn describe(setting: &HotkeyRuleSetting) -> String {
         }
         None => text.push_str(&setting.action),
     }
-    let apps = remap_logic::normalize_apps(setting.apps.iter().map(String::as_str));
+    let apps = remap_logic::normalize_app_list(&setting.apps);
     if !apps.is_empty() {
         text.push_str(&format!("（{}）", apps.join("、")));
     }

@@ -20,7 +20,8 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
+use std::sync::{Mutex, OnceLock};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -36,8 +37,67 @@ const ALWAYS_ON: bool = cfg!(any(debug_assertions, feature = "devlog"));
 /// 記録するか（設定画面の ON/OFF）。
 static ENABLED: AtomicBool = AtomicBool::new(ALWAYS_ON);
 
-/// 書き込み先（開いたファイルと、これまでの大きさ）。最初の記録のときに開く。
-static WRITER: Mutex<Option<(File, u64)>> = Mutex::new(None);
+/// 書き込みスレッドへの依頼。
+enum Job {
+    Line(String),
+    /// ここまでの記録を書き終えたら知らせる。
+    Flush(SyncSender<()>),
+    /// ファイルを閉じる（記録をやめたとき。利用者が消したり開いたりしやすいように）。
+    Close,
+}
+
+/// 書き込みスレッドへの送り口。最初の記録のときにスレッドを始める。
+///
+/// 記録する側（キーボードフックを含む）ではファイルに触れず、ここへ送るだけにする。
+/// フックの中でファイルに書くと、遅いディスクやウイルス対策ソフトのせいでフックの
+/// 制限時間を超え、Windows がフックを外してしまう（キーが効かなくなる）おそれがある。
+static SENDER: OnceLock<Mutex<Sender<Job>>> = OnceLock::new();
+
+fn send(job: Job) {
+    let sender = SENDER.get_or_init(|| {
+        let (tx, rx) = channel::<Job>();
+        std::thread::spawn(move || writer_thread(rx));
+        Mutex::new(tx)
+    });
+    if let Ok(sender) = sender.lock() {
+        let _ = sender.send(job);
+    }
+}
+
+/// 記録をファイルに書くスレッド。
+fn writer_thread(rx: Receiver<Job>) {
+    // 開いたファイルと、開いてから書いた大きさ。
+    let mut writer: Option<(File, u64)> = None;
+    for job in rx {
+        match job {
+            Job::Line(line) => {
+                if writer.is_none() {
+                    writer = open_log();
+                }
+                let Some((file, written)) = writer.as_mut() else {
+                    continue;
+                };
+                if file.write_all(line.as_bytes()).is_err() {
+                    // 書けなくなった（消された・別のアプリが握っている等）。次の記録で開き直す。
+                    writer = None;
+                    continue;
+                }
+                *written += line.len() as u64;
+                if *written > MAX_LOG_BYTES {
+                    // 次の記録のときに、古い記録へ回して作り直す。
+                    writer = None;
+                }
+            }
+            Job::Flush(done) => {
+                if let Some((file, _)) = writer.as_mut() {
+                    let _ = file.flush();
+                }
+                let _ = done.send(());
+            }
+            Job::Close => writer = None,
+        }
+    }
+}
 
 static LOGGER: FileLogger = FileLogger;
 
@@ -57,9 +117,7 @@ pub fn set_enabled(enabled: bool) {
     let was = ENABLED.swap(enabled, Ordering::SeqCst);
     if was && !enabled {
         // 記録をやめたらファイルを閉じる（利用者が消したり開いたりしやすいように）。
-        if let Ok(mut writer) = WRITER.lock() {
-            *writer = None;
-        }
+        send(Job::Close);
     }
 }
 
@@ -92,33 +150,14 @@ impl Log for FileLogger {
         #[cfg(debug_assertions)]
         eprint!("{line}");
 
-        let Ok(mut writer) = WRITER.lock() else {
-            return;
-        };
-        if writer.is_none() {
-            *writer = open_log();
-        }
-        let Some((file, written)) = writer.as_mut() else {
-            return;
-        };
-        if file.write_all(line.as_bytes()).is_err() {
-            // 書けなくなった（消された・別のアプリが握っている等）。次の記録で開き直す。
-            *writer = None;
-            return;
-        }
-        *written += line.len() as u64;
-        if *written > MAX_LOG_BYTES {
-            // 次の記録のときに、古い記録へ回して作り直す。
-            *writer = None;
-        }
+        send(Job::Line(line));
     }
 
     fn flush(&self) {
-        if let Ok(mut writer) = WRITER.lock() {
-            if let Some((file, _)) = writer.as_mut() {
-                let _ = file.flush();
-            }
-        }
+        // 書き込みスレッドが書き終えるのを、少しだけ待つ（終了のときと「ログを開く」のとき）。
+        let (tx, rx) = sync_channel(1);
+        send(Job::Flush(tx));
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(2));
     }
 }
 
@@ -128,12 +167,14 @@ fn open_log() -> Option<(File, u64)> {
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     let size = if size > MAX_LOG_BYTES {
         let _ = std::fs::rename(&path, path.with_file_name("log.old.txt"));
+        // 回せなかった（古い記録をほかのアプリが開いている など）ときは、そのまま書き足す。
+        // 次に回そうとするのは、ここからまた上限まで書いたあとにする。
         0
     } else {
         size
     };
     let mut file = OpenOptions::new().create(true).append(true).open(&path).ok()?;
-    if size == 0 {
+    if file.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
         // 新しいファイルには UTF-8 の BOM を付ける。古いメモ帳などで開いても
         // 日本語が文字化けしないように。
         let _ = file.write_all("\u{feff}".as_bytes());

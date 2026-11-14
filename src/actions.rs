@@ -39,7 +39,7 @@ use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId}
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetAncestor,
-    GetForegroundWindow, GetMessageW, GetShellWindow, GetWindowLongPtrW,
+    GetForegroundWindow, GetMessageW, GetShellWindow, GetWindowLongPtrW, IsHungAppWindow,
     GetWindowThreadProcessId, KillTimer, MessageBoxW, PeekMessageW, PostMessageW,
     PostQuitMessage, PostThreadMessageW, RegisterClassW, SetForegroundWindow, SetTimer,
     SetWindowPos, TranslateMessage, GA_ROOT, GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOPMOST,
@@ -67,6 +67,8 @@ const PASTE_ACCEPT_WAIT: Duration = Duration::from_millis(500);
 /// 貼り付け先が文字を読みに来てから、元のクリップボードに戻すまでの待ち時間
 /// （同じ貼り付けの中で、別の形式を続けて読みに来ることがあるため）。
 const PASTE_SETTLE_WAIT: Duration = Duration::from_millis(300);
+/// 貼り付け先が固まっているとき、動き出すのを待つ上限。
+const PASTE_HUNG_WAIT: Duration = Duration::from_secs(10);
 
 thread_local! {
     /// クリップボードの持ち主になる、見えないウィンドウ（実行スレッドだけで使う）。
@@ -246,6 +248,10 @@ pub fn dispatch(action: Action, held: Hotkey) {
         // 一覧を出しているときに、出す操作をもう一度したら閉じる（積んでおくと、閉じたあとで
         // また出てしまう）。実行スレッドを起こすだけで、依頼は積まない。
         history_window::request_close();
+    } else if history_window::is_open() {
+        // 一覧を出している間に押されたほかの割り当ては、捨てる（積んでおくと、一覧を閉じたあとで
+        // 思いがけず実行される）。
+        return;
     } else {
         QUEUE
         .lock()
@@ -547,7 +553,10 @@ unsafe fn run_queued_requests() {
     loop {
         let request = QUEUE.lock().unwrap_or_else(|p| p.into_inner()).pop_front();
         match request {
-            Some(request) => execute(request),
+            Some(request) => {
+                execute(request);
+                keyboard::repress_released_modifiers();
+            }
             None => break,
         }
     }
@@ -784,7 +793,10 @@ fn register_snippets(texts: &[String]) {
     let mut list = snippets();
     let mut added = 0;
     for text in texts {
-        let Ok(snippet) = crate::snippets::make("", text) else {
+        // 定型文は貼り付けるときに {date} などを置き換えるので、履歴の文字にある { } は、
+        // そのまま貼り付けられるよう {{ }} にしておく。
+        let escaped = text.replace('{', "{{").replace('}', "}}");
+        let Ok(snippet) = crate::snippets::make("", &escaped) else {
             continue;
         };
         if list.len() >= crate::snippets::MAX_SNIPPETS || list.iter().any(|s| s.text == snippet.text) {
@@ -863,7 +875,25 @@ unsafe fn paste_text(held: &Hotkey, text: &str) {
     }
     sendinput::send_key_sequence(held, &[ctrl_v()]);
 
-    let accepted = pump_messages_until(PASTE_ACCEPT_WAIT, || RENDERED.with(Cell::get));
+    let mut accepted = pump_messages_until(PASTE_ACCEPT_WAIT, || RENDERED.with(Cell::get));
+    // 貼り付け先が固まっている（再計算中の Excel など）だけなら、Ctrl+V はまだ相手に届いていない。
+    // ここで 1 文字ずつ入力すると、相手が動き出したときに貼り付けと入力の両方が入るので、
+    // 相手が応答するまで待つ。
+    let mut target_hung = false;
+    if !accepted {
+        let waiting_since = Instant::now();
+        while foreground_is_hung() && waiting_since.elapsed() < PASTE_HUNG_WAIT {
+            target_hung = true;
+            if pump_messages_until(PASTE_ACCEPT_WAIT, || RENDERED.with(Cell::get)) {
+                break;
+            }
+        }
+        if target_hung {
+            // 動き出した相手が、届いていた Ctrl+V を処理するのを待つ。
+            accepted = pump_messages_until(PASTE_ACCEPT_WAIT, || RENDERED.with(Cell::get));
+            target_hung = !accepted && foreground_is_hung();
+        }
+    }
     if accepted {
         pump_messages_until(PASTE_SETTLE_WAIT, || false);
     }
@@ -891,7 +921,11 @@ unsafe fn paste_text(held: &Hotkey, text: &str) {
         log::debug!("キー割り当て: クリップボードが新しくなったため、元に戻しません");
     }
 
-    if !accepted {
+    if target_hung {
+        // 最後まで応答が無い。入力しても届かず、あとでまとめて入ってしまうので、あきらめる。
+        log::warn!("キー割り当て: 貼り付け先が応答しないため、貼り付けをやめました");
+        ime_indicator::notify("応答なし");
+    } else if !accepted {
         log::debug!(
             "キー割り当て: 貼り付けを受け付けない入力欄のため、1 文字ずつ入力します（{}）",
             crate::excel_check::foreground_process_name().unwrap_or_else(|| "不明".into())
@@ -899,6 +933,12 @@ unsafe fn paste_text(held: &Hotkey, text: &str) {
         // 修飾キーは Ctrl+V を送るときに離してある。
         sendinput::send_text(&Hotkey::unpack(0), text);
     }
+}
+
+/// 前面のウィンドウが、メッセージに応答していないか。
+unsafe fn foreground_is_hung() -> bool {
+    let window = GetForegroundWindow();
+    !window.is_invalid() && IsHungAppWindow(window).as_bool()
 }
 
 /// 文字を、遅延レンダリングでクリップボードに予約する（中身は求められたときに渡す）。

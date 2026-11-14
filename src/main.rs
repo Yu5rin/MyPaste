@@ -367,6 +367,7 @@ fn main() {
     let _ = hook_thread.join();
     action_worker.stop();
     log::info!("アタイの貼り付け 終了");
+    log::logger().flush();
 }
 
 /// 動作の記録の最初に、調査に要る情報（版・場所・設定）を残す。

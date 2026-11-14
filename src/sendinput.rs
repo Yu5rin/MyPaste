@@ -17,7 +17,8 @@
 //! 自分が送ったキーをフック側で確実に無視できるようにする。
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    MAPVK_VK_TO_VSC,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_CONTROL, VK_LWIN,
     VK_MENU, VK_RETURN, VK_RWIN, VK_SHIFT, VK_TAB,
 };
@@ -121,14 +122,36 @@ pub fn send_text(held: &Hotkey, text: &str) {
 /// 何もしない など）のあとで Alt や Win を離すと、メニューやスタートが開いてしまう。
 /// それを防ぐため、何も割り当てられていないキーを 1 回打鍵する（修飾キーは離さない）。
 pub fn suppress_menu(held: &Hotkey) {
-    if held.alt || held.win {
-        send(&[key(VK_MENU_MASK, false), key(VK_MENU_MASK, true)]);
+    if needs_mask(held) {
+        tap_mask();
     }
+}
+
+/// 修飾キーだけを押して離したことにならないよう、何も割り当てられていないキーを挟むべきか。
+/// Alt・Win はメニューやスタートが開く。Ctrl+Shift は、入力方式（IME）を切り替える
+/// Windows のホットキーになっていることがある。
+fn needs_mask(held: &Hotkey) -> bool {
+    held.alt || held.win || (held.ctrl && held.shift)
+}
+
+/// 何も割り当てられていないキーを 1 回打鍵する。
+pub fn tap_mask() {
+    send(&[key(VK_MENU_MASK, false), key(VK_MENU_MASK, true)]);
 }
 
 /// 押されたままの修飾キー（`held`）を離すだけ（書式なし貼り付けなどの前に使う）。
 pub fn release_modifiers(held: &Hotkey) {
     send(&release_inputs(held));
+}
+
+/// 修飾キーを押す（動作のために離した Ctrl・Shift を、押し直すとき）。
+pub fn press_modifier(vk: u16) {
+    send(&[key(vk, false)]);
+}
+
+/// 修飾キーを離す。
+pub fn release_modifier(vk: u16) {
+    send(&[key(vk, true)]);
 }
 
 fn send(inputs: &[INPUT]) {
@@ -153,7 +176,7 @@ fn release_inputs(held: &Hotkey) -> Vec<INPUT> {
     // 利用者が修飾キーを押したまま、同じ割り当てをもう一度押せるように知らせておく。
     crate::keyboard::mark_released_by_us(held.ctrl, held.shift, held.alt, held.win);
     let mut inputs = Vec::new();
-    if held.alt || held.win {
+    if needs_mask(held) {
         inputs.push(key(VK_MENU_MASK, false));
         inputs.push(key(VK_MENU_MASK, true));
     }
@@ -239,7 +262,8 @@ fn key_ex(vk: u16, up: bool, extended: bool) -> INPUT {
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
                 wVk: VIRTUAL_KEY(vk),
-                wScan: 0,
+                // スキャンコードを見るアプリ（リモートデスクトップ・仮想マシンなど）にも届くように。
+                wScan: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) } as u16,
                 dwFlags: flags,
                 time: 0,
                 dwExtraInfo: EXTRA_INFO_SIGNATURE,

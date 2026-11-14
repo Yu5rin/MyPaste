@@ -268,7 +268,7 @@ unsafe fn load_editor(hwnd: HWND, rule: &HotkeyRuleSetting) {
         set_checked(hwnd, ID_TRANSFORM_FIRST + i as i32, transforms.contains(transform));
     }
     set_checked(hwnd, ID_PASTE, hotkey_rules::input_is_paste(&rule.input));
-    let apps = remap_logic::normalize_apps(rule.apps.iter().map(String::as_str));
+    let apps = remap_logic::normalize_app_list(&rule.apps);
     set_combo_index(hwnd, ID_SCOPE, usize::from(!apps.is_empty()));
     set_text(hwnd, ID_APPS, &remap_logic::apps_to_line(&apps));
     update_fields(hwnd);

@@ -22,6 +22,7 @@ use std::sync::RwLock;
 
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
@@ -46,6 +47,18 @@ static HOOK_HANDLE: AtomicIsize = AtomicIsize::new(0);
 /// （オートリピート）で何度も貼り付けが走らないよう、最初の押下でのみ送出し、
 /// 離すまでの押下と、対応する解放を握りつぶすために使う。
 static ACTIVE_VK: AtomicU32 = AtomicU32::new(0);
+/// [`ACTIVE_VK`] のキーを、最後に握りつぶした時刻（フックに届いた時刻。ミリ秒）。
+static ACTIVE_TIME: AtomicU32 = AtomicU32::new(0);
+/// 握りつぶしているキーの「離した」を見逃した（UAC の画面や、管理者として動くアプリの上で
+/// 離された）とみなすまでの時間。押しっぱなしの間はオートリピートが届き続けるので、
+/// これだけ途切れたら、もう離されている。
+const ACTIVE_STALE_MS: u32 = 1500;
+
+/// 握りつぶすキーを覚える。
+fn set_active(vk: u32, time: u32) {
+    ACTIVE_TIME.store(time, Ordering::SeqCst);
+    ACTIVE_VK.store(vk, Ordering::SeqCst);
+}
 
 /// 起動するキーの組み合わせ（[`Hotkey::pack`] の値）。既定は Ctrl+B。
 static HOTKEY: AtomicU32 = AtomicU32::new(0x0142);
@@ -98,6 +111,11 @@ fn history_double_tap() -> Option<Modifier> {
 /// 反映するので、修飾キーを押したまま割り当てたキーを続けて押したときに、2 回目が一致しなく
 /// なる。それを防ぐため、利用者が実際に離す（または押し直す）までは押されているとみなす。
 static RELEASED_BY_US: AtomicU32 = AtomicU32::new(0);
+/// [`RELEASED_BY_US`] に最後に印を付けた時刻（`GetTickCount`）。
+static RELEASED_AT: AtomicU32 = AtomicU32::new(0);
+/// 印を信じる時間。利用者が離したことを見逃すと印が残り、押していない修飾キーを押していると
+/// みなし続けてしまうので、これを過ぎた印は捨てる。
+const RELEASED_STALE_MS: u32 = 5000;
 const MOD_CTRL: u32 = 1;
 const MOD_SHIFT: u32 = 2;
 const MOD_ALT: u32 = 4;
@@ -113,6 +131,7 @@ pub fn mark_released_by_us(ctrl: bool, shift: bool, alt: bool, win: bool) {
         | (u32::from(alt && is_down(VK_MENU)) * MOD_ALT)
         | (u32::from(win && (is_down(VK_LWIN) || is_down(VK_RWIN))) * MOD_WIN);
     if bits != 0 {
+        RELEASED_AT.store(unsafe { GetTickCount() }, Ordering::SeqCst);
         RELEASED_BY_US.fetch_or(bits, Ordering::SeqCst);
         // 印を付けている間に、利用者がもう離していた（フックが印を消したあとに付けてしまった）
         // 修飾キーは、印を外す。
@@ -121,6 +140,30 @@ pub fn mark_released_by_us(ctrl: bool, shift: bool, alt: bool, win: bool) {
             | (u32::from(!is_down(VK_MENU)) * MOD_ALT)
             | (u32::from(!is_down(VK_LWIN) && !is_down(VK_RWIN)) * MOD_WIN);
         RELEASED_BY_US.fetch_and(!(bits & released), Ordering::SeqCst);
+    }
+}
+
+/// アプリが離した Ctrl・Shift を、利用者がまだ押しているなら押し直す（動作のあとで呼ぶ）。
+///
+/// 押し直さないと、Ctrl を押したまま割り当てのキーを押し、続けて `S` を押したときに、
+/// Windows は Ctrl が離されていると思っているので、保存ではなく `s` が入力されてしまう。
+/// Alt と Win は、押し直すとメニューやスタートが開くことがあるので、押し直さない。
+pub fn repress_released_modifiers() {
+    let mut pressed = 0;
+    for (bit, vk) in [(MOD_CTRL, VK_CONTROL), (MOD_SHIFT, VK_SHIFT)] {
+        if RELEASED_BY_US.load(Ordering::SeqCst) & bit == 0 {
+            continue;
+        }
+        sendinput::press_modifier(vk.0);
+        pressed += 1;
+        // 押し直す間に利用者が離していたら（フックが印を消している）、離した状態に戻す。
+        if RELEASED_BY_US.fetch_and(!bit, Ordering::SeqCst) & bit == 0 {
+            sendinput::release_modifier(vk.0);
+        }
+    }
+    if pressed == 2 {
+        // Ctrl+Shift だけを押して離すと、入力方式を切り替える Windows のホットキーになることがある。
+        sendinput::tap_mask();
     }
 }
 
@@ -294,7 +337,14 @@ fn is_down(vk: VIRTUAL_KEY) -> bool {
 /// アプリが「離した」を送ったが利用者はまだ押している修飾キー（[`RELEASED_BY_US`]）も、
 /// 押されているものとして数える。
 fn modifiers_match(hotkey: &Hotkey) -> bool {
-    let ours = RELEASED_BY_US.load(Ordering::SeqCst);
+    let mut ours = RELEASED_BY_US.load(Ordering::SeqCst);
+    if ours != 0
+        && unsafe { GetTickCount() }.wrapping_sub(RELEASED_AT.load(Ordering::SeqCst))
+            > RELEASED_STALE_MS
+    {
+        RELEASED_BY_US.store(0, Ordering::SeqCst);
+        ours = 0;
+    }
     let held = |vk_down: bool, bit: u32| vk_down || ours & bit != 0;
     held(is_down(VK_CONTROL), MOD_CTRL) == hotkey.ctrl
         && held(is_down(VK_SHIFT), MOD_SHIFT) == hotkey.shift
@@ -345,13 +395,18 @@ unsafe extern "system" fn low_level_keyboard_proc(
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
                     // リマップ中のキーの押しっぱなし（オートリピート）は、修飾キーの
                     // 状態にかかわらず離すまで握りつぶす（再送もしない）。
-                    if kb.vkCode == ACTIVE_VK.load(Ordering::SeqCst) {
-                        return LRESULT(1);
+                    if kb.vkCode != 0 && kb.vkCode == ACTIVE_VK.load(Ordering::SeqCst) {
+                        let last = ACTIVE_TIME.swap(kb.time, Ordering::SeqCst);
+                        if kb.time.wrapping_sub(last) < ACTIVE_STALE_MS {
+                            return LRESULT(1);
+                        }
+                        // 「離した」を見逃していた。新しく押されたものとして扱う。
+                        ACTIVE_VK.store(0, Ordering::SeqCst);
                     }
                     // 対象アプリかつ ON かつ修飾キーが一致するときだけリマップする。
                     if kb.vkCode == hotkey.vk && modifiers_match(&hotkey) {
                         if is_enabled() && is_target_foreground() {
-                            ACTIVE_VK.store(kb.vkCode, Ordering::SeqCst);
+                            set_active(kb.vkCode, kb.time);
                             sendinput::send_paste_values(&hotkey);
                             log::debug!("{} -> Ctrl+Shift+V を送りました", hotkey.format());
                             return LRESULT(1);
@@ -374,7 +429,7 @@ unsafe extern "system" fn low_level_keyboard_proc(
                     // クリップボードの履歴の一覧を出すキー（キー割り当ての ON/OFF にかかわらず効く）。
                     if let Some(history) = history_hotkey() {
                         if kb.vkCode == history.vk && modifiers_match(&history) {
-                            ACTIVE_VK.store(kb.vkCode, Ordering::SeqCst);
+                            set_active(kb.vkCode, kb.time);
                             log::debug!("クリップボードの履歴: {} を捕まえました", history.format());
                             actions::dispatch(Action::ClipboardHistory, history);
                             return LRESULT(1);
@@ -382,7 +437,7 @@ unsafe extern "system" fn low_level_keyboard_proc(
                     }
                     // キー割り当て。実行は別のスレッドに頼み、ここではすぐに戻る。
                     if let Some((action, rule_hotkey)) = find_rule(kb.vkCode) {
-                        ACTIVE_VK.store(kb.vkCode, Ordering::SeqCst);
+                        set_active(kb.vkCode, kb.time);
                         log::debug!("キー割り当て: {} を捕まえました", rule_hotkey.format());
                         actions::dispatch(action, rule_hotkey);
                         return LRESULT(1);

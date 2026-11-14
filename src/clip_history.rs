@@ -527,9 +527,7 @@ impl Config {
             page_size: settings.page_size.clamp(MIN_PAGE_SIZE, MAX_PAGE_SIZE),
             theme: Theme::from_setting(&settings.theme),
             move_to_top: settings.move_to_top,
-            exclude_apps: crate::remap_logic::normalize_apps(
-                settings.exclude_apps.iter().map(String::as_str),
-            ),
+            exclude_apps: crate::remap_logic::normalize_app_list(&settings.exclude_apps),
             problem,
         }
     }

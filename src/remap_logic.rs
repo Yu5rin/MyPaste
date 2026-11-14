@@ -275,19 +275,24 @@ pub fn apps_to_line(apps: &[String]) -> String {
     apps_to_text(apps).replace("\r\n", " ")
 }
 
-/// 設定ファイルの対象アプリを、実際に使う一覧にする。
-///
-/// 書き方の揺れ（小文字、`.exe` 抜け、フォルダ付き）を [`normalize_app`] で直す。
-/// 空になった場合は、どのアプリでも動かず故障に見えるため既定（Excel）に戻す。
-pub fn effective_target_apps(apps: &[String]) -> Vec<String> {
-    // 配列の要素はそれぞれ 1 つの名前なので、空白で分けない（"My App.exe" を許す）。
+/// 設定ファイルに保存したアプリの一覧（配列）を整える。配列の要素はそれぞれ 1 つの名前なので、
+/// 空白で分けない（`"My App.exe"` を許す）。画面の欄の文字を読むときは [`normalize_apps`]。
+pub fn normalize_app_list(apps: &[String]) -> Vec<String> {
     let mut normalized: Vec<String> = Vec::new();
     for name in apps.iter().filter_map(|a| normalize_app(a)) {
         if !normalized.contains(&name) {
             normalized.push(name);
         }
     }
-    let apps = normalized;
+    normalized
+}
+
+/// 設定ファイルの対象アプリを、実際に使う一覧にする。
+///
+/// 書き方の揺れ（小文字、`.exe` 抜け、フォルダ付き）を [`normalize_app`] で直す。
+/// 空になった場合は、どのアプリでも動かず故障に見えるため既定（Excel）に戻す。
+pub fn effective_target_apps(apps: &[String]) -> Vec<String> {
+    let apps = normalize_app_list(apps);
     if apps.is_empty() {
         vec![DEFAULT_TARGET_APP.to_string()]
     } else {
@@ -530,5 +535,11 @@ mod tests {
         assert_eq!(add_app("EXCEL.EXE", "notepad.exe"), vec!["EXCEL.EXE", "NOTEPAD.EXE"]);
         assert_eq!(add_app("excel notepad", "NOTEPAD.EXE"), vec!["EXCEL.EXE", "NOTEPAD.EXE"]);
         assert_eq!(add_app("", "My App.exe"), vec!["MY APP.EXE"]);
+    }
+
+    #[test]
+    fn saved_app_list_keeps_names_with_spaces() {
+        let saved = vec!["my app.exe".to_string(), "excel".to_string(), "EXCEL.EXE".to_string(), " ".to_string()];
+        assert_eq!(normalize_app_list(&saved), ["MY APP.EXE", "EXCEL.EXE"]);
     }
 }
