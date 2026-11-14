@@ -26,11 +26,11 @@
 //!
 //! 3 が失敗した場合は 2 を巻き戻す（[`install`] のロールバック）。ただし、
 //! **電源断や強制終了など OS ごと落ちるケースでは、この巻き戻しコード自体が
-//! 実行されない**ため保証の対象外である。そのために [`cleanup_old`] が
-//! 次回起動時、`.exe` が無く `.old` だけが残っている場合に `.old` を
-//! `.exe` へ戻す（復元を試みる）。それでも、複製元の `.old` 自体が壊れて
-//! いた場合などは救えない。詳細は README の「実行中の EXE を入れ替える仕組み」
-//! を参照。
+//! 実行されない**ため保証の対象外である。2 と 3 の間（リネーム 2 回の間のごく短い時間）で
+//! 落ちると、`.exe` が無く `.old` と `.new` だけが残り、アプリを起動できなくなる。
+//! このときは、利用者が `Atai-paste.exe.old` の名前を `Atai-paste.exe` に戻す必要がある
+//! （README の「実行中の EXE を入れ替える仕組み」に書いてある）。[`cleanup_old`] にある
+//! 復元の処理は、別名で残っていた実行ファイルから起動された場合に備えたもの。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -61,6 +61,9 @@ pub const AUTO_UPDATED_ARG: &str = "--auto-updated";
 const IDLE_BEFORE_AUTO_INSTALL: Duration = Duration::from_secs(120);
 /// 操作が無くなるのを待つ間の、確かめる間隔。
 const IDLE_POLL: Duration = Duration::from_secs(5);
+
+/// 尋ねずに更新する設定で、ダウンロードを済ませて入れ替える時を待っている版。
+static PENDING_INSTALL: Mutex<Option<Version>> = Mutex::new(None);
 
 /// 動いている間にすでに尋ねた（見送られた）・知らせた版。定期的な確認で同じ版を
 /// 何度も出さないために覚えておく（アプリを起動し直すと忘れる）。
@@ -668,10 +671,17 @@ pub fn run(settings: Settings, tx: Sender<TrayMessage>, trigger: Trigger) {
     let Some(_guard) = RunningGuard::acquire() else {
         log::info!("更新処理は既に実行中のため、今回の要求は無視します");
         if manual {
-            message_box(
-                "現在、更新を確認しています。完了までしばらくお待ちください。",
-                MB_OK | MB_ICONINFORMATION,
-            );
+            let pending = *PENDING_INSTALL.lock().unwrap_or_else(|p| p.into_inner());
+            let text = match pending {
+                // 尋ねずに更新する設定で、入れ替える時を待っている。
+                Some(version) => format!(
+                    "新しいバージョン {version} をダウンロード済みです。\n\n\
+                     しばらく操作が無いときに、自動で入れ替えて再起動します\
+                     （設定画面などを開いている間は入れ替えません）。"
+                ),
+                None => "現在、更新を確認しています。完了までしばらくお待ちください。".to_string(),
+            };
+            message_box(&text, MB_OK | MB_ICONINFORMATION);
         }
         return;
     };
@@ -851,7 +861,10 @@ fn install_when_idle(info: &Available, tx: &Sender<TrayMessage>) {
     };
     // 待っている間は、トレイの進捗表示を戻しておく。
     let _ = tx.send(TrayMessage::UpdateFinished);
-    if !wait_until_idle() {
+    *PENDING_INSTALL.lock().unwrap_or_else(|p| p.into_inner()) = Some(info.version);
+    let ready = wait_until_idle();
+    *PENDING_INSTALL.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    if !ready {
         log::info!("アプリの終了中のため、更新しません");
         let _ = std::fs::remove_file(&downloaded);
         return;
