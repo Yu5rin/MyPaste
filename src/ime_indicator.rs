@@ -51,6 +51,7 @@ use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::UI::Shell::{
     SHQueryUserNotificationState, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
     GetForegroundWindow, GetGUIThreadInfo, GetMessageW, GetWindowThreadProcessId, KillTimer,
@@ -513,6 +514,12 @@ unsafe fn query_foreground_ime() -> Option<Observed> {
     let thread_id = GetWindowThreadProcessId(foreground, Some(&mut pid));
     // 自分自身のウィンドウは対象外。
     if thread_id == 0 || pid == GetCurrentProcessId() {
+        return None;
+    }
+
+    // 日本語の入力方式のときだけ表示する（韓国語・中国語の入力方式では「あ」「A」が当てはまらない）。
+    const LANG_JAPANESE: usize = 0x0411;
+    if GetKeyboardLayout(thread_id).0 as usize & 0xFFFF != LANG_JAPANESE {
         return None;
     }
 

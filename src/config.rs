@@ -318,10 +318,73 @@ impl Settings {
         match serde_json::from_str(text) {
             Ok(s) => s,
             Err(e) => {
-                log::warn!("settings.json の解析に失敗したため既定値を使います: {e}");
-                Self::default()
+                log::warn!("settings.json をそのままでは読めません: {e}");
+                // 1 か所の書き間違いで全部を既定値にすると、キー割り当てや定型文が空に見え、
+                // 次に保存したときに本当に消えてしまう。読める部分は読む。
+                let (settings, problems) = match serde_json::from_str::<serde_json::Value>(text) {
+                    Ok(value) => Self::from_value_lenient(&value),
+                    Err(_) => (
+                        Self::default(),
+                        vec!["ファイル全体を JSON として読めません（かっこやカンマの書き間違いなど）".to_string()],
+                    ),
+                };
+                report_load_problem(&path, &format!("{e}"), &problems);
+                settings
             }
         }
+    }
+
+    /// 型の合わない所があっても、読める部分だけを読む。読めなかった所は既定値にして、
+    /// どこが読めなかったかを返す。
+    pub fn from_value_lenient(value: &serde_json::Value) -> (Self, Vec<String>) {
+        fn section<T: serde::de::DeserializeOwned>(
+            value: &serde_json::Value,
+            key: &str,
+            target: &mut T,
+            problems: &mut Vec<String>,
+        ) {
+            if let Some(part) = value.get(key) {
+                match serde_json::from_value(part.clone()) {
+                    Ok(parsed) => *target = parsed,
+                    Err(e) => problems.push(format!("{key}: {e}")),
+                }
+            }
+        }
+        /// 配列は 1 件ずつ読み、読めない件だけを飛ばす。
+        fn list<T: serde::de::DeserializeOwned>(
+            value: &serde_json::Value,
+            key: &str,
+            target: &mut Vec<T>,
+            problems: &mut Vec<String>,
+        ) {
+            match value.get(key) {
+                None => {}
+                Some(serde_json::Value::Array(items)) => {
+                    for (i, item) in items.iter().enumerate() {
+                        match serde_json::from_value(item.clone()) {
+                            Ok(parsed) => target.push(parsed),
+                            Err(e) => problems.push(format!("{key} の {} 件目: {e}", i + 1)),
+                        }
+                    }
+                }
+                Some(_) => problems.push(format!("{key}: 配列ではありません")),
+            }
+        }
+        let mut settings = Self::default();
+        let mut problems = Vec::new();
+        if !value.is_object() {
+            problems.push("いちばん外側が { } ではありません".to_string());
+            return (settings, problems);
+        }
+        section(value, "remap", &mut settings.remap, &mut problems);
+        section(value, "update", &mut settings.update, &mut problems);
+        section(value, "ime_indicator", &mut settings.ime_indicator, &mut problems);
+        section(value, "log", &mut settings.log, &mut problems);
+        section(value, "hotkeys_enabled", &mut settings.hotkeys_enabled, &mut problems);
+        section(value, "clipboard_history", &mut settings.clipboard_history, &mut problems);
+        list(value, "hotkeys", &mut settings.hotkeys, &mut problems);
+        list(value, "snippets", &mut settings.snippets, &mut problems);
+        (settings, problems)
     }
 
     /// 既定の設定をファイルへ書き出す（初回起動時のみ。失敗は無視）。
@@ -330,6 +393,45 @@ impl Settings {
             let _ = std::fs::write(path, text);
         }
     }
+}
+
+/// settings.json を読めなかった所の説明（起動時に 1 度だけ知らせる）。
+static LOAD_PROBLEM: Mutex<Option<String>> = Mutex::new(None);
+
+/// settings.json に読めない所があったことを覚えておく。最初の 1 回は、直す前の中身を
+/// `settings.json.bak` に写しておく（このあとの保存で、読めなかった所が既定値に置き換わるため）。
+fn report_load_problem(path: &Path, error: &str, problems: &[String]) {
+    let mut slot = LOAD_PROBLEM.lock().unwrap_or_else(|p| p.into_inner());
+    if slot.is_some() {
+        return;
+    }
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(".bak");
+    let backup = PathBuf::from(backup);
+    let copied = std::fs::copy(path, &backup).is_ok();
+    let mut message = format!(
+        "設定ファイル（settings.json）に読めない所があったため、その部分は既定値で動いています。\n\n{}\n\n読めなかった所:\n",
+        path.display()
+    );
+    for problem in problems.iter().take(8) {
+        message.push_str(&format!("・{problem}\n"));
+    }
+    if problems.is_empty() {
+        message.push_str(&format!("・{error}\n"));
+    }
+    if copied {
+        message.push_str(&format!(
+            "\n元の中身は、次のファイルに写してあります。\n{}\n",
+            backup.display()
+        ));
+    }
+    message.push_str("\nこのあと設定を保存すると、読めなかった所は既定値に置き換わります。");
+    *slot = Some(message);
+}
+
+/// settings.json を読めなかった所の説明を取り出す（あれば、起動時に利用者へ知らせる）。
+pub fn take_load_problem() -> Option<String> {
+    LOAD_PROBLEM.lock().unwrap_or_else(|p| p.into_inner()).take()
 }
 
 /// IME 入力モード表示の ON/OFF だけを `settings.json` に書き込む（トレイメニューから使う）。
@@ -977,5 +1079,32 @@ mod tests {
         assert!(hotkeys_from_json(r#"{"remap":{}}"#).is_err());
         assert!(hotkeys_from_json("3").is_err());
         assert!(hotkeys_from_json(r#"{"hotkeys":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn lenient_load_keeps_readable_parts() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{
+                "remap": { "hotkey": "Ctrl+Q", "target_apps": "EXCEL.EXE" },
+                "log": { "enabled": true },
+                "hotkeys": [
+                    { "hotkey": "F9", "action": "block" },
+                    { "hotkey": "F8", "action": "block", "apps": "x" }
+                ],
+                "snippets": [ { "name": "a", "text": "b" } ]
+            }"#,
+        )
+        .unwrap();
+        assert!(serde_json::from_value::<Settings>(value.clone()).is_err());
+        let (settings, problems) = Settings::from_value_lenient(&value);
+        // 読めなかった所だけが既定値になる。
+        assert_eq!(settings.remap.hotkey, Settings::default().remap.hotkey);
+        assert!(settings.log.enabled);
+        assert_eq!(settings.hotkeys.len(), 1);
+        assert_eq!(settings.hotkeys[0].hotkey, "F9");
+        assert_eq!(settings.snippets.len(), 1);
+        assert_eq!(problems.len(), 2);
+        assert!(problems[0].starts_with("remap"));
+        assert!(problems[1].starts_with("hotkeys の 2 件目"));
     }
 }

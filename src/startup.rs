@@ -49,10 +49,28 @@ pub fn enable() -> Result<()> {
 
 /// 自動起動を無効にする（ショートカットを削除）。
 pub fn disable() -> Result<()> {
-    if let Ok(path) = lnk_path() {
-        let _ = std::fs::remove_file(path);
+    let path = lnk_path()?;
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(windows::core::Error::new(
+            HRESULT(-1),
+            format!("ショートカットを削除できません: {e}"),
+        )),
     }
-    Ok(())
+}
+
+/// 自動起動が有効なら、ショートカットの先を今の実行ファイルに合わせ直す（起動時に呼ぶ）。
+///
+/// 実行ファイルを別のフォルダへ移したり、名前を変えたりすると、ショートカットは古い場所を
+/// 指したままになり、メニューには「有効」と出るのに、サインインしても起動しなくなる。
+pub fn refresh() {
+    if !is_enabled() {
+        return;
+    }
+    if let Err(e) = enable() {
+        log::warn!("自動起動のショートカットを、今の場所に合わせ直せませんでした: {e}");
+    }
 }
 
 /// 自動起動を反転し、反転後の状態（true = 有効）を返す。
@@ -83,7 +101,7 @@ fn create_shortcut(target: &Path, lnk: &Path) -> Result<()> {
                 link.SetWorkingDirectory(PCWSTR(dir_w.as_ptr()))?;
             }
 
-            let desc_w = wide("Excel で Ctrl+B を Ctrl+Shift+V にリマップ");
+            let desc_w = wide("アタイの貼り付け");
             link.SetDescription(PCWSTR(desc_w.as_ptr()))?;
 
             let persist: IPersistFile = link.cast()?;

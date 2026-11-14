@@ -143,9 +143,19 @@ fn main() {
     for note in config::take_migration_notes() {
         log::info!("{note}");
     }
+    if let Some(problem) = config::take_load_problem() {
+        // 黙って既定値で動くと、設定が消えたように見える。起動を止めないよう別のスレッドで知らせる。
+        log::warn!("{problem}");
+        thread::spawn(move || {
+            update::message_box(&problem, MB_OK | windows::Win32::UI::WindowsAndMessaging::MB_ICONWARNING);
+        });
+    }
 
     // 前回の更新で残った .old があれば削除する。
     update::cleanup_old();
+    // 実行ファイルを移したあとでも自動起動が効くよう、ショートカットの先を合わせ直す
+    // （COM を使うので、起動を待たせないよう別のスレッドで行う）。
+    thread::spawn(startup::refresh);
 
     // キーリマップのキーと対象アプリを、フックを設置する前に決めておく。
     keyboard::set_enabled(settings.remap.enabled);

@@ -16,11 +16,14 @@
 //! 送出する入力には [`EXTRA_INFO_SIGNATURE`] を `dwExtraInfo` として付与し、
 //! 自分が送ったキーをフック側で確実に無視できるようにする。
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    GetAsyncKeyState, MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     MAPVK_VK_TO_VSC,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_CONTROL, VK_LWIN,
-    VK_MENU, VK_RETURN, VK_RWIN, VK_SHIFT, VK_TAB,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL,
+    VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN, VK_RMENU, VK_RSHIFT, VK_RWIN,
+    VK_SHIFT, VK_TAB,
 };
 
 use crate::remap_logic::{self, Hotkey};
@@ -52,7 +55,8 @@ fn paste_values_inputs(held: &Hotkey) -> Vec<INPUT> {
         inputs.push(key(VK_MENU_MASK, true));
     }
     if held.alt {
-        inputs.push(key(VK_MENU.0, true)); // Alt 解放（押し直しはしない）
+        // Alt 解放（押し直しはしない）
+        push_release(&mut inputs, VK_MENU.0, VK_LMENU.0, VK_RMENU.0, true);
     }
     if held.win {
         // Win は settings.json で指定した場合だけ。左右どちらか分からないので両方離す。
@@ -144,14 +148,70 @@ pub fn release_modifiers(held: &Hotkey) {
     send(&release_inputs(held));
 }
 
-/// 修飾キーを押す（動作のために離した Ctrl・Shift を、押し直すとき）。
-pub fn press_modifier(vk: u16) {
-    send(&[key(vk, false)]);
+/// 動作のために離した Ctrl・Shift が、左右どちらだったか（押し直すときに同じ側を押す）。
+/// ビット: 1 = 左 Ctrl、2 = 右 Ctrl、4 = 左 Shift、8 = 右 Shift。
+static RELEASED_SIDES: AtomicU32 = AtomicU32::new(0);
+
+/// 修飾キー（`VK_CONTROL` / `VK_SHIFT`）の、左右のキーと [`RELEASED_SIDES`] のビット。
+fn sides_of(vk: u16) -> [(u16, bool, u32); 2] {
+    if vk == VK_SHIFT.0 {
+        [(VK_LSHIFT.0, false, 4), (VK_RSHIFT.0, false, 8)]
+    } else {
+        [(VK_LCONTROL.0, false, 1), (VK_RCONTROL.0, true, 2)]
+    }
 }
 
-/// 修飾キーを離す。
+/// 修飾キーを押す（動作のために離した Ctrl・Shift を、押し直すとき）。離したときと同じ側を押す。
+pub fn press_modifier(vk: u16) {
+    send(&side_inputs(vk, false));
+}
+
+/// 修飾キーを離す（押し直したあとで、利用者がもう離していたと分かったとき）。
 pub fn release_modifier(vk: u16) {
-    send(&[key(vk, true)]);
+    send(&side_inputs(vk, true));
+}
+
+fn side_inputs(vk: u16, up: bool) -> Vec<INPUT> {
+    let recorded = RELEASED_SIDES.load(Ordering::SeqCst);
+    let inputs: Vec<INPUT> = sides_of(vk)
+        .into_iter()
+        .filter(|(_, _, bit)| recorded & bit != 0)
+        .map(|(side, extended, _)| key_ex(side, up, extended))
+        .collect();
+    if inputs.is_empty() {
+        vec![key(vk, up)]
+    } else {
+        inputs
+    }
+}
+
+/// 押されている修飾キーを離す入力を足す。左右どちらが押されているかを調べ、その側を離す
+/// （右 Ctrl を押しているのに左の「離した」を送ると、右が押されたまま残る）。
+/// どちらか分からないときは、左右を区別しないキーを離す。
+fn push_release(inputs: &mut Vec<INPUT>, generic: u16, left: u16, right: u16, right_extended: bool) {
+    let down = |vk: u16| unsafe { (GetAsyncKeyState(i32::from(vk)) as u16 & 0x8000) != 0 };
+    let (left_down, right_down) = (down(left), down(right));
+    if left_down {
+        inputs.push(key(left, true));
+    }
+    if right_down {
+        inputs.push(key_ex(right, true, right_extended));
+    }
+    if !left_down && !right_down {
+        inputs.push(key(generic, true));
+    }
+    // Ctrl・Shift は、あとで同じ側を押し直せるように覚えておく（Alt は押し直さない）。
+    if generic == VK_CONTROL.0 || generic == VK_SHIFT.0 {
+        let [(_, _, left_bit), (_, _, right_bit)] = sides_of(generic);
+        let mut sides = RELEASED_SIDES.load(Ordering::SeqCst) & !(left_bit | right_bit);
+        if left_down {
+            sides |= left_bit;
+        }
+        if right_down {
+            sides |= right_bit;
+        }
+        RELEASED_SIDES.store(sides, Ordering::SeqCst);
+    }
 }
 
 fn send(inputs: &[INPUT]) {
@@ -181,7 +241,7 @@ fn release_inputs(held: &Hotkey) -> Vec<INPUT> {
         inputs.push(key(VK_MENU_MASK, true));
     }
     if held.alt {
-        inputs.push(key(VK_MENU.0, true));
+        push_release(&mut inputs, VK_MENU.0, VK_LMENU.0, VK_RMENU.0, true);
     }
     if held.win {
         // 左右どちらを押しているか分からないので、両方の解放を送る。
@@ -189,10 +249,10 @@ fn release_inputs(held: &Hotkey) -> Vec<INPUT> {
         inputs.push(key(VK_RWIN.0, true));
     }
     if held.ctrl {
-        inputs.push(key(VK_CONTROL.0, true));
+        push_release(&mut inputs, VK_CONTROL.0, VK_LCONTROL.0, VK_RCONTROL.0, true);
     }
     if held.shift {
-        inputs.push(key(VK_SHIFT.0, true));
+        push_release(&mut inputs, VK_SHIFT.0, VK_LSHIFT.0, VK_RSHIFT.0, false);
     }
     inputs
 }

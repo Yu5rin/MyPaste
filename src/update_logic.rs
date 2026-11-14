@@ -237,6 +237,11 @@ pub fn extract_latest_tag_from_atom(xml: &str) -> Option<String> {
         let Some(tag) = tag_from_release_url(&href) else {
             continue;
         };
+        // 試験版（`v1.9.0-beta` のように `-` が付くタグ）は、正式版として扱わない
+        // （API の「最新のリリース」には出ないものを、フィードから拾って入れてしまわないように）。
+        if tag.contains('-') {
+            continue;
+        }
         let Some(version) = Version::parse(&tag) else {
             continue;
         };
@@ -906,5 +911,11 @@ mod tests {
         assert_eq!(decide(UpdateMode::Ask, Trigger::Manual, found, Some(found), false), Decision::ManualReplace);
         // 一度案内した版は、定期的な確認では繰り返さない。
         assert_eq!(decide(UpdateMode::Auto, Trigger::Periodic, found, Some(found), false), Decision::Nothing);
+    }
+
+    #[test]
+    fn ignores_prerelease_tags_in_feed() {
+        assert_eq!(extract_latest_tag_from_atom(&feed(&["v2.0.0-beta", "v1.9.0"])).as_deref(), Some("v1.9.0"));
+        assert_eq!(extract_latest_tag_from_atom(&feed(&["v2.0.0-rc.1"])), None);
     }
 }
