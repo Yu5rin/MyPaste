@@ -22,6 +22,10 @@
 //! クリックで切り替える（検索と組み合わせられる。出したままにして出し直しても保つ）。
 //! 絞り込んだ一覧の位置は、元の一覧の位置に置き換えてから消す・ピン留め・貼り付けをする。
 //!
+//! まとめて貼り付け: Space で選んでいる行に印を付ける・外す（印を付けた順番を、番号の所に色の
+//! 付いた札で出す。タブをまたいで付けられる）。印があるときは、Enter・行のクリックで、印を付けた
+//! ものを付けた順に貼り付ける（続く文字は改行でつないで 1 回で、画像はその位置で 1 枚ずつ）。
+//!
 //! 一覧は前面（アクティブ）にしない。前面にすると、元のアプリの入力欄からカーソルが外れて
 //! 貼り付けられなくなることがあるため。キー操作はキーボードフック（[`hook_key`]）から、一覧の外の
 //! クリックとホイールはマウスフックから受け取る。ただし、右クリックのメニューを出している間と、
@@ -61,7 +65,7 @@ use windows::Win32::UI::Input::Ime::ImmAssociateContextEx;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SetFocus, VK_APPS, VK_CONTROL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END,
     VK_ESCAPE, VK_F10, VK_HOME, VK_LEFT, VK_NEXT, VK_OEM_2, VK_PRIOR, VK_RETURN, VK_RIGHT,
-    VK_SHIFT, VK_TAB, VK_UP,
+    VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
@@ -82,7 +86,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
-use crate::clip_history::{self, GateState, KeyGate, KeyRoute, MenuPosition, Palette, Theme};
+use crate::clip_history::{self, GateState, KeyGate, KeyRoute, Marks, MenuPosition, Palette, Theme};
 use crate::config::Snippet;
 use crate::clip_images::{self, Item, KindFilter, Thumb};
 use crate::ui;
@@ -267,6 +271,9 @@ const MENU_CLOSE: usize = 5;
 const MENU_PIN: usize = 6;
 const MENU_KEEP: usize = 7;
 const MENU_SEARCH: usize = 8;
+const MENU_MARK: usize = 9;
+const MENU_PASTE_MARKED: usize = 10;
+const MENU_CLEAR_MARKS: usize = 11;
 /// ピン留めした行の左端に引く線の太さ（96 DPI 基準）。
 const PIN_BAR_W: i32 = 3;
 
@@ -331,6 +338,9 @@ pub enum Pick {
     Snippet(String),
     /// 履歴の画像（番号）。
     Image(u64),
+    /// 印を付けたもの（付けた順。中身は `History` / `Snippet` / `Image` だけ）。続く文字は改行で
+    /// つないで 1 回で、画像はその位置で 1 枚ずつ貼り付ける。
+    Many(Vec<Pick>),
 }
 
 /// 一覧を閉じたときの、タブと選んでいた位置と絞り込み（出したままにするとき、同じ所から
@@ -497,6 +507,8 @@ struct State {
     searching: bool,
     /// 検索で探す文（大文字と小文字の違いをなくしたもの。最初に検索するときに作る）。
     folded: Option<[Vec<String>; 2]>,
+    /// まとめて貼り付けるために印を付けたもの（タブの番号, 元の一覧での位置）。付けた順。
+    marks: Marks,
     page_size: usize,
     opacity: u32,
     dpi: u32,
@@ -640,26 +652,45 @@ impl State {
         self.places[self.tab.index()] = (selected, page);
     }
 
-    /// 位置 `index` の行に出すもの: (番号, 出す文, 行数, ピン留めしているか)。番号は、絞り込む
-    /// 前の一覧での番号。
-    fn row(&self, index: usize) -> Option<(usize, String, usize, bool)> {
+    /// 位置 `index` の行に出すもの。番号は、絞り込む前の一覧での番号。
+    fn row(&self, index: usize) -> Option<Row> {
         let actual = self.actual(index)?;
-        match self.tab {
+        let mark = self.marks.order(self.tab.index(), actual);
+        let (shown, lines, pinned) = match self.tab {
             Tab::History => match self.history.get(actual)? {
                 Item::Text { text, pinned } => {
                     let (shown, lines) = clip_history::row_text(text);
-                    Some((actual + 1, shown, lines, *pinned))
+                    (shown, lines, *pinned)
                 }
-                Item::Image(entry) => {
-                    Some((actual + 1, clip_images::row_label(entry), 1, entry.pinned))
-                }
+                Item::Image(entry) => (clip_images::row_label(entry), 1, entry.pinned),
             },
             Tab::Snippets => {
                 let snippet = self.snippets.get(actual)?;
                 let lines = clip_history::row_text(&snippet.text).1;
-                Some((actual + 1, snippets::display_name(snippet), lines, false))
+                (snippets::display_name(snippet), lines, false)
             }
-        }
+        };
+        Some(Row {
+            number: actual + 1,
+            shown,
+            lines,
+            pinned,
+            mark,
+        })
+    }
+
+    /// 印を付けたものを、付けた順に、貼り付けるものにする。
+    fn marked_picks(&self) -> Vec<Pick> {
+        self.marks
+            .iter()
+            .filter_map(|(list, index)| match Tab::from_index(list) {
+                Tab::History => match self.history.get(index)? {
+                    Item::Text { text, .. } => Some(Pick::History(text.clone())),
+                    Item::Image(entry) => Some(Pick::Image(entry.id)),
+                },
+                Tab::Snippets => self.snippets.get(index).map(|s| Pick::Snippet(s.text.clone())),
+            })
+            .collect()
     }
 
     /// 位置 `index` の全文。
@@ -673,6 +704,19 @@ impl State {
             Tab::Snippets => self.snippets.get(actual).map(|s| s.text.clone()),
         }
     }
+}
+
+/// 一覧の 1 行に出すもの。
+struct Row {
+    /// 番号（絞り込む前の一覧での番号）。
+    number: usize,
+    /// 出す文（最初の行・定型文の名前・画像の大きさと日時）。
+    shown: String,
+    /// 行数。
+    lines: usize,
+    pinned: bool,
+    /// まとめて貼り付けるために印を付けた順番（1 から）。
+    mark: Option<usize>,
 }
 
 /// 定型文の、検索で探す文（名前と本文。大文字と小文字の違いをなくしたもの）。
@@ -764,6 +808,7 @@ pub unsafe fn choose(
             kind,
             searching: false,
             folded: None,
+            marks: Marks::default(),
             page_size,
             opacity: view.opacity,
             dpi,
@@ -1159,6 +1204,8 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
         v if (v == VK_OEM_2.0 || v == VK_DIVIDE.0) && !ctrl => enter_search(hwnd),
         // F で、履歴のタブで出す種類を切り替える（すべて → 文字だけ → 画像だけ）。
         v if v == u16::from(b'F') => cycle_kind(hwnd),
+        // Space で、まとめて貼り付けるための印を付ける・外す。
+        v if v == VK_SPACE.0 && !ctrl => toggle_mark_current(hwnd),
         v if v == VK_RETURN.0 => choose_current(),
         v if v == vk_prev => move_to(current - 1),
         v if v == vk_next => move_to(current + 1),
@@ -1214,8 +1261,20 @@ unsafe fn turn_page(hwnd: HWND, delta: isize) {
     select(hwnd, (range.start + row).min(range.end - 1));
 }
 
-/// 選んでいるものを貼り付けるために閉じる。
+/// 選んでいるものを貼り付けるために閉じる。印を付けたものがあれば、それらを付けた順に
+/// まとめて貼り付ける。
 fn choose_current() {
+    let marked = with_state(|st| st.marked_picks()).unwrap_or_default();
+    if !marked.is_empty() {
+        with_state(|st| st.outcome.ctrl_held = CTRL_HELD.load(Ordering::SeqCst));
+        finish(Some(Pick::Many(marked)));
+        return;
+    }
+    choose_selected();
+}
+
+/// 選んでいるもの（印にかかわらず、その 1 件）を貼り付けるために閉じる。
+fn choose_selected() {
     let chosen = with_state(|st| {
         let pos = st.selected()?;
         Some(match (st.tab, st.image_id(pos)) {
@@ -1246,6 +1305,7 @@ unsafe fn remove_current(hwnd: HWND) {
         if let Some(folded) = st.folded.as_mut() {
             folded[0].remove(actual);
         }
+        st.marks.removed(Tab::History.index(), actual);
         st.rebuild();
         let count = st.len();
         let selected = (count > 0).then(|| pos.min(count - 1));
@@ -1333,6 +1393,27 @@ unsafe fn toggle_keep_open(hwnd: HWND) {
         st.keep_open = !st.keep_open;
         st.outcome.keep_open = Some(st.keep_open);
     });
+    let _ = InvalidateRect(control(hwnd, ID_HEADER), None, true);
+}
+
+/// 選んでいるものに、まとめて貼り付けるための印を付ける・外す。
+unsafe fn toggle_mark_current(hwnd: HWND) {
+    let changed = with_state(|st| {
+        let actual = st.selected().and_then(|p| st.actual(p))?;
+        st.marks.toggle(st.tab.index(), actual);
+        Some(())
+    })
+    .flatten();
+    if changed.is_some() {
+        let _ = InvalidateRect(control(hwnd, ID_LIST), None, true);
+        let _ = InvalidateRect(control(hwnd, ID_HEADER), None, true);
+    }
+}
+
+/// 印をすべて外す。
+unsafe fn clear_marks(hwnd: HWND) {
+    with_state(|st| st.marks.clear());
+    let _ = InvalidateRect(control(hwnd, ID_LIST), None, true);
     let _ = InvalidateRect(control(hwnd, ID_HEADER), None, true);
 }
 
@@ -1472,7 +1553,7 @@ unsafe fn on_search_changed(hwnd: HWND) {
 
 /// 右クリックのメニューを出す。
 unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
-    let Some((tab, has_row, pinned, is_image, keep_open)) = with_state(|st| {
+    let Some(((tab, has_row, pinned, is_image, keep_open), (marked, any_marks))) = with_state(|st| {
         let item = st
             .selected()
             .filter(|_| st.tab == Tab::History)
@@ -1480,7 +1561,14 @@ unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
             .and_then(|a| st.history.get(a));
         let pinned = item.is_some_and(Item::pinned);
         let is_image = matches!(item, Some(Item::Image(_)));
-        (st.tab, on_row && st.selected().is_some(), pinned, is_image, st.keep_open)
+        let marked = st
+            .selected()
+            .and_then(|p| st.actual(p))
+            .is_some_and(|a| st.marks.order(st.tab.index(), a).is_some());
+        (
+            (st.tab, on_row && st.selected().is_some(), pinned, is_image, st.keep_open),
+            (marked, !st.marks.is_empty()),
+        )
     }) else {
         return;
     };
@@ -1488,7 +1576,28 @@ unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
         return;
     };
     let row_flag = if has_row { MF_STRING } else { MF_STRING | MF_GRAYED };
-    let _ = AppendMenuW(menu, row_flag, MENU_PASTE, w!("貼り付け(&V)\tEnter"));
+    // 印を付けたものがあるときは、Enter でそれらをまとめて貼り付ける。
+    let paste_label = if any_marks {
+        w!("貼り付け(&V)")
+    } else {
+        w!("貼り付け(&V)\tEnter")
+    };
+    let _ = AppendMenuW(menu, row_flag, MENU_PASTE, paste_label);
+    let marks_flag = if any_marks { MF_STRING } else { MF_STRING | MF_GRAYED };
+    let _ = AppendMenuW(
+        menu,
+        marks_flag,
+        MENU_PASTE_MARKED,
+        w!("選んだものをまとめて貼り付け(&M)\tEnter"),
+    );
+    let mark_label = if marked {
+        w!("まとめて貼り付けから外す(&A)\tSpace")
+    } else {
+        w!("まとめて貼り付けに加える(&A)\tSpace")
+    };
+    let _ = AppendMenuW(menu, row_flag, MENU_MARK, mark_label);
+    let _ = AppendMenuW(menu, marks_flag, MENU_CLEAR_MARKS, w!("選択をすべて外す(&U)"));
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     if tab != Tab::Snippets {
         let pin_label = if pinned {
             w!("ピン留めを外す(&I)\tP")
@@ -1539,7 +1648,10 @@ unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
     MENU_OPEN.store(false, Ordering::SeqCst);
     match chosen {
         MENU_SEARCH => enter_search(hwnd),
-        MENU_PASTE => choose_current(),
+        MENU_PASTE => choose_selected(),
+        MENU_PASTE_MARKED => choose_current(),
+        MENU_MARK => toggle_mark_current(hwnd),
+        MENU_CLEAR_MARKS => clear_marks(hwnd),
         MENU_REGISTER => register_current(hwnd),
         MENU_PIN => toggle_pin_current(hwnd),
         MENU_KEEP => toggle_keep_open(hwnd),
@@ -1642,14 +1754,19 @@ unsafe fn draw_row(item: &DRAWITEMSTRUCT) {
     let Ok(row) = usize::try_from(item.itemID) else {
         return;
     };
-    let Some(Some((number, text, lines, pinned, dpi, font, colors))) = with_state(|st| {
+    let Some(Some((info, dpi, font, colors))) = with_state(|st| {
         let index = st.page() * st.page_size + row;
-        st.row(index).map(|(number, text, lines, pinned)| {
-            (number, text, lines, pinned, st.dpi, st.font, st.colors)
-        })
+        st.row(index).map(|info| (info, st.dpi, st.font, st.colors))
     }) else {
         return;
     };
+    let Row {
+        number,
+        shown: text,
+        lines,
+        pinned,
+        mark,
+    } = info;
     let hdc = item.hDC;
     let rect = item.rcItem;
     let selected = item.itemState.0 & ODS_SELECTED.0 != 0;
@@ -1681,11 +1798,19 @@ unsafe fn draw_row(item: &DRAWITEMSTRUCT) {
         (colors.text, colors.sub)
     };
     SetTextColor(hdc, COLORREF(sub));
-    let mut number_rect = RECT {
+    let number_rect = RECT {
         right: rect.left + ui::scale(NUMBER_W, dpi),
         ..rect
     };
-    draw_line(hdc, &number.to_string(), &mut number_rect, DT_RIGHT);
+    match mark {
+        // 印を付けた行は、番号の代わりに、付けた順番を色の付いた札で出す。
+        Some(order) => draw_mark(hdc, number_rect, order, colors, selected, dpi),
+        None => {
+            let mut number_rect = number_rect;
+            draw_line(hdc, &number.to_string(), &mut number_rect, DT_RIGHT);
+        }
+    }
+    SetTextColor(hdc, COLORREF(sub));
     if lines > 1 {
         let mut lines_rect = RECT {
             left: rect.right - ui::scale(LINES_W + PAD, dpi),
@@ -1702,16 +1827,31 @@ unsafe fn draw_row(item: &DRAWITEMSTRUCT) {
 
 /// 帯の 1 件（カード）を描く: 上に番号と名前・行数、その下に中身（文字は数行、画像は絵）。
 unsafe fn draw_card(hdc: HDC, rect: RECT, row: usize, selected: bool) {
-    let Some(Some((number, title, lines, pinned, body, thumb, dpi, font, colors))) =
+    let Some(Some((number, title, lines, pinned, mark, body, thumb, dpi, font, colors))) =
         with_state(|st| {
             let index = st.page() * st.page_size + row;
-            let (number, shown, lines, pinned) = st.row(index)?;
+            let info = st.row(index)?;
             // 上の行: 定型文は名前、画像は大きさと日時。文字の履歴は番号だけ。
             let is_image = st.image_id(index).is_some();
-            let title = if st.tab == Tab::History && !is_image { String::new() } else { shown };
+            let title = if st.tab == Tab::History && !is_image {
+                String::new()
+            } else {
+                info.shown
+            };
             let body = st.full_text(index).map(|t| clip_history::tip_text(&t));
             let thumb = st.thumb_at(index);
-            Some((number, title, lines, pinned, body, thumb, st.dpi, st.font, st.colors))
+            Some((
+                info.number,
+                title,
+                info.lines,
+                info.pinned,
+                info.mark,
+                body,
+                thumb,
+                st.dpi,
+                st.font,
+                st.colors,
+            ))
         })
     else {
         fill(hdc, &rect, with_state(|st| st.colors.back).unwrap_or(0));
@@ -1762,6 +1902,16 @@ unsafe fn draw_card(hdc: HDC, rect: RECT, row: usize, selected: bool) {
         draw_line(hdc, &format!("{lines}行"), &mut lines_rect, DT_RIGHT);
         head.right = lines_rect.left;
     }
+    if let Some(order) = mark {
+        // 印を付けたカードは、上の行の左に、付けた順番を色の付いた札で出す。
+        let badge = RECT {
+            right: head.left + ui::scale(NUMBER_W, dpi),
+            ..head
+        };
+        draw_mark(hdc, badge, order, colors, selected, dpi);
+        head.left = badge.right + ui::scale(PAD, dpi);
+        SetTextColor(hdc, COLORREF(sub));
+    }
     draw_line(hdc, &label, &mut head, DT_LEFT | DT_END_ELLIPSIS);
     let mut inner = RECT {
         left: card.left + pad,
@@ -1794,6 +1944,28 @@ unsafe fn draw_card(hdc: HDC, rect: RECT, row: usize, selected: bool) {
 unsafe fn draw_line(hdc: HDC, text: &str, rect: &mut RECT, align: DRAW_TEXT_FORMAT) {
     let mut units: Vec<u16> = text.encode_utf16().collect();
     DrawTextW(hdc, &mut units, rect, align | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+}
+
+/// まとめて貼り付けるために印を付けた順番を、`rect` の中に色の付いた札で描く（選んでいる行では
+/// 色を反対にする）。
+unsafe fn draw_mark(hdc: HDC, rect: RECT, order: usize, colors: Palette, selected: bool, dpi: u32) {
+    let inset = ui::scale(2, dpi);
+    let badge = RECT {
+        // ピン留めの線に重ねない。
+        left: rect.left + ui::scale(PIN_BAR_W + 1, dpi),
+        top: rect.top + inset,
+        right: rect.right - inset,
+        bottom: rect.bottom - inset,
+    };
+    let (back, text) = if selected {
+        (colors.sel_text, colors.sel_back)
+    } else {
+        (colors.sel_back, colors.sel_text)
+    };
+    fill(hdc, &badge, back);
+    SetTextColor(hdc, COLORREF(text));
+    let mut text_rect = badge;
+    draw_line(hdc, &order.to_string(), &mut text_rect, DT_CENTER);
 }
 
 unsafe fn fill(hdc: HDC, rect: &RECT, color: u32) {
@@ -1926,8 +2098,8 @@ unsafe fn paint_header(hwnd: HWND) {
 
 /// 見出しの下の段（検索の欄）を描く。入力欄に入力しているなら `true`（入力欄を置き直す）。
 unsafe fn paint_filter_row(hdc: HDC, row: RECT, colors: Palette, dpi: u32) -> bool {
-    let Some((query, searching, tab, kind)) =
-        with_state(|st| (st.query.clone(), st.searching, st.tab, st.kind))
+    let Some((query, searching, tab, kind, marks)) =
+        with_state(|st| (st.query.clone(), st.searching, st.tab, st.kind, st.marks.len()))
     else {
         return false;
     };
@@ -1963,10 +2135,23 @@ unsafe fn paint_filter_row(hdc: HDC, row: RECT, colors: Palette, dpi: u32) -> bo
         left = kind_rect.right;
     }
     with_state(|st| st.kind_rect = kind_rect);
+    // 印を付けたものがあれば、右にその件数を出す。
+    let mut right = row.right - pad;
+    if marks > 0 {
+        let label = format!("選択 {marks}");
+        let mut marks_rect = RECT {
+            left: (right - text_width(hdc, &label)).max(left),
+            right,
+            ..row
+        };
+        right = marks_rect.left - pad;
+        SetTextColor(hdc, COLORREF(colors.header_text));
+        draw_line(hdc, &label, &mut marks_rect, DT_RIGHT);
+    }
     let search = RECT {
         left: left + pad,
         top: row.top + inset / 2,
-        right: (row.right - pad).max(left + pad),
+        right: right.max(left + pad),
         bottom: row.bottom - inset,
     };
     // 入力欄のような枠（入力しているときは、選んだ行と同じ色の枠にする）。
@@ -2012,10 +2197,11 @@ unsafe fn update_tip(hwnd: HWND) {
     let content = with_state(|st| {
         let pos = selected?;
         let image = st.thumb_at(pos);
-        Some((st.full_text(pos), image, st.row(pos)?))
+        let info = st.row(pos)?;
+        Some((st.full_text(pos), image, info.shown, info.lines))
     })
     .flatten();
-    let (Some(row), Some((full, image, (_, shown, lines, _)))) = (row, content) else {
+    let (Some(row), Some((full, image, shown, lines))) = (row, content) else {
         let _ = ShowWindow(tip, SW_HIDE);
         return;
     };

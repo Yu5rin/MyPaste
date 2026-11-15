@@ -52,7 +52,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::clip_history::{self, History, MenuPosition};
-use crate::clip_images::{self, Index};
+use crate::clip_images::{self, Index, Part};
 use crate::hotkey_rules::{self, Action, LocalTime};
 use crate::remap_logic::Hotkey;
 use crate::config::Snippet;
@@ -1022,42 +1022,78 @@ unsafe fn apply_history_outcome(
     if outcome.edit_snippets {
         snippet_window::open();
     }
+    let pick = outcome.chosen?;
     let mut moved_to = None;
-    let text = match outcome.chosen {
-        Some(history_window::Pick::History(text)) => {
-            // 貼り付けたものを、いちばん上に移す（設定で選べる。ピン留めしたものは動かさない）。
+    let parts = match pick {
+        // 印を付けたものは、付けた順に。続く文字は改行でつないで 1 回で貼り付ける。
+        history_window::Pick::Many(picks) => {
+            let parts: Vec<Part> = picks
+                .into_iter()
+                .filter_map(|pick| resolve_pick(pick, config, &mut moved_to))
+                .collect();
+            log::debug!("クリップボードの履歴・定型文から、{} 件をまとめて貼り付けます", parts.len());
+            clip_images::batch(parts)
+        }
+        pick => resolve_pick(pick, config, &mut moved_to).into_iter().collect(),
+    };
+    // 元のウィンドウに入力が戻ってから貼り付ける。
+    pump_messages_until(MENU_REFOCUS_WAIT, || false);
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            // 前の貼り付けを、貼り付け先が終えるのを少し待つ。
+            pump_messages_until(MENU_REFOCUS_WAIT, || false);
+        }
+        paste_part(part);
+    }
+    // 貼り付けのために離した Shift を、利用者がまだ押していれば押し直す。
+    keyboard::repress_released_modifiers();
+    Some(moved_to)
+}
+
+/// 一覧で選んだものを、貼り付けるもの（文字か画像）にする。履歴の文字と画像は、いちばん上に
+/// 移す（設定で選べる。ピン留めしたものは動かさない）。移したら `moved_to` にその位置を入れる。
+unsafe fn resolve_pick(
+    pick: history_window::Pick,
+    config: &HistoryConfig,
+    moved_to: &mut Option<usize>,
+) -> Option<Part> {
+    match pick {
+        history_window::Pick::History(text) => {
             let stamp = next_stamp();
             if config.move_to_top && HISTORY.with(|h| h.borrow_mut().move_to_top_at(&text, stamp)) {
                 mark_history_changed();
                 // ピン留めしたものの次が、いちばん上。
-                moved_to = Some(pinned_count());
+                *moved_to = Some(pinned_count());
             }
-            text
+            Some(Part::Text(text))
         }
         // 定型文は {date} などを置き換えてから貼り付ける。
-        Some(history_window::Pick::Snippet(text)) => {
-            hotkey_rules::expand_placeholders(&text, &local_time())
-        }
-        Some(history_window::Pick::Image(id)) => {
+        history_window::Pick::Snippet(text) => Some(Part::Text(hotkey_rules::expand_placeholders(
+            &text,
+            &local_time(),
+        ))),
+        history_window::Pick::Image(id) => {
             let stamp = next_stamp();
             if config.move_to_top && IMAGES.with(|i| i.borrow_mut().touch(id, stamp)) {
                 save_image_index();
-                moved_to = Some(pinned_count());
+                *moved_to = Some(pinned_count());
             }
-            pump_messages_until(MENU_REFOCUS_WAIT, || false);
-            paste_image(id);
-            // 貼り付けのために離した Shift を、利用者がまだ押していれば押し直す。
-            keyboard::repress_released_modifiers();
-            return Some(moved_to);
+            Some(Part::Image(id))
         }
-        None => return None,
-    };
-    // 元のウィンドウに入力が戻ってから貼り付ける。
-    pump_messages_until(MENU_REFOCUS_WAIT, || false);
-    log::debug!("クリップボードの履歴・定型文から貼り付けます（{} 文字）", text.chars().count());
-    paste_text_with(&Hotkey::unpack(0), &text, || send_history_paste());
-    keyboard::repress_released_modifiers();
-    Some(moved_to)
+        // まとめたものの中に、まとめたものは入れない。
+        history_window::Pick::Many(_) => None,
+    }
+}
+
+/// 文字か画像を、一覧から選んだものとして貼り付ける。
+unsafe fn paste_part(part: &Part) {
+    match part {
+        Part::Text(text) => {
+            log::debug!("クリップボードの履歴・定型文から貼り付けます（{} 文字）", text.chars().count());
+            paste_text_with(&Hotkey::unpack(0), text, || send_history_paste());
+        }
+        Part::Image(id) => paste_image(*id),
+    }
 }
 
 /// 一覧から選んだものを貼り付ける Ctrl+V を送る。

@@ -279,6 +279,34 @@ pub fn search_text(item: &Item) -> String {
     }
 }
 
+/// まとめて貼り付けるものの 1 つ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Part {
+    /// 文字（定型文は置き換えたあとのもの）。
+    Text(String),
+    /// 履歴の画像（番号）。
+    Image(u64),
+}
+
+/// まとめて貼り付ける順に並べたものを、貼り付ける単位にする。続く文字は改行（CRLF）でつないで
+/// 1 回で貼り付け、画像はその位置で 1 枚ずつ貼り付ける。つなぐ文字の終わりの改行は除く
+/// （改行で終わる文字のあとに、空の行ができないように）。最後の文字の改行は残す。
+pub fn batch(parts: Vec<Part>) -> Vec<Part> {
+    let mut out: Vec<Part> = Vec::new();
+    for part in parts {
+        match (out.last_mut(), part) {
+            (Some(Part::Text(previous)), Part::Text(text)) => {
+                let kept = previous.trim_end_matches(['\r', '\n']).len();
+                previous.truncate(kept);
+                previous.push_str("\r\n");
+                previous.push_str(&text);
+            }
+            (_, part) => out.push(part),
+        }
+    }
+    out
+}
+
 /// クリップボードの DIB（`CF_DIB`）の見出しから読み取ったもの。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DibInfo {
@@ -625,6 +653,29 @@ mod tests {
             pinned: false,
         };
         assert_eq!(search_text(&text), "abc");
+    }
+
+    #[test]
+    fn batch_joins_texts_between_images() {
+        let parts = vec![
+            Part::Text("a\r\n".into()),
+            Part::Text("b".into()),
+            Part::Image(3),
+            Part::Image(4),
+            Part::Text("c".into()),
+            Part::Text("d\r\n".into()),
+        ];
+        assert_eq!(
+            batch(parts),
+            vec![
+                Part::Text("a\r\nb".into()),
+                Part::Image(3),
+                Part::Image(4),
+                Part::Text("c\r\nd\r\n".into()),
+            ]
+        );
+        assert_eq!(batch(vec![Part::Text("x".into())]), vec![Part::Text("x".into())]);
+        assert!(batch(Vec::new()).is_empty());
     }
 
     #[test]

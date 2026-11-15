@@ -933,6 +933,58 @@ pub fn nearest_position(visible: &[usize], wanted: usize) -> Option<usize> {
     Some(visible.iter().position(|v| *v >= wanted).unwrap_or(visible.len() - 1))
 }
 
+/// まとめて貼り付けるために印を付けたもの（一覧の番号, 元の位置）を、付けた順に覚える。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Marks {
+    items: Vec<(usize, usize)>,
+}
+
+impl Marks {
+    /// 印を付ける・外す。付けたら `true`。
+    pub fn toggle(&mut self, list: usize, index: usize) -> bool {
+        match self.items.iter().position(|m| *m == (list, index)) {
+            Some(i) => {
+                self.items.remove(i);
+                false
+            }
+            None => {
+                self.items.push((list, index));
+                true
+            }
+        }
+    }
+
+    /// 印を付けた順番（1 から）。付けていなければ `None`。
+    pub fn order(&self, list: usize, index: usize) -> Option<usize> {
+        self.items.iter().position(|m| *m == (list, index)).map(|i| i + 1)
+    }
+
+    /// 一覧から 1 件を消した（その印を外し、後ろのものの位置を 1 つ前へずらす）。
+    pub fn removed(&mut self, list: usize, index: usize) {
+        self.items.retain(|m| *m != (list, index));
+        for m in self.items.iter_mut().filter(|m| m.0 == list && m.1 > index) {
+            m.1 -= 1;
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// 付けた順の (一覧の番号, 元の位置)。
+    pub fn iter(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.items.iter().copied()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -955,6 +1007,27 @@ mod tests {
         assert_eq!(nearest_position(&visible, 0), Some(0));
         assert_eq!(nearest_position(&visible, 9), Some(2));
         assert_eq!(nearest_position(&[], 0), None);
+    }
+
+    #[test]
+    fn marks_keep_order_and_follow_removal() {
+        let mut marks = Marks::default();
+        assert!(marks.toggle(0, 5));
+        assert!(marks.toggle(1, 2));
+        assert!(marks.toggle(0, 1));
+        assert_eq!(marks.order(0, 5), Some(1));
+        assert_eq!(marks.order(0, 1), Some(3));
+        assert_eq!(marks.order(0, 2), None);
+        assert!(!marks.toggle(1, 2));
+        assert_eq!(marks.order(0, 1), Some(2));
+        // 元の位置 3 を消すと、5 は 4 になり、1 はそのまま。
+        marks.removed(0, 3);
+        assert_eq!(marks.iter().collect::<Vec<_>>(), vec![(0, 4), (0, 1)]);
+        marks.removed(0, 4);
+        assert_eq!(marks.iter().collect::<Vec<_>>(), vec![(0, 1)]);
+        assert_eq!(marks.len(), 1);
+        marks.clear();
+        assert!(marks.is_empty());
     }
 
     #[test]
