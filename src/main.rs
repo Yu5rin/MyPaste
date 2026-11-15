@@ -25,6 +25,15 @@
 //!   キー操作を妨げないよう、必ず別スレッドで実行する。多重実行の防止は
 //!   `update::run` 内部で行う。動いている間の定期的な確認のきっかけは、
 //!   10 分おきに [`TrayMessage::UpdateTick`] を送る小さなスレッドが作る。
+//!
+//! ## 一時停止
+//! トレイの「30 分間 一時停止」で、値貼り付け・キー割り当て・クリップボードの履歴（記録と、
+//! 一覧を出すキー）・入力モードの表示を、まとめて止める。止めるのはメインスレッドが持つ
+//! 「いつまで止めるか」（`paused_until`）だけで、settings.json や機能ごとの ON/OFF は
+//! 変えない。設定を反映するところ（[`apply_settings`]・[`configure_hotkeys`]・
+//! [`apply_pause`]）はどれもこれを見て、止めている間は機能を動かさない。解除したときは、
+//! その時点の設定をそのまま反映する。解除の時刻は、[`TrayMessage::PauseTick`] を送る
+//! 小さなスレッドのきっかけで確かめる。
 
 // 本番（release）ビルドではコンソールウィンドウを出さない。
 // デバッグビルドではパニック出力などを確認できるよう残す。
@@ -65,7 +74,7 @@ mod logging;
 
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 
@@ -95,6 +104,10 @@ fn notice_in_background(text: String) {
 
 /// 動いている間の更新確認の時刻かを確かめる間隔。
 const UPDATE_TICK: Duration = Duration::from_secs(10 * 60);
+/// 一時停止する長さ。
+const PAUSE_DURATION: Duration = Duration::from_secs(30 * 60);
+/// 一時停止を解除する時刻かを確かめる間隔。
+const PAUSE_TICK: Duration = Duration::from_secs(30);
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK};
 
 /// タスクトレイのメニュー操作をメインスレッドへ伝えるメッセージ。
@@ -105,6 +118,10 @@ pub enum TrayMessage {
     ToggleStartup,
     /// 入力モード表示 ON/OFF 切替
     ToggleImeIndicator,
+    /// 一時停止する・解除する
+    TogglePause,
+    /// 一時停止を解除する時刻か確かめる（30 秒おき）
+    PauseTick,
     /// 設定画面を開く
     OpenSettings,
     /// 設定画面で保存された（settings.json への書き込みは済んでいる。反映だけ行う）
@@ -170,7 +187,7 @@ fn main() {
     keyboard::set_enabled(settings.remap.enabled);
     keyboard::set_rules_enabled(settings.hotkeys_enabled);
     let hotkey = configure_remap(&settings);
-    configure_hotkeys(&settings);
+    configure_hotkeys(&settings, false);
     // キー割り当ての動作を実行するスレッド。フックより先に始めておく。
     actions::set_snippets(settings.snippets.clone());
     let action_worker = actions::start();
@@ -223,6 +240,7 @@ fn main() {
             history: settings.clipboard_history.enabled,
             ime_indicator: ime_indicator.is_some() && ime_indicator::is_enabled(),
             startup: startup::is_enabled(),
+            paused_until: None,
         },
     ) {
         Ok(t) => t,
@@ -269,9 +287,62 @@ fn main() {
         });
     }
 
+    // --- 一時停止を解除する時刻か確かめるきっかけ ---
+    {
+        let tx_tick = tx.clone();
+        thread::spawn(move || loop {
+            thread::sleep(PAUSE_TICK);
+            if tx_tick.send(TrayMessage::PauseTick).is_err() {
+                break;
+            }
+        });
+    }
+    // 一時停止しているときは、解除する日時（スリープしていた間も数えるよう、時計で持つ）。
+    let mut paused_until: Option<SystemTime> = None;
+
     // --- メインループ: トレイのメニュー操作を処理 ---
     for msg in rx {
+        // 一時停止している間は、機能ごとの ON/OFF をメニューで選べないようにしてある。
+        // 万一届いても、止めている機能を動かさないよう受け付けない。
+        if paused_until.is_some()
+            && matches!(
+                msg,
+                TrayMessage::Toggle
+                    | TrayMessage::ToggleHotkeys
+                    | TrayMessage::ToggleHistory
+                    | TrayMessage::ToggleImeIndicator
+            )
+        {
+            continue;
+        }
+        let paused = paused_until.is_some();
         match msg {
+            TrayMessage::TogglePause => {
+                paused_until = if paused {
+                    log::info!("一時停止を解除しました");
+                    None
+                } else {
+                    log::info!("{} 分間、一時停止します", PAUSE_DURATION.as_secs() / 60);
+                    Some(SystemTime::now() + PAUSE_DURATION)
+                };
+                apply_pause(&settings, &tray, ime_indicator.is_some(), paused_until);
+            }
+            TrayMessage::PauseTick => {
+                let Some(until) = paused_until else {
+                    continue;
+                };
+                let now = SystemTime::now();
+                if tray::minutes_left(until, now) == 0 {
+                    log::info!("一時停止の時間が過ぎたため、解除しました");
+                    paused_until = None;
+                    apply_pause(&settings, &tray, ime_indicator.is_some(), None);
+                    tray.notify("一時停止を終えて、元の動作に戻りました。");
+                } else if until.duration_since(now).is_ok_and(|left| left > PAUSE_DURATION) {
+                    // 時計が戻された。止める長さが 30 分を超えないようにする。
+                    paused_until = Some(now + PAUSE_DURATION);
+                    tray.update(|s| s.paused_until = paused_until);
+                }
+            }
             TrayMessage::Toggle => {
                 let on = keyboard::toggle();
                 settings.remap.enabled = on;
@@ -297,7 +368,7 @@ fn main() {
                 settings.clipboard_history.enabled = on;
                 settings.clipboard_history.opacity = actions::history_opacity();
                 settings.clipboard_history.keep_open = actions::history_keep_open();
-                configure_hotkeys(&settings);
+                configure_hotkeys(&settings, paused);
                 tray.update(|s| s.history = on);
                 report_save(config::save_clipboard_history_enabled(on));
                 log::info!("クリップボードの履歴: {}", if on { "有効" } else { "無効" });
@@ -327,9 +398,11 @@ fn main() {
             }
             TrayMessage::OpenSettings => {
                 // トレイで切り替えた入力モード表示の ON/OFF は settings にも入れてあるが、
-                // 念のため実際の状態を渡す。
+                // 念のため実際の状態を渡す（一時停止で止めている間は、利用者が選んだ状態を渡す）。
                 let mut current = settings.clone();
-                current.ime_indicator.enabled = ime_indicator::is_enabled();
+                if !paused {
+                    current.ime_indicator.enabled = ime_indicator::is_enabled();
+                }
                 // 一覧の上で Shift+ホイールで変えた不透明度を出す（古い値で保存し直さないように）。
                 settings.clipboard_history.opacity = actions::history_opacity();
                 settings.clipboard_history.keep_open = actions::history_keep_open();
@@ -349,14 +422,14 @@ fn main() {
                 settings.update.check_every_hours = saved.update.check_every_hours;
                 settings.update.mode = saved.update.mode;
                 settings.clipboard_history = saved.clipboard_history;
-                apply_settings(&settings, &tray, ime_indicator.is_some());
+                apply_settings(&settings, &tray, ime_indicator.is_some(), paused);
             }
             TrayMessage::SettingsImported(imported) => {
                 // 読み込んだ設定（キー割り当て・定型文を含む）を、まとめて一度に反映する
                 // （途中の状態で履歴の記録を止めて、保存した履歴を消してしまわないように）。
                 settings = *imported;
                 actions::set_snippets(settings.snippets.clone());
-                apply_settings(&settings, &tray, ime_indicator.is_some());
+                apply_settings(&settings, &tray, ime_indicator.is_some(), paused);
             }
             TrayMessage::ToggleHotkeys => {
                 let on = keyboard::toggle_rules();
@@ -375,7 +448,7 @@ fn main() {
                 // 一覧の上で Shift+ホイールで変えた不透明度を、古い値で戻さない。
                 settings.clipboard_history.opacity = actions::history_opacity();
                 settings.clipboard_history.keep_open = actions::history_keep_open();
-                configure_hotkeys(&settings);
+                configure_hotkeys(&settings, paused);
             }
             TrayMessage::CheckUpdate => {
                 // 手動確認。結果（最新である／失敗した）もダイアログで知らせる。
@@ -462,10 +535,11 @@ fn log_startup(settings: &config::Settings) {
 }
 
 /// 設定（設定画面で保存したもの・読み込んだもの）を、フック・入力モード表示・トレイメニューへ
-/// 反映する。
-fn apply_settings(settings: &config::Settings, tray: &tray::Menu, indicator_running: bool) {
+/// 反映する。一時停止している間（`paused`）は、機能を動かさずに設定だけ覚えておく
+/// （解除したときに [`apply_pause`] で反映する）。
+fn apply_settings(settings: &config::Settings, tray: &tray::Menu, indicator_running: bool, paused: bool) {
     let hotkey = configure_remap(settings);
-    configure_hotkeys(settings);
+    configure_hotkeys(settings, paused);
     let was_logging = logging::is_enabled();
     logging::set_enabled(settings.log.enabled);
     if logging::is_enabled() && !was_logging {
@@ -474,24 +548,51 @@ fn apply_settings(settings: &config::Settings, tray: &tray::Menu, indicator_runn
     }
     ime_indicator::set_params(ime_indicator::Params::from_settings(&settings.ime_indicator));
     if indicator_running {
-        ime_indicator::set_enabled(settings.ime_indicator.enabled);
+        ime_indicator::set_enabled(settings.ime_indicator.enabled && !paused);
     }
-    keyboard::set_enabled(settings.remap.enabled);
-    keyboard::set_rules_enabled(settings.hotkeys_enabled);
+    keyboard::set_enabled(settings.remap.enabled && !paused);
+    keyboard::set_rules_enabled(settings.hotkeys_enabled && !paused);
+    // メニューのチェックは、利用者が選んだ状態を出す（一時停止で止めていても）。
     tray.update(|s| {
         s.remap_hotkey = hotkey.format();
-        s.remap = keyboard::is_enabled();
-        s.hotkeys = keyboard::rules_enabled();
+        s.remap = settings.remap.enabled;
+        s.hotkeys = settings.hotkeys_enabled;
         s.history = settings.clipboard_history.enabled;
-        s.ime_indicator = indicator_running && ime_indicator::is_enabled();
+        s.ime_indicator = indicator_running && settings.ime_indicator.enabled;
         s.startup = startup::is_enabled();
     });
     log::info!("設定を反映しました（キー: {}）", hotkey.format());
 }
 
+/// 一時停止する・解除する。止めるときは利用者の入力に関わる機能をすべて止め、解除するときは
+/// その時点の設定（止めている間に設定画面で変えたものも）をそのまま反映する。
+/// settings.json と、機能ごとの ON/OFF の設定は変えない。
+fn apply_pause(
+    settings: &config::Settings,
+    tray: &tray::Menu,
+    indicator_running: bool,
+    paused_until: Option<SystemTime>,
+) {
+    let paused = paused_until.is_some();
+    keyboard::set_enabled(settings.remap.enabled && !paused);
+    keyboard::set_rules_enabled(settings.hotkeys_enabled && !paused);
+    configure_hotkeys(settings, paused);
+    if indicator_running {
+        ime_indicator::set_enabled(settings.ime_indicator.enabled && !paused);
+    }
+    tray.update(|s| {
+        s.remap = settings.remap.enabled;
+        s.hotkeys = settings.hotkeys_enabled;
+        s.history = settings.clipboard_history.enabled;
+        s.ime_indicator = indicator_running && settings.ime_indicator.enabled;
+        s.paused_until = paused_until;
+    });
+}
+
 /// キー割り当てとクリップボードの履歴の設定を読み取ってフックへ渡す。使えない割り当ては
-/// 記録に残して飛ばす。
-fn configure_hotkeys(settings: &config::Settings) {
+/// 記録に残して飛ばす。一時停止している間（`paused`）は、履歴の記録と一覧を出すキーを止める
+/// （覚えている履歴は消さない）。
+fn configure_hotkeys(settings: &config::Settings, paused: bool) {
     let (rules, problems) = hotkey_rules::compile(&settings.hotkeys);
     for problem in problems {
         log::warn!("{problem}");
@@ -506,12 +607,13 @@ fn configure_hotkeys(settings: &config::Settings) {
     if let Some(problem) = &history.problem {
         log::warn!("クリップボードの履歴: {problem}");
     }
-    let (hotkey, double_tap) = if history.enabled {
+    let (hotkey, double_tap) = if history.enabled && !paused {
         (history.hotkey, history.trigger.double_tap_key())
     } else {
         (None, None)
     };
     keyboard::set_history_trigger(hotkey, double_tap, history.double_tap_ms);
+    actions::set_history_paused(paused);
     actions::set_history_exclude_apps(history.exclude_apps.clone());
     actions::set_history_config(actions::HistoryConfig {
         record: history.enabled || assigned,

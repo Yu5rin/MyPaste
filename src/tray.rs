@@ -11,12 +11,15 @@
 //! - エクスプローラーが再起動すると、トレイのアイコンは消える。Windows が知らせる
 //!   `TaskbarCreated` を受けて、同じアイコン・ツールチップで登録し直す。
 //! - お知らせ（[`Menu::notify`]）は、トレイの吹き出し（通知）で出す。
+//! - 一時停止している間は、OFF のアイコンにし、ツールチップに「一時停止中」と出す。
+//!   機能ごとの ON/OFF の項目は、選べないようにする（解除したときに元の状態へ戻すため）。
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::SystemTime;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -61,6 +64,7 @@ const CMD_REMAP: usize = 1;
 const CMD_HOTKEYS: usize = 2;
 const CMD_HISTORY: usize = 3;
 const CMD_IME: usize = 4;
+const CMD_PAUSE: usize = 5;
 const CMD_SETTINGS: usize = 10;
 const CMD_HOTKEY_WINDOW: usize = 11;
 const CMD_SNIPPETS: usize = 12;
@@ -93,6 +97,24 @@ pub struct State {
     pub ime_indicator: bool,
     /// Windows の起動時（サインイン時）に自動で起動するか。
     pub startup: bool,
+    /// 一時停止しているときは、解除する日時。機能ごとの ON/OFF（上の項目）は利用者が選んだ
+    /// ままで、一時停止の間だけ止める。
+    pub paused_until: Option<SystemTime>,
+}
+
+impl State {
+    /// アイコンを ON の絵柄にするか（値貼り付けが有効で、一時停止していないとき）。
+    fn icon_on(&self) -> bool {
+        self.remap && self.paused_until.is_none()
+    }
+}
+
+/// 一時停止を解除するまでの残り（分。端数は切り上げる。過ぎていれば 0）。
+pub fn minutes_left(until: SystemTime, now: SystemTime) -> u64 {
+    until
+        .duration_since(now)
+        .map(|d| d.as_secs().div_ceil(60))
+        .unwrap_or(0)
 }
 
 /// トレイのスレッドと共有するもの。
@@ -125,17 +147,17 @@ impl Menu {
         HWND(self.window.load(Ordering::SeqCst) as *mut core::ffi::c_void)
     }
 
-    /// 状態を書き換える（次にメニューを開いたときから表示に出る）。値貼り付けの ON/OFF が
-    /// 変わったら、アイコンの絵柄も替える。
+    /// 状態を書き換える（次にメニューを開いたときから表示に出る）。値貼り付けの ON/OFF や
+    /// 一時停止が変わったら、アイコンの絵柄とツールチップも替える。
     pub fn update(&self, change: impl FnOnce(&mut State)) {
         let (before, after) = {
             let mut shared = self.shared.lock().unwrap_or_else(|p| p.into_inner());
-            let before = shared.state.remap;
+            let before = (shared.state.icon_on(), shared.state.paused_until.is_some());
             change(&mut shared.state);
-            (before, shared.state.remap)
+            (before, (shared.state.icon_on(), shared.state.paused_until.is_some()))
         };
         if before != after {
-            unsafe { notify_icon(self.hwnd(), NIM_MODIFY, NIF_ICON, &self.shared, None) };
+            unsafe { notify_icon(self.hwnd(), NIM_MODIFY, NIF_ICON | NIF_TIP, &self.shared, None) };
         }
     }
 
@@ -270,7 +292,12 @@ unsafe fn notify_icon(
     }
     let (on, tooltip) = {
         let shared = shared.lock().unwrap_or_else(|p| p.into_inner());
-        (shared.state.remap, shared.tooltip.clone())
+        let tooltip = if shared.state.paused_until.is_some() {
+            format!("{}（一時停止中）", shared.tooltip)
+        } else {
+            shared.tooltip.clone()
+        };
+        (shared.state.icon_on(), tooltip)
     };
     let mut data = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -393,11 +420,15 @@ unsafe fn show_menu(hwnd: HWND) {
     let Ok(menu) = CreatePopupMenu() else {
         return;
     };
-    let item = |id: usize, text: &str, checked: bool| {
+    let add = |id: usize, text: &str, checked: bool, enabled: bool| {
         let text = wide(text);
-        let flags = if checked { MF_STRING | MF_CHECKED } else { MF_STRING };
+        let mut flags = if checked { MF_STRING | MF_CHECKED } else { MF_STRING };
+        if !enabled {
+            flags |= MF_GRAYED;
+        }
         let _ = AppendMenuW(menu, flags, id, PCWSTR(text.as_ptr()));
     };
+    let item = |id: usize, text: &str, checked: bool| add(id, text, checked, true);
     let separator = || {
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     };
@@ -405,11 +436,21 @@ unsafe fn show_menu(hwnd: HWND) {
     let title = wide(&app_title());
     let _ = AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, PCWSTR(title.as_ptr()));
     separator();
-    // 機能の ON/OFF。
-    item(CMD_REMAP, &format!("値貼り付け（{}）(&V)", state.remap_hotkey), state.remap);
-    item(CMD_HOTKEYS, "キー割り当て(&K)", state.hotkeys);
-    item(CMD_HISTORY, "クリップボードの履歴(&H)", state.history);
-    item(CMD_IME, "入力モードの表示(&I)", state.ime_indicator);
+    // 機能の ON/OFF。一時停止している間は選べない（チェックは利用者が選んだ状態のまま出し、
+    // 解除するとその状態に戻る）。
+    let switchable = state.paused_until.is_none();
+    add(CMD_REMAP, &format!("値貼り付け（{}）(&V)", state.remap_hotkey), state.remap, switchable);
+    add(CMD_HOTKEYS, "キー割り当て(&K)", state.hotkeys, switchable);
+    add(CMD_HISTORY, "クリップボードの履歴(&H)", state.history, switchable);
+    add(CMD_IME, "入力モードの表示(&I)", state.ime_indicator, switchable);
+    match state.paused_until {
+        Some(until) => {
+            // 解除の時刻を過ぎていても、メインスレッドが解除するまでは 1 分と出す。
+            let left = minutes_left(until, SystemTime::now()).max(1);
+            item(CMD_PAUSE, &format!("一時停止を解除（あと {left} 分）(&Z)"), true);
+        }
+        None => item(CMD_PAUSE, "30 分間 一時停止(&Z)", false),
+    }
     separator();
     // 画面を開く。
     item(CMD_SETTINGS, "設定(&S)...", false);
@@ -444,6 +485,7 @@ unsafe fn show_menu(hwnd: HWND) {
         CMD_HOTKEYS => TrayMessage::ToggleHotkeys,
         CMD_HISTORY => TrayMessage::ToggleHistory,
         CMD_IME => TrayMessage::ToggleImeIndicator,
+        CMD_PAUSE => TrayMessage::TogglePause,
         CMD_SETTINGS => TrayMessage::OpenSettings,
         CMD_HOTKEY_WINDOW => TrayMessage::OpenHotkeys,
         CMD_SNIPPETS => TrayMessage::OpenSnippets,

@@ -523,10 +523,18 @@ unsafe fn copied_in_excluded_app() -> bool {
     process.is_some_and(|name| remap_logic::is_target_app(&name, &apps))
 }
 
+/// 一時停止中か（トレイの「一時停止」）。記録をやめる設定と違い、覚えている履歴はそのまま残す。
+static HISTORY_PAUSED: AtomicBool = AtomicBool::new(false);
+
+/// クリップボードの履歴の記録を一時停止する・再開する（覚えている履歴は消さない）。
+pub fn set_history_paused(paused: bool) {
+    HISTORY_PAUSED.store(paused, Ordering::SeqCst);
+}
+
 /// クリップボードが変わった。記録してよい文字なら履歴に加える。
 unsafe fn record_clipboard() {
     // 記録をやめた直後に、すでに届いていた知らせは記録しない。
-    if !history_config().record {
+    if !history_config().record || HISTORY_PAUSED.load(Ordering::SeqCst) {
         return;
     }
     // 貼り付けのために自分で一時的に置いたもの・元に戻したものは記録しない。
