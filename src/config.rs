@@ -225,6 +225,8 @@ pub struct ImeIndicatorSettings {
     pub opacity: u32,
     /// 全画面のアプリ（ゲーム・動画・プレゼンテーションなど）の間は表示しないか。
     pub hide_in_fullscreen: bool,
+    /// スクリーンショットや画面共有に、入力モードの表示を写さないか。
+    pub hide_from_capture: bool,
     /// 切り替えたときに、画面に大きく表示するか。
     pub flash: bool,
     /// いまの入力モードを、小さな印で出すか。
@@ -256,6 +258,7 @@ impl Default for ImeIndicatorSettings {
             theme: "dark".to_string(),
             opacity: crate::ime_logic::DEFAULT_OPACITY,
             hide_in_fullscreen: false,
+            hide_from_capture: true,
             flash: true,
             badge_enabled: false,
             badge: "caret".to_string(),
@@ -508,6 +511,7 @@ pub fn save_from_settings_window(settings: &Settings) -> Result<(), String> {
             "theme": settings.ime_indicator.theme,
             "opacity": settings.ime_indicator.opacity,
             "hide_in_fullscreen": settings.ime_indicator.hide_in_fullscreen,
+            "hide_from_capture": settings.ime_indicator.hide_from_capture,
             "flash": settings.ime_indicator.flash,
             "badge_enabled": settings.ime_indicator.badge_enabled,
             "badge": settings.ime_indicator.badge,

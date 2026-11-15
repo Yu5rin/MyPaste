@@ -57,6 +57,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorInfo, GetCursorPos,
+    SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
     LoadCursorW, CURSORINFO, IDC_IBEAM,
     GetForegroundWindow, GetGUIThreadInfo, GetMessageW, GetWindowThreadProcessId, KillTimer,
     PostMessageW, PostThreadMessageW, RegisterClassW, SendMessageTimeoutW,
@@ -141,6 +142,8 @@ pub struct Params {
     pub opacity: u32,
     /// 全画面のアプリの間は表示しない。
     pub hide_in_fullscreen: bool,
+    /// スクリーンショットや画面共有に写さない。
+    pub hide_from_capture: bool,
     /// 切り替えたときに、画面に大きく表示する。
     pub flash: bool,
     /// いまの入力モードを、小さな印で出すか。
@@ -185,6 +188,7 @@ impl Params {
         theme: Theme::Dark,
         opacity: ime_logic::DEFAULT_OPACITY,
         hide_in_fullscreen: false,
+        hide_from_capture: true,
         flash: true,
         badge_enabled: false,
         badge: Badge::Caret,
@@ -208,6 +212,7 @@ impl Params {
             theme: Theme::from_setting(&settings.theme),
             opacity: settings.opacity,
             hide_in_fullscreen: settings.hide_in_fullscreen,
+            hide_from_capture: settings.hide_from_capture,
             flash: settings.flash,
             badge_enabled: settings.badge_enabled,
             badge: Badge::from_setting(&settings.badge),
@@ -377,6 +382,8 @@ struct State {
     readability: ReadabilityLog,
     /// いまの入力モードを出し続ける小さな印（[`Badge`]）。
     badge: BadgeState,
+    /// スクリーンショットに写さない指定を、いま当てているか（まだなら `None`）。
+    capture_hidden: Option<bool>,
 }
 
 /// 小さな印の状態。
@@ -465,6 +472,7 @@ fn thread_main(ready: mpsc::Sender<u32>) {
                     trigger: None,
                     alpha: 0,
                 },
+                capture_hidden: None,
             })
         });
         WINDOW.store(hwnd.0 as isize, Ordering::SeqCst);
@@ -575,8 +583,36 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
     }
 }
 
+/// 表示のウィンドウを、スクリーンショットや画面共有に写すかどうかを、設定に合わせる
+/// （変わったときだけ）。写さない指定は Windows 10 バージョン 2004 以降で使える。それより前では
+/// 使えないので、そのまま写る。
+unsafe fn apply_capture_setting() {
+    let hide = current_params().hide_from_capture;
+    let windows = STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let state = s.as_mut()?;
+        if state.capture_hidden == Some(hide) {
+            return None;
+        }
+        state.capture_hidden = Some(hide);
+        Some([state.hwnd, state.badge.hwnd])
+    });
+    let Some(windows) = windows else {
+        return;
+    };
+    let affinity = if hide { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
+    for window in windows {
+        if !window.is_invalid() {
+            if let Err(e) = SetWindowDisplayAffinity(window, affinity) {
+                log::debug!("入力モードの表示: スクリーンショットに写さない指定ができませんでした: {e}");
+            }
+        }
+    }
+}
+
 /// 100ms ごとの監視。
 unsafe fn on_poll() {
+    apply_capture_setting();
     let enabled = is_enabled();
     let observed = if enabled { query_foreground_ime() } else { None };
 

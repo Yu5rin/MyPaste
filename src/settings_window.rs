@@ -126,6 +126,7 @@ const ID_BADGE_OPACITY: i32 = 187;
 const ID_BADGE_IBEAM: i32 = 188;
 const ID_BADGE_ENABLED: i32 = 189;
 const ID_BADGE_KEEP: i32 = 190;
+const ID_NO_CAPTURE: i32 = 191;
 
 /// 画面の中身の大きさ（96 DPI 基準）。ノート PC（1366x768、表示 125%）でも収まる大きさにする。
 const CLIENT_W: i32 = 500;
@@ -224,7 +225,8 @@ const PAGE_IME: &[Item] = &[
     item(238, Kind::Label, "%", 462, 348, 16, 24),
     item(ID_BADGE_KEEP, Kind::Check, "入力位置では出し続ける", 24, 374, 170, 22),
     item(ID_BADGE_IBEAM, Kind::Check, "マウスが文字入力の形（I）になったら出す", 200, 374, 280, 22),
-    item(ID_FULLSCREEN, Kind::Check, "全画面のアプリ（ゲーム・動画・発表など）では表示しない", 16, 404, 468, 22),
+    item(ID_FULLSCREEN, Kind::Check, "全画面のアプリでは表示しない", 16, 404, 212, 22),
+    item(ID_NO_CAPTURE, Kind::Check, "スクリーンショット・画面共有に写さない", 232, 404, 252, 22),
 ];
 
 /// 「クリップボードの履歴」のページ。
@@ -443,6 +445,7 @@ unsafe fn fill_form(hwnd: HWND, form: &Form) {
     set_text(hwnd, ID_SIZE, &ime.size.to_string());
     set_text(hwnd, ID_OPACITY, &ime.opacity.to_string());
     set_checked(hwnd, ID_FULLSCREEN, ime.hide_in_fullscreen);
+    set_checked(hwnd, ID_NO_CAPTURE, ime.hide_from_capture);
     set_checked(hwnd, ID_FLASH, ime.flash);
     // 「出さない」が書かれていたら、出さないことにして、場所は最初のものを出しておく。
     let badge_index = BADGE_PLACES.iter().position(|(b, _)| *b == ime.badge);
@@ -477,7 +480,7 @@ unsafe fn update_ime_fields(hwnd: HWND) {
     for id in [ID_POSITION, ID_THEME, ID_HOLD, ID_FADE, ID_SIZE, ID_OPACITY, ID_PREVIEW] {
         ui::set_enabled(hwnd, id, flash);
     }
-    for id in [ID_FLASH, ID_FULLSCREEN, ID_BADGE_ENABLED] {
+    for id in [ID_FLASH, ID_FULLSCREEN, ID_NO_CAPTURE, ID_BADGE_ENABLED] {
         ui::set_enabled(hwnd, id, on);
     }
     // 小さな印の出し方は、小さな印を出すときだけ使う。
@@ -787,6 +790,7 @@ unsafe fn read_ime_params(hwnd: HWND) -> Result<Params, (i32, String)> {
         theme,
         opacity,
         hide_in_fullscreen: is_checked(hwnd, ID_FULLSCREEN),
+        hide_from_capture: is_checked(hwnd, ID_NO_CAPTURE),
         flash: is_checked(hwnd, ID_FLASH),
         badge_enabled: is_checked(hwnd, ID_BADGE_ENABLED),
         badge: combo_index(hwnd, ID_BADGE)
@@ -1039,6 +1043,7 @@ unsafe fn on_save(hwnd: HWND, close: bool) {
     settings.ime_indicator.theme = ime.theme.as_setting().to_string();
     settings.ime_indicator.opacity = ime.opacity;
     settings.ime_indicator.hide_in_fullscreen = ime.hide_in_fullscreen;
+    settings.ime_indicator.hide_from_capture = ime.hide_from_capture;
     settings.ime_indicator.flash = ime.flash;
     settings.ime_indicator.badge_enabled = ime.badge_enabled;
     settings.ime_indicator.badge = ime.badge.as_setting().to_string();

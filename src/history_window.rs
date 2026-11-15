@@ -119,6 +119,8 @@ static POPUP: AtomicIsize = AtomicIsize::new(0);
 static TIP: AtomicIsize = AtomicIsize::new(0);
 /// 右クリックのメニューを出している（その間は、キーをメニューに渡す）。
 static MENU_OPEN: AtomicBool = AtomicBool::new(false);
+/// 利用者が Ctrl を押しているか（押している間は、貼り付けても一覧を閉じない）。
+static CTRL_HELD: AtomicBool = AtomicBool::new(false);
 /// 一覧が受け取って握りつぶしたキー（離したときも握りつぶすため。8 個まで）。
 static HELD_KEYS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
@@ -126,6 +128,11 @@ static HELD_KEYS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 /// 届けない）なら `true`。Shift・Ctrl などの修飾キーそのものと、Alt・Win を押しながらのキー
 /// （Alt+Tab など）は、そのまま通す。
 pub fn hook_key(vk: u32, down: bool) -> bool {
+    // Ctrl を押しているかは、ここで覚える（貼り付けのために Ctrl+V を送ると、Windows から見た
+    // Ctrl の状態が変わるので、あとから調べても分からない）。0x11 = Ctrl、0xA2 / 0xA3 = 左右の Ctrl
+    if OPEN.load(Ordering::SeqCst) && matches!(vk, 0x11 | 0xA2 | 0xA3) {
+        CTRL_HELD.store(down, Ordering::SeqCst);
+    }
     let popup = POPUP.load(Ordering::SeqCst);
     if popup == 0 || MENU_OPEN.load(Ordering::SeqCst) {
         return false;
@@ -324,6 +331,8 @@ pub struct Outcome {
     pub image_pin_changes: Vec<(u64, bool)>,
     /// 「出したままにする」を切り替えた（切り替えなければ `None`）。
     pub keep_open: Option<bool>,
+    /// Ctrl を押しながら選んだ（今回は、貼り付けても一覧を閉じない）。
+    pub ctrl_held: bool,
     /// 閉じたときのタブと位置。
     pub resume: Resume,
     /// 「定型文の編集...」を選んだ。
@@ -346,6 +355,7 @@ pub fn is_open() -> bool {
 
 /// 一覧を出し始める（貼り付けて出し直すまでの間も、出しているとみなす）。
 pub fn begin_session() {
+    CTRL_HELD.store(unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0, Ordering::SeqCst);
     CLOSE_REQUESTED.store(false, Ordering::SeqCst);
     OPEN.store(true, Ordering::SeqCst);
 }
@@ -986,6 +996,7 @@ fn choose_current() {
     })
     .flatten();
     if chosen.is_some() {
+        with_state(|st| st.outcome.ctrl_held = CTRL_HELD.load(Ordering::SeqCst));
         finish(chosen);
     }
 }

@@ -885,7 +885,8 @@ unsafe fn show_history_until_closed() {
             ime_indicator::notify("不可");
             return;
         };
-        let keep_open = outcome.keep_open.unwrap_or(config.view.keep_open);
+        // Ctrl を押しながら選んだときも、出したままにする（続けていくつも貼り付けられる）。
+        let keep_open = outcome.keep_open.unwrap_or(config.view.keep_open) || outcome.ctrl_held;
         let place = outcome.resume;
         let Some(moved_to) = apply_history_outcome(outcome, &config, target) else {
             return;
