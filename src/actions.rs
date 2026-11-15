@@ -238,8 +238,9 @@ pub fn start() -> Worker {
 
         WORKER_WINDOW.store(0, Ordering::SeqCst);
         save_history_now();
-        if !history_config().keep {
-            // 終了後は残さない設定なら、画像のファイルも消す。
+        // 終了後は残さない設定なら、画像のファイルも消す（記録していて、その設定を当てたあとだけ。
+        // 設定を受け取る前に終了したときに、残していたものを消さないように）。
+        if HISTORY_APPLIED.with(Cell::get) == Some((true, false)) {
             clip_image_store::delete_all();
         }
         if !window.is_invalid() {
