@@ -34,7 +34,7 @@ use std::sync::{mpsc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use windows::core::w;
+use windows::core::{w, Interface, VARIANT};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, ClientToScreen, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject,
@@ -44,7 +44,9 @@ use windows::Win32::Graphics::Gdi::{
     DT_VCENTER, FF_DONTCARE, FW_BOLD, HFONT, HGDIOBJ, HMONITOR, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Accessibility::{IAccessible, ObjectFromLresult};
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
@@ -59,7 +61,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetGUIThreadInfo, GetMessageW, GetWindowThreadProcessId, KillTimer,
     PostMessageW, PostThreadMessageW, RegisterClassW, SendMessageTimeoutW,
     SetLayeredWindowAttributes, SetTimer, SetWindowPos, ShowWindow, TranslateMessage,
-    GUITHREADINFO, HTTRANSPARENT, HWND_TOPMOST, LWA_ALPHA, MA_NOACTIVATE, MSG, SMTO_ABORTIFHUNG,
+    GUITHREADINFO, OBJID_CARET, WM_GETOBJECT, HTTRANSPARENT, HWND_TOPMOST, LWA_ALPHA, MA_NOACTIVATE, MSG, SMTO_ABORTIFHUNG,
     SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WM_APP, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT,
     WM_QUIT, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP,
@@ -90,6 +92,8 @@ const TIMER_POLL: usize = 1;
 const TIMER_ANIM: usize = 2;
 /// マウスカーソルに付いて動かす小さな印の、位置を直すタイマー。
 const TIMER_BADGE: usize = 3;
+/// アクセシビリティの情報を問い合わせるときに待つ時間（ミリ秒）。
+const ACC_QUERY_TIMEOUT_MS: u32 = 100;
 /// 小さな印をマウスに付いて動かすときの、位置を直す間隔（ミリ秒）。
 const BADGE_FOLLOW_INTERVAL_MS: u32 = 30;
 /// 小さな印の不透明度（0〜255）。
@@ -383,8 +387,6 @@ struct BadgeState {
     font: Option<(HFONT, i32)>,
     /// 最後に読み取ったモード（切り替わったことを知るため。読み取れなかったら `None`）。
     seen: Option<ImeMode>,
-    /// 最後に見た入力先のウィンドウ（入力先が変わったことを知るため）。
-    seen_focus: isize,
     /// マウスカーソルが文字入力の形（I の形）だったか（変わった瞬間を知るため）。
     ibeam: bool,
     /// 最後のきっかけ（キーを打った・クリックした・モードが切り替わった など）の時刻。
@@ -422,6 +424,8 @@ thread_local! {
 
 fn thread_main(ready: mpsc::Sender<u32>) {
     unsafe {
+        // 入力位置をアクセシビリティの情報から調べるのに COM を使う（このスレッドは終了まで動く）。
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let Some(hwnd) = create_window() else {
             let _ = ready.send(0);
             return;
@@ -443,7 +447,6 @@ fn thread_main(ready: mpsc::Sender<u32>) {
                     follows_mouse: false,
                     font: None,
                     seen: None,
-                    seen_focus: 0,
                     ibeam: false,
                     trigger: None,
                     alpha: 0,
@@ -675,7 +678,7 @@ unsafe fn cursor_is_ibeam() -> bool {
 /// 出さない設定のとき・全画面のアプリの間（その設定のとき）は消す。
 unsafe fn update_badge(observed: Option<&Observed>) {
     let params = current_params();
-    // きっかけ（キーを打った・クリックした・モードや入力先が変わった・マウスカーソルが文字入力の
+    // きっかけ（キーを打った・入力欄をクリックした・モードが変わった・マウスカーソルが文字入力の
     // 形になった）を調べる。出さないときも毎回見て、古いきっかけを残さない。
     let now = GetTickCount();
     let key = KEY_TICK.swap(0, Ordering::Relaxed) != 0;
@@ -686,17 +689,15 @@ unsafe fn update_badge(observed: Option<&Observed>) {
         let mut s = s.borrow_mut();
         let badge = &mut s.as_mut()?.badge;
         let mode = observed.map(|o| o.mode);
-        let focus = observed.map_or(0, |o| o.focus.0 as isize);
         let events = BadgeEvents {
             key,
             click,
             mode_switched: badge.seen.is_some() && mode.is_some() && badge.seen != mode,
-            focus_changed: focus != 0 && focus != badge.seen_focus,
+            ibeam,
             ibeam_entered: ibeam && !badge.ibeam,
             caret_known,
         };
         badge.seen = mode;
-        badge.seen_focus = focus;
         badge.ibeam = ibeam;
         if ime_logic::badge_triggered(params.badge_when, params.badge_on_ibeam, events) {
             badge.trigger = Some(now);
@@ -963,8 +964,70 @@ unsafe fn query_foreground_ime() -> Option<Observed> {
     })
 }
 
-/// 入力位置（キャレット）を画面座標で返す。キャレットを使っていないアプリでは `None`。
+/// 入力位置（キャレット）を画面座標で返す。分からなければ `None`。
+///
+/// まず Windows のキャレットを見る。それを使わないアプリ（ブラウザーや、その仕組みで作られた
+/// アプリ）は、アクセシビリティの情報として入力位置を知らせていることが多いので、そちらも見る。
+/// どちらも、入力欄に入力位置があるときだけ取れる（ボタンや本文を選んでいるときは取れない）。
 pub(crate) unsafe fn caret_rect(info: &GUITHREADINFO) -> Option<RECT> {
+    system_caret_rect(info).or_else(|| accessible_caret_rect(info.hwndFocus))
+}
+
+/// アクセシビリティの情報（`OBJID_CARET`）から、入力位置を画面座標で返す。
+///
+/// 相手が固まっていても巻き込まれないよう、問い合わせは時間を区切って送る。呼び出すスレッドは
+/// COM を初期化しておくこと。
+unsafe fn accessible_caret_rect(focus: HWND) -> Option<RECT> {
+    if focus.is_invalid() {
+        return None;
+    }
+    let mut result = 0usize;
+    let sent = SendMessageTimeoutW(
+        focus,
+        WM_GETOBJECT,
+        WPARAM(0),
+        LPARAM(OBJID_CARET.0 as isize),
+        SMTO_ABORTIFHUNG,
+        ACC_QUERY_TIMEOUT_MS,
+        Some(&mut result),
+    );
+    if sent.0 == 0 || result == 0 {
+        return None;
+    }
+    let mut object: *mut core::ffi::c_void = std::ptr::null_mut();
+    ObjectFromLresult(LRESULT(result as isize), &IAccessible::IID, WPARAM(0), &mut object).ok()?;
+    if object.is_null() {
+        return None;
+    }
+    let caret = IAccessible::from_raw(object);
+    // 入力欄を選んでいない間は「見えない」と知らせてくる（前の位置が残っていても使わない）。
+    const STATE_SYSTEM_INVISIBLE: i32 = 0x8000;
+    let hidden = caret
+        .get_accState(&VARIANT::from(0i32))
+        .ok()
+        .and_then(|state| i32::try_from(&state).ok())
+        .is_some_and(|state| state & STATE_SYSTEM_INVISIBLE != 0);
+    if hidden {
+        return None;
+    }
+    let (mut left, mut top, mut width, mut height) = (0i32, 0i32, 0i32, 0i32);
+    caret
+        .accLocation(&mut left, &mut top, &mut width, &mut height, &VARIANT::from(0i32))
+        .ok()?;
+    // 入力位置が無いとき（入力欄を選んでいないとき）は、大きさの無い四角が返る。
+    if height <= 0 || width < 0 || (left == 0 && top == 0) {
+        return None;
+    }
+    Some(RECT {
+        left,
+        top,
+        right: left + width.max(1),
+        bottom: top + height,
+    })
+}
+
+/// Windows のキャレットから、入力位置を画面座標で返す。キャレットを使っていないアプリでは `None`。
+unsafe fn system_caret_rect(info: &GUITHREADINFO) -> Option<RECT> {
     if info.hwndCaret.is_invalid() {
         return None;
     }

@@ -68,6 +68,10 @@ features = [
     "Win32_Graphics_Dwm",
     # 定型文の CSV を Shift_JIS でも読む（MultiByteToWideChar）
     "Win32_Globalization",
+    # 入力位置を、アクセシビリティの情報からも調べる（ブラウザーなど、Windows のキャレットを使わないアプリ）
+    "Win32_UI_Accessibility",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
 ]
 
 [features]

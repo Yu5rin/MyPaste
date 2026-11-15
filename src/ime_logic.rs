@@ -248,24 +248,30 @@ pub struct BadgeEvents {
     pub click: bool,
     /// 入力モードが切り替わった。
     pub mode_switched: bool,
-    /// 入力先のウィンドウが変わった。
-    pub focus_changed: bool,
+    /// マウスカーソルが、いま文字入力の形（I の形）をしている。
+    pub ibeam: bool,
     /// マウスカーソルが文字入力の形（I の形）に変わった。
     pub ibeam_entered: bool,
     /// 入力位置（キャレット）が分かる。
     pub caret_known: bool,
 }
 
-/// きっかけとして数えるか。「打ち始めたときだけ」は、打った・切り替えた・入力欄をクリックした
-/// （入力位置が分かるときのクリック）だけ。「おまかせ」は、入力欄かどうか分からないクリックや、
-/// ウィンドウの切り替え、マウスカーソルの形（`on_ibeam` が真のとき）も数える。
+/// きっかけとして数えるか。印は「これから文字を打つ場所で、打つ前に入力モードを知らせる」ための
+/// ものなので、文字を打つ場所だと分かる出来事だけを数える。
+///
+/// - 打った・切り替えた: いつも数える。
+/// - クリック: 入力欄をクリックしたときだけ。入力位置が分かるか（「おまかせ」では）マウスカーソルが
+///   文字入力の形のときに押した場合。ボタンや余白のクリックは数えない。
+/// - マウスカーソルが文字入力の形に変わった: 「おまかせ」で、`on_ibeam` が真のときだけ。
 pub fn badge_triggered(when: BadgeWhen, on_ibeam: bool, events: BadgeEvents) -> bool {
     let typing = events.key || events.mode_switched;
     match when {
         BadgeWhen::Always => false,
         BadgeWhen::Typing => typing || (events.click && events.caret_known),
         BadgeWhen::Auto => {
-            typing || events.click || events.focus_changed || (on_ibeam && events.ibeam_entered)
+            typing
+                || (events.click && (events.caret_known || events.ibeam))
+                || (on_ibeam && events.ibeam_entered)
         }
     }
 }
@@ -738,8 +744,8 @@ mod tests {
         let key = BadgeEvents { key: true, ..none };
         let click = BadgeEvents { click: true, ..none };
         let click_in_input = BadgeEvents { click: true, caret_known: true, ..none };
-        let focus = BadgeEvents { focus_changed: true, ..none };
-        let ibeam = BadgeEvents { ibeam_entered: true, ..none };
+        let click_on_text = BadgeEvents { click: true, ibeam: true, ..none };
+        let ibeam = BadgeEvents { ibeam: true, ibeam_entered: true, ..none };
         let switched = BadgeEvents { mode_switched: true, ..none };
         for when in [Auto, Typing] {
             assert!(!badge_triggered(when, true, none));
@@ -747,13 +753,15 @@ mod tests {
             assert!(badge_triggered(when, true, switched));
             assert!(badge_triggered(when, true, click_in_input));
         }
-        // 入力欄かどうか分からないクリック・ウィンドウの切り替え・マウスの形は「おまかせ」だけ。
-        assert!(badge_triggered(Auto, true, click));
-        assert!(badge_triggered(Auto, true, focus));
+        // 入力欄ではない所（ボタン・余白）のクリックは、どちらでも数えない。
+        assert!(!badge_triggered(Auto, true, click));
+        assert!(!badge_triggered(Typing, true, click));
+        // 文字入力の形のカーソルで押した・その形に変わった、は「おまかせ」だけ。
+        assert!(badge_triggered(Auto, true, click_on_text));
+        assert!(badge_triggered(Auto, false, click_on_text));
         assert!(badge_triggered(Auto, true, ibeam));
         assert!(!badge_triggered(Auto, false, ibeam));
-        assert!(!badge_triggered(Typing, true, click));
-        assert!(!badge_triggered(Typing, true, focus));
+        assert!(!badge_triggered(Typing, true, click_on_text));
         assert!(!badge_triggered(Typing, true, ibeam));
         assert!(!badge_triggered(Always, true, key));
         // 日本語を入力するモードと半角英数で、色が違う。
