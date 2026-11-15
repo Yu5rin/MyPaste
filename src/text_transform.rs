@@ -157,6 +157,29 @@ pub fn quick_format(text: &str, format: QuickFormat) -> String {
     }
 }
 
+/// Windows の文字の読み取り（OCR）が返した 1 行の単語をつなぐ。日本語は 1 文字ずつ単語に分かれて
+/// 返るので、そのまま空白でつなぐと「請 求 書」のようになる。前後のどちらかが英数字でない
+/// （かな・漢字など）ときは、空白をはさまずにつなぐ。
+pub fn join_ocr_words<S: AsRef<str>>(words: &[S]) -> String {
+    let mut out = String::new();
+    for word in words.iter().map(|w| w.as_ref().trim()).filter(|w| !w.is_empty()) {
+        let needs_space = match (out.chars().last(), word.chars().next()) {
+            (Some(last), Some(first)) => is_latin(last) && is_latin(first),
+            _ => false,
+        };
+        if needs_space {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
+}
+
+/// 欧文の単語をつくる文字（英数字と、単語の前後に付きやすい記号）。
+fn is_latin(c: char) -> bool {
+    c.is_ascii_graphic()
+}
+
 /// 空白とみなす文字（半角・全角の空白とタブ）。
 fn is_space(c: char) -> bool {
     matches!(c, ' ' | '\u{3000}' | '\t')
@@ -393,6 +416,16 @@ mod tests {
         assert_eq!(quick_format("ABC\nＸＹ", QuickFormat::Lower), "abc\r\nｘｙ");
         assert_eq!(quick_format("ＡＢ１２　ｃ", QuickFormat::ZenToHan), "AB12 c");
         assert_eq!(QUICK_FORMATS.len(), 5);
+    }
+
+    #[test]
+    fn joins_ocr_words() {
+        assert_eq!(join_ocr_words(&["請", "求", "書"]), "請求書");
+        assert_eq!(join_ocr_words(&["Hello,", "world"]), "Hello, world");
+        assert_eq!(join_ocr_words(&["金額", "1,234", "円"]), "金額1,234円");
+        assert_eq!(join_ocr_words(&["No.", "123", "の", "件"]), "No. 123の件");
+        assert_eq!(join_ocr_words::<&str>(&[]), "");
+        assert_eq!(join_ocr_words(&["", " a "]), "a");
     }
 
     #[test]

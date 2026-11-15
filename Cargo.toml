@@ -72,6 +72,12 @@ features = [
     "Win32_UI_Accessibility",
     "Win32_System_Ole",
     "Win32_System_Variant",
+    # 履歴の画像の文字を読み取る（Windows に入っている OCR。WinRT）
+    "Foundation",
+    "Foundation_Collections",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Storage_Streams",
 ]
 
 [features]

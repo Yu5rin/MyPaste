@@ -56,7 +56,7 @@ use crate::clip_images::{self, Index, Part};
 use crate::hotkey_rules::{self, Action, LocalTime};
 use crate::remap_logic::Hotkey;
 use crate::config::Snippet;
-use crate::{clip_image_store, clip_store, config, history_window, snippet_window, ime_indicator, keyboard, remap_logic, sendinput, text_transform};
+use crate::{clip_image_store, clip_store, config, history_window, snippet_window, ime_indicator, keyboard, ocr, remap_logic, sendinput, text_transform};
 
 /// クリップボードの文字（`CF_UNICODETEXT`）。
 const CF_UNICODETEXT: u32 = 13;
@@ -186,6 +186,8 @@ const SAVE_HISTORY_MAX_DELAY: Duration = Duration::from_secs(15);
 
 /// 履歴の一覧を閉じてから、元のウィンドウに入力が戻るのを待つ時間。
 const MENU_REFOCUS_WAIT: Duration = Duration::from_millis(80);
+/// 画像の文字の読み取りを待つ長さの上限。
+const OCR_WAIT: Duration = Duration::from_secs(30);
 
 /// 実行スレッドのハンドル。[`Worker::stop`] で止める。
 ///
@@ -1096,8 +1098,53 @@ unsafe fn resolve_pick(
             }
             Some(Part::Text(text))
         }
+        history_window::Pick::Ocr(id) => recognize_image(id).map(Part::Text),
         // まとめたものの中に、まとめたものは入れない。
         history_window::Pick::Many(_) => None,
+    }
+}
+
+/// 履歴の画像の文字を、Windows の文字の読み取り（OCR）で読む。読めなかったとき・何も無かったときは、
+/// 画面に短く知らせて `None`。
+unsafe fn recognize_image(id: u64) -> Option<String> {
+    let Some(dib) = clip_image_store::load_image(id) else {
+        log::warn!("画像の履歴: 文字を読み取る画像を読めませんでした");
+        ime_indicator::notify("不可");
+        return None;
+    };
+    // 読み取りは時間がかかることがあるので、別のスレッドで行い、その間もメッセージを処理する。
+    let worker = std::thread::spawn(move || ocr::recognize(&dib));
+    pump_messages_until(OCR_WAIT, || worker.is_finished());
+    if !worker.is_finished() {
+        log::warn!("画像の履歴: 文字の読み取りが終わらないため、やめました");
+        ime_indicator::notify("不可");
+        return None;
+    }
+    match worker.join() {
+        Ok(Ok(text)) if !text.trim().is_empty() => {
+            log::debug!("画像の履歴: 文字を読み取りました（{} 文字）", text.chars().count());
+            Some(text)
+        }
+        Ok(Ok(_)) => {
+            log::debug!("画像の履歴: 画像から文字を読み取れませんでした");
+            ime_indicator::notify("文字なし");
+            None
+        }
+        Ok(Err(ocr::Failure::NoLanguage)) => {
+            log::warn!("画像の履歴: 文字を読み取れる言語が Windows に入っていません");
+            ime_indicator::notify("OCR なし");
+            None
+        }
+        Ok(Err(ocr::Failure::Failed(e))) => {
+            log::warn!("画像の履歴: 文字を読み取れませんでした: {e}");
+            ime_indicator::notify("不可");
+            None
+        }
+        Err(_) => {
+            log::warn!("画像の履歴: 文字の読み取りが途中で止まりました");
+            ime_indicator::notify("不可");
+            None
+        }
     }
 }
 

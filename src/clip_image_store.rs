@@ -314,6 +314,32 @@ pub unsafe fn save_png(id: u64, path: &std::path::Path) -> Result<(u32, u32), St
     Ok((pixels.width, pixels.height))
 }
 
+/// 文字の読み取りに渡す絵（上から下へ、不透明な BGRA）。縦横のどちらかが `max_side` を
+/// 超えるときは、縦横の比を保って縮める。(幅, 高さ, 画素) を返す。
+pub unsafe fn ocr_pixels(dib: &[u8], max_side: u32) -> Option<(u32, u32, Vec<u8>)> {
+    let pixels = image_pixels(dib)?;
+    let bgra = pixels.to_opaque_bgra();
+    let (width, height) = clip_images::thumb_size(pixels.width, pixels.height, max_side, max_side);
+    if (width, height) == (pixels.width, pixels.height) {
+        return Some((width, height, bgra));
+    }
+    let header = top_down_header(pixels.width, pixels.height);
+    let scaled = stretch(
+        &header,
+        bgra.as_ptr().cast(),
+        pixels.width,
+        pixels.height,
+        width,
+        height,
+    )?;
+    // 描き直した絵の 4 バイト目は意味を持たないので、不透明にする。
+    let mut scaled = scaled;
+    for px in scaled.chunks_exact_mut(4) {
+        px[3] = 255;
+    }
+    Some((width, height, scaled))
+}
+
 /// 縮小した絵を、枠 `(x, y, w, h)` の中央に、縦横の比を保って描く。
 pub unsafe fn draw_thumb(hdc: HDC, thumb: &Thumb, x: i32, y: i32, w: i32, h: i32) {
     if w <= 0 || h <= 0 {

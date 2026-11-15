@@ -476,6 +476,17 @@ impl Pixels {
         }
         rgb
     }
+
+    /// 白の上に重ねた、不透明な BGRA（文字の読み取りに渡す。透けたところが黒にならないように）。
+    pub fn to_opaque_bgra(&self) -> Vec<u8> {
+        let mut bgra = Vec::with_capacity(self.rgba.len());
+        for px in self.rgba.chunks_exact(4) {
+            let a = u32::from(px[3]);
+            let over_white = |c: u8| ((u32::from(c) * a + 255 * (255 - a)) / 255) as u8;
+            bgra.extend_from_slice(&[over_white(px[2]), over_white(px[1]), over_white(px[0]), 255]);
+        }
+        bgra
+    }
 }
 
 /// 上から下へ並ぶ BGRA（Windows の 32 ビットの絵）を [`Pixels`] にする。`use_alpha` が偽なら
@@ -805,6 +816,11 @@ mod tests {
         assert!(p.has_alpha);
         assert_eq!(&p.rgba[..8], &[3, 2, 1, 128, 6, 5, 4, 255]);
         assert_eq!(p.rgba[11], 0);
+        // 白の上に重ねる: 不透明度 128 の (3, 2, 1) は白に寄り、透明は白になる。
+        let bgra = p.to_opaque_bgra();
+        assert_eq!(&bgra[..4], &[127, 128, 128, 255]);
+        assert_eq!(&bgra[4..8], &[4, 5, 6, 255]);
+        assert_eq!(&bgra[8..12], &[255, 255, 255, 255]);
     }
 
     #[test]

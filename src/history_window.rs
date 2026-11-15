@@ -14,7 +14,9 @@
 //! 履歴は Delete で 1 件を消せる。右クリック（またはアプリケーションキー）で、定型文への登録・
 //! 削除・定型文の編集のメニューを出す。メニューの「整えて貼り付け」では、文字（履歴の文字と
 //! 定型文）を整えてから貼り付ける（前後の空白を除く・1 行にまとめる・大文字・小文字・全角英数を
-//! 半角に。履歴そのものは変えない）。画像の行では「画像をファイルに保存...」で PNG に書き出せる。
+//! 半角に。履歴そのものは変えない）。画像の行では「画像の文字を読み取って貼り付け」で、Windows の
+//! 文字の読み取り（[`crate::ocr`]）で読んだ文字を貼り付け、「画像をファイルに保存...」で PNG に
+//! 書き出せる。
 //!
 //! 検索: Ctrl+F か `/`（または検索の欄をクリック）で、検索の欄に入力欄を出す。入力した言葉で、
 //! 今のタブを絞り込む（大文字と小文字は区別しない。空白で区切ると、すべてを含むもの。定型文は
@@ -278,6 +280,7 @@ const MENU_MARK: usize = 9;
 const MENU_PASTE_MARKED: usize = 10;
 const MENU_CLEAR_MARKS: usize = 11;
 const MENU_SAVE_IMAGE: usize = 12;
+const MENU_OCR: usize = 13;
 /// 「整えて貼り付け」の項目（この番号に、[`text_transform::QUICK_FORMATS`] の位置を足す）。
 const MENU_FORMAT_BASE: usize = 20;
 /// ピン留めした行の左端に引く線の太さ（96 DPI 基準）。
@@ -349,6 +352,8 @@ pub enum Pick {
     Many(Vec<Pick>),
     /// 整えて貼り付ける（中身は `History` か `Snippet`）。履歴そのものは変えない。
     Formatted(Box<Pick>, QuickFormat),
+    /// 履歴の画像（番号）の文字を読み取って、その文字を貼り付ける。
+    Ocr(u64),
 }
 
 /// 一覧を閉じたときの、タブと選んでいた位置と絞り込み（出したままにするとき、同じ所から
@@ -1316,6 +1321,15 @@ fn choose_formatted(format: QuickFormat) {
     }
 }
 
+/// 選んでいる履歴の画像の文字を読み取って貼り付けるために閉じる。
+fn choose_ocr() {
+    let chosen = with_state(|st| st.selected().and_then(|p| st.image_id(p)).map(Pick::Ocr)).flatten();
+    if chosen.is_some() {
+        with_state(|st| st.outcome.ctrl_held = CTRL_HELD.load(Ordering::SeqCst));
+        finish(chosen);
+    }
+}
+
 /// 選んでいる履歴の画像を、保存先を選んで PNG のファイルに書き出す。結果は画面に短く出す。
 unsafe fn save_selected_image(hwnd: HWND) {
     let Some(id) = with_state(|st| st.selected().and_then(|p| st.image_id(p))).flatten() else {
@@ -1604,7 +1618,7 @@ unsafe fn on_search_changed(hwnd: HWND) {
 
 /// 右クリックのメニューを出す。
 unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
-    let Some(((tab, has_row, pinned, is_image, keep_open), (marked, any_marks, is_text))) = with_state(|st| {
+    let state = with_state(|st| {
         let item = st
             .selected()
             .filter(|_| st.tab == Tab::History)
@@ -1616,11 +1630,14 @@ unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
             .selected()
             .and_then(|p| st.actual(p))
             .is_some_and(|a| st.marks.order(st.tab.index(), a).is_some());
+        let is_text = st.selected().and_then(|p| st.full_text(p)).is_some();
         (
             (st.tab, on_row && st.selected().is_some(), pinned, is_image, st.keep_open),
-            (marked, !st.marks.is_empty(), st.selected().and_then(|p| st.full_text(p)).is_some()),
+            (marked, !st.marks.is_empty(), is_text),
         )
-    }) else {
+    });
+    let Some(((tab, has_row, pinned, is_image, keep_open), (marked, any_marks, is_text))) = state
+    else {
         return;
     };
     let Ok(menu) = CreatePopupMenu() else {
@@ -1669,6 +1686,12 @@ unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
         let _ = AppendMenuW(menu, register_flag, MENU_REGISTER, w!("定型文に登録(&T)"));
         // 画像の行だけ。
         let image_flag = if has_row && is_image { MF_STRING } else { MF_STRING | MF_GRAYED };
+        let _ = AppendMenuW(
+            menu,
+            image_flag,
+            MENU_OCR,
+            w!("画像の文字を読み取って貼り付け(&R)"),
+        );
         let _ = AppendMenuW(menu, image_flag, MENU_SAVE_IMAGE, w!("画像をファイルに保存...(&S)"));
         let _ = AppendMenuW(menu, row_flag, MENU_DELETE, w!("この履歴を削除(&D)\tDelete"));
     }
@@ -1718,6 +1741,7 @@ unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
         MENU_PASTE_MARKED => choose_current(),
         MENU_MARK => toggle_mark_current(hwnd),
         MENU_CLEAR_MARKS => clear_marks(hwnd),
+        MENU_OCR => choose_ocr(),
         n if (MENU_FORMAT_BASE..MENU_FORMAT_BASE + text_transform::QUICK_FORMATS.len())
             .contains(&n) =>
         {
