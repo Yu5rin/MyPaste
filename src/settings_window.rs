@@ -46,7 +46,7 @@ use crate::config::{self, ClipboardHistorySettings, Settings};
 use crate::hotkey_rules;
 use crate::ime_indicator::{Params, Timing};
 use crate::ime_logic::{
-    self, Badge, Position, Theme, FADE_MS_MAX, FADE_MS_MIN, HOLD_MS_MAX, HOLD_MS_MIN, OPACITY_MAX,
+    self, Badge, BadgeWhen, Position, Theme, FADE_MS_MAX, FADE_MS_MIN, HOLD_MS_MAX, HOLD_MS_MIN, OPACITY_MAX,
     OPACITY_MIN, SIZE_MAX, SIZE_MIN,
 };
 use crate::remap_logic::{self, Hotkey, KEYS};
@@ -120,6 +120,9 @@ const ID_BADGE_SIZE: i32 = 181;
 const ID_FLASH: i32 = 182;
 const ID_CH_IMAGES: i32 = 183;
 const ID_CH_KEEP_OPEN: i32 = 184;
+const ID_BADGE_WHEN: i32 = 185;
+const ID_BADGE_HOLD: i32 = 186;
+const ID_BADGE_OPACITY: i32 = 187;
 
 /// 画面の中身の大きさ（96 DPI 基準）。ノート PC（1366x768、表示 125%）でも収まる大きさにする。
 const CLIENT_W: i32 = 500;
@@ -196,13 +199,20 @@ const PAGE_IME: &[Item] = &[
     item(ID_OPACITY, Kind::NumberEdit, "", 140, 262, 70, 24),
     item(230, Kind::Label, "%（30〜100）", 216, 262, 150, 24),
     item(ID_PREVIEW, Kind::Button, "プレビュー(&P)", 366, 260, 110, 28),
-    item(231, Kind::Group, "いまの入力モードを、小さな印で出し続ける", 12, 302, 476, 58),
+    item(231, Kind::Group, "いまの入力モードを、小さな印で出す", 12, 302, 476, 86),
     item(232, Kind::Label, "出す場所", 24, 324, 66, 24),
     item(ID_BADGE, Kind::Combo, "", 92, 324, 262, 200),
     item(233, Kind::Label, "大きさ", 364, 324, 44, 24),
     item(ID_BADGE_SIZE, Kind::NumberEdit, "", 410, 324, 40, 24),
     item(234, Kind::Label, "px", 454, 324, 24, 24),
-    item(ID_FULLSCREEN, Kind::Check, "全画面のアプリ（ゲーム・動画・発表など）では表示しない", 16, 368, 468, 22),
+    item(235, Kind::Label, "出すとき", 24, 354, 66, 24),
+    item(ID_BADGE_WHEN, Kind::Combo, "", 92, 354, 150, 200),
+    item(ID_BADGE_HOLD, Kind::Edit, "", 250, 354, 36, 24),
+    item(236, Kind::Label, "秒", 290, 354, 20, 24),
+    item(237, Kind::Label, "不透明度", 322, 354, 58, 24),
+    item(ID_BADGE_OPACITY, Kind::NumberEdit, "", 382, 354, 40, 24),
+    item(238, Kind::Label, "%", 426, 354, 20, 24),
+    item(ID_FULLSCREEN, Kind::Check, "全画面のアプリ（ゲーム・動画・発表など）では表示しない", 16, 396, 468, 22),
 ];
 
 /// 「クリップボードの履歴」のページ。
@@ -376,6 +386,7 @@ unsafe fn thread_main(tx: Sender<TrayMessage>, settings: Settings, startup: bool
     ui::add_combo_items(hwnd, ID_POSITION, Position::ALL.iter().map(|(_, _, name)| *name));
     ui::add_combo_items(hwnd, ID_THEME, Theme::ALL.iter().map(|(_, _, name)| *name));
     ui::add_combo_items(hwnd, ID_BADGE, Badge::ALL.iter().map(|(_, _, name)| *name));
+    ui::add_combo_items(hwnd, ID_BADGE_WHEN, BadgeWhen::ALL.iter().map(|(_, _, name)| *name));
     ui::add_combo_items(hwnd, ID_UPDATE_MODE, UpdateMode::ALL.iter().map(|(_, _, name)| *name));
     ui::add_combo_items(hwnd, ID_CH_TRIGGER, Trigger::ALL.iter().map(|(_, _, name)| *name));
     ui::add_combo_items(hwnd, ID_CH_KEY, KEYS.iter().map(|(name, _)| *name));
@@ -424,6 +435,10 @@ unsafe fn fill_form(hwnd: HWND, form: &Form) {
     let badge_index = Badge::ALL.iter().position(|(b, _, _)| *b == ime.badge).unwrap_or(0);
     set_combo_index(hwnd, ID_BADGE, badge_index);
     set_text(hwnd, ID_BADGE_SIZE, &ime.badge_size.to_string());
+    let when_index = BadgeWhen::ALL.iter().position(|(w, _, _)| *w == ime.badge_when).unwrap_or(0);
+    set_combo_index(hwnd, ID_BADGE_WHEN, when_index);
+    set_text(hwnd, ID_BADGE_HOLD, &ime_logic::format_seconds(ime.badge_hold_ms));
+    set_text(hwnd, ID_BADGE_OPACITY, &ime.badge_opacity.to_string());
     set_checked(hwnd, ID_STARTUP, form.startup);
     set_checked(hwnd, ID_UPDATE, form.check_update);
     set_checked(hwnd, ID_UPDATE_PERIODIC, form.update_every_hours > 0);
@@ -446,9 +461,14 @@ unsafe fn update_ime_fields(hwnd: HWND) {
     for id in [ID_POSITION, ID_THEME, ID_HOLD, ID_FADE, ID_SIZE, ID_OPACITY, ID_PREVIEW] {
         ui::set_enabled(hwnd, id, flash);
     }
-    for id in [ID_FLASH, ID_FULLSCREEN, ID_BADGE, ID_BADGE_SIZE] {
+    for id in [ID_FLASH, ID_FULLSCREEN, ID_BADGE, ID_BADGE_SIZE, ID_BADGE_WHEN, ID_BADGE_OPACITY] {
         ui::set_enabled(hwnd, id, on);
     }
+    // 出しておく時間は、「打ち始めたときだけ」のときに使う。
+    let typing = combo_index(hwnd, ID_BADGE_WHEN)
+        .and_then(|i| BadgeWhen::ALL.get(i))
+        .is_none_or(|(w, _, _)| *w == BadgeWhen::Typing);
+    ui::set_enabled(hwnd, ID_BADGE_HOLD, on && typing);
 }
 
 /// 今の欄の中身を「保存済みの状態」として覚える。
@@ -763,6 +783,39 @@ unsafe fn read_ime_params(hwnd: HWND) -> Result<Params, (i32, String)> {
                 ),
             )
         })? as u32,
+        badge_when: combo_index(hwnd, ID_BADGE_WHEN)
+            .and_then(|i| BadgeWhen::ALL.get(i))
+            .map_or(BadgeWhen::Typing, |(w, _, _)| *w),
+        badge_hold_ms: ime_logic::parse_seconds(
+            &get_text(hwnd, ID_BADGE_HOLD),
+            ime_logic::BADGE_HOLD_MS_MIN,
+            ime_logic::BADGE_HOLD_MS_MAX,
+        )
+        .ok_or_else(|| {
+            (
+                ID_BADGE_HOLD,
+                format!(
+                    "小さな印を出しておく時間は {}〜{} 秒で入力してください。",
+                    ime_logic::format_seconds(ime_logic::BADGE_HOLD_MS_MIN),
+                    ime_logic::format_seconds(ime_logic::BADGE_HOLD_MS_MAX)
+                ),
+            )
+        })?,
+        badge_opacity: parse_in_range(
+            &get_text(hwnd, ID_BADGE_OPACITY),
+            u64::from(ime_logic::BADGE_OPACITY_MIN),
+            u64::from(ime_logic::BADGE_OPACITY_MAX),
+        )
+        .ok_or_else(|| {
+            (
+                ID_BADGE_OPACITY,
+                format!(
+                    "小さな印の不透明度は {}〜{} の数で入力してください。",
+                    ime_logic::BADGE_OPACITY_MIN,
+                    ime_logic::BADGE_OPACITY_MAX
+                ),
+            )
+        })? as u32,
     })
 }
 
@@ -814,6 +867,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 || (id == ID_CH_ENABLED && code == BN_CLICKED)
             {
                 update_history_fields(hwnd);
+            }
+            if id == ID_BADGE_WHEN && code == CBN_SELCHANGE {
+                update_ime_fields(hwnd);
             }
             if (id == ID_IME_ENABLED || id == ID_FLASH) && code == BN_CLICKED {
                 update_ime_fields(hwnd);
@@ -958,6 +1014,9 @@ unsafe fn on_save(hwnd: HWND, close: bool) {
     settings.ime_indicator.flash = ime.flash;
     settings.ime_indicator.badge = ime.badge.as_setting().to_string();
     settings.ime_indicator.badge_size = ime.badge_size;
+    settings.ime_indicator.badge_when = ime.badge_when.as_setting().to_string();
+    settings.ime_indicator.badge_hold_ms = ime.badge_hold_ms;
+    settings.ime_indicator.badge_opacity = ime.badge_opacity;
     settings.log.enabled = form.log;
     settings.update.check_on_startup = form.check_update;
     settings.update.check_every_hours = form.update_every_hours;

@@ -176,6 +176,57 @@ impl Badge {
     }
 }
 
+/// 小さな印を出すとき。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BadgeWhen {
+    /// キーを打ったとき・入力欄をクリックしたとき・モードを切り替えたときに出し、少しして消す。
+    Typing,
+    /// 出し続ける。
+    Always,
+}
+
+impl BadgeWhen {
+    /// 設定ファイルの値・画面の表示名との対応（画面の並び順）。
+    pub const ALL: [(BadgeWhen, &'static str, &'static str); 2] = [
+        (BadgeWhen::Typing, "typing", "打ち始めたときだけ"),
+        (BadgeWhen::Always, "always", "出し続ける"),
+    ];
+
+    /// settings.json の値から読む。知らない値は「打ち始めたときだけ」。
+    pub fn from_setting(text: &str) -> BadgeWhen {
+        let text = text.trim();
+        Self::ALL
+            .iter()
+            .find(|(_, name, _)| name.eq_ignore_ascii_case(text))
+            .map_or(BadgeWhen::Typing, |(when, _, _)| *when)
+    }
+
+    /// settings.json に書く値。
+    pub fn as_setting(self) -> &'static str {
+        Self::ALL.iter().find(|(w, _, _)| *w == self).map_or("typing", |(_, n, _)| *n)
+    }
+}
+
+/// 「打ち始めたときだけ」のときに、小さな印を出しておく時間の範囲と既定（ミリ秒）。
+pub const BADGE_HOLD_MS_MIN: u64 = 1000;
+pub const BADGE_HOLD_MS_MAX: u64 = 10_000;
+pub const DEFAULT_BADGE_HOLD_MS: u64 = 3000;
+/// 小さな印の不透明度の範囲と既定（%）。
+pub const BADGE_OPACITY_MIN: u32 = 20;
+pub const BADGE_OPACITY_MAX: u32 = 100;
+pub const DEFAULT_BADGE_OPACITY: u32 = 90;
+
+/// 小さな印を出しておくか。`trigger` は最後のきっかけ（キーを打った など）の時刻、`now` は今の
+/// 時刻（どちらも `GetTickCount` のミリ秒。約 49 日で 0 に戻るので、差で比べる）。
+pub fn badge_visible(when: BadgeWhen, trigger: Option<u32>, now: u32, hold_ms: u64) -> bool {
+    match when {
+        BadgeWhen::Always => true,
+        BadgeWhen::Typing => {
+            trigger.is_some_and(|at| u64::from(now.wrapping_sub(at)) < hold_ms)
+        }
+    }
+}
+
 /// 小さな印の色（背景, 文字。`0x00BBGGRR`）。日本語を入力するモードは赤、半角英数は青にして、
 /// 文字を読まなくても色で見分けられるようにする。
 pub fn badge_colors(mode: ImeMode) -> (u32, u32) {
@@ -610,6 +661,24 @@ mod tests {
         }
         assert_eq!(Badge::from_setting(" CARET "), Badge::Caret);
         assert_eq!(Badge::from_setting("unknown"), Badge::Off);
+        for (when, name, _) in BadgeWhen::ALL {
+            assert_eq!(BadgeWhen::from_setting(name), when);
+            assert_eq!(when.as_setting(), name);
+        }
+        assert_eq!(BadgeWhen::from_setting("?"), BadgeWhen::Typing);
+    }
+
+    #[test]
+    fn badge_shows_for_a_while_after_trigger() {
+        use BadgeWhen::{Always, Typing};
+        assert!(badge_visible(Always, None, 0, 3000));
+        assert!(!badge_visible(Typing, None, 5000, 3000));
+        assert!(badge_visible(Typing, Some(5000), 5000, 3000));
+        assert!(badge_visible(Typing, Some(5000), 7999, 3000));
+        assert!(!badge_visible(Typing, Some(5000), 8000, 3000));
+        // 時刻が 0 に戻っても、差で比べるので続けて数えられる。
+        assert!(badge_visible(Typing, Some(u32::MAX - 10), 100, 3000));
+        assert!(!badge_visible(Typing, Some(u32::MAX - 10), 5000, 3000));
         // 日本語を入力するモードと半角英数で、色が違う。
         assert_ne!(badge_colors(ImeMode::Hiragana).0, badge_colors(ImeMode::AlnumHalf).0);
         assert_eq!(badge_colors(ImeMode::Hiragana), badge_colors(ImeMode::KatakanaHalf));

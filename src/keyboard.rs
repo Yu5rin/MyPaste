@@ -311,8 +311,20 @@ unsafe extern "system" fn low_level_mouse_proc(code: i32, wparam: WPARAM, lparam
         )
     {
         DOUBLE_TAP.with(|d| d.borrow_mut().reset());
+        crate::ime_indicator::note_click();
     }
     CallNextHookEx(None, code, wparam, lparam)
+}
+
+/// 文字を打つキーか（修飾キーそのものと、Ctrl・Alt・Win を押しながらのキーは除く）。
+unsafe fn is_typing_key(vk: u32) -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    const MODIFIERS: [u32; 11] = [0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5];
+    if MODIFIERS.contains(&vk) {
+        return false;
+    }
+    // 0x11 = Ctrl、0x12 = Alt、0x5B / 0x5C = Win
+    ![0x11, 0x12, 0x5B, 0x5C].iter().any(|key| GetAsyncKeyState(*key) < 0)
 }
 
 /// キーボードフックを解除する（リソースリーク防止のため終了時に必ず呼ぶ）。
@@ -390,6 +402,11 @@ unsafe extern "system" fn low_level_keyboard_proc(
 
         // 自分が送った入力・注入入力は対象外。
         if !injected && !is_self {
+            // 文字を打ち始めたら、入力モードの小さな印を出す（Ctrl+C のようなショートカットや、
+            // Shift などの修飾キーだけでは出さない）。
+            if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN) && is_typing_key(kb.vkCode) {
+                crate::ime_indicator::note_key();
+            }
             // Ctrl などの 2 回押しで、クリップボードの履歴の一覧を出す（キーはそのまま通す）。
             if let Some(key) = history_double_tap() {
                 let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);

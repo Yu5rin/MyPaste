@@ -29,7 +29,7 @@
 //! Ctrl+B のリマップには影響しない。
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -45,6 +45,7 @@ use windows::Win32::Graphics::Gdi::{
     MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
@@ -64,7 +65,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::ImeIndicatorSettings;
-use crate::ime_logic::{self, Badge, ImeMode, ModeTracker, Position, ReadabilityLog, Theme};
+use crate::ime_logic::{self, Badge, BadgeWhen, ImeMode, ModeTracker, Position, ReadabilityLog, Theme};
 
 /// IME の状態を調べる間隔（ミリ秒）。
 const POLL_INTERVAL_MS: u32 = 100;
@@ -91,7 +92,6 @@ const TIMER_BADGE: usize = 3;
 /// 小さな印をマウスに付いて動かすときの、位置を直す間隔（ミリ秒）。
 const BADGE_FOLLOW_INTERVAL_MS: u32 = 30;
 /// 小さな印の不透明度（0〜255）。
-const BADGE_ALPHA: u8 = 230;
 /// 小さな印と入力位置の間（96 DPI 基準のピクセル）。
 const BADGE_CARET_GAP: i32 = 3;
 /// 小さな印とマウスカーソルの間（96 DPI 基準のピクセル）と、カーソルの絵の高さの見込み。
@@ -141,6 +141,25 @@ pub struct Params {
     pub badge: Badge,
     /// 小さな印の一辺（96 DPI 基準のピクセル）。
     pub badge_size: u32,
+    /// 小さな印を出すとき・出しておく時間（ミリ秒）・不透明度（%）。
+    pub badge_when: BadgeWhen,
+    pub badge_hold_ms: u64,
+    pub badge_opacity: u32,
+}
+
+/// キーを打った・マウスのボタンを押した時刻（`GetTickCount`。0 は「まだ見ていないものは無い」）。
+/// キーボードとマウスのフックが書き、監視が読んで 0 に戻す。
+static KEY_TICK: AtomicU32 = AtomicU32::new(0);
+static CLICK_TICK: AtomicU32 = AtomicU32::new(0);
+
+/// 文字のキーを打った（キーボードフックから呼ぶ。小さな印を出すきっかけ）。
+pub fn note_key() {
+    KEY_TICK.store(unsafe { GetTickCount() }.max(1), Ordering::Relaxed);
+}
+
+/// マウスのボタンを押した（マウスフックから呼ぶ。入力欄をクリックしたときに、小さな印を出す）。
+pub fn note_click() {
+    CLICK_TICK.store(unsafe { GetTickCount() }.max(1), Ordering::Relaxed);
 }
 
 impl Params {
@@ -157,6 +176,9 @@ impl Params {
         flash: true,
         badge: Badge::Off,
         badge_size: ime_logic::DEFAULT_BADGE_SIZE,
+        badge_when: BadgeWhen::Typing,
+        badge_hold_ms: ime_logic::DEFAULT_BADGE_HOLD_MS,
+        badge_opacity: ime_logic::DEFAULT_BADGE_OPACITY,
     };
 
     /// 設定ファイルの値から作る（範囲外は丸め、知らない値は既定にする）。
@@ -174,6 +196,9 @@ impl Params {
             flash: settings.flash,
             badge: Badge::from_setting(&settings.badge),
             badge_size: settings.badge_size,
+            badge_when: BadgeWhen::from_setting(&settings.badge_when),
+            badge_hold_ms: settings.badge_hold_ms,
+            badge_opacity: settings.badge_opacity,
         }
         .clamped()
     }
@@ -198,6 +223,12 @@ impl Params {
             badge_size: self
                 .badge_size
                 .clamp(ime_logic::BADGE_SIZE_MIN, ime_logic::BADGE_SIZE_MAX),
+            badge_hold_ms: self
+                .badge_hold_ms
+                .clamp(ime_logic::BADGE_HOLD_MS_MIN, ime_logic::BADGE_HOLD_MS_MAX),
+            badge_opacity: self
+                .badge_opacity
+                .clamp(ime_logic::BADGE_OPACITY_MIN, ime_logic::BADGE_OPACITY_MAX),
             ..self
         }
     }
@@ -341,6 +372,12 @@ struct BadgeState {
     follows_mouse: bool,
     /// 作成済みのフォントと、その文字の高さ。
     font: Option<(HFONT, i32)>,
+    /// 最後に読み取ったモード（切り替わったことを知るため。読み取れなかったら `None`）。
+    seen: Option<ImeMode>,
+    /// 最後のきっかけ（キーを打った・入力欄をクリックした・モードが切り替わった）の時刻。
+    trigger: Option<u32>,
+    /// いまの不透明度（0〜255。変わったときだけ当て直す）。
+    alpha: u8,
 }
 
 /// 表示中の内容。
@@ -392,6 +429,9 @@ fn thread_main(ready: mpsc::Sender<u32>) {
                     size: 0,
                     follows_mouse: false,
                     font: None,
+                    seen: None,
+                    trigger: None,
+                    alpha: 0,
                 },
             })
         });
@@ -608,6 +648,28 @@ unsafe extern "system" fn badge_wnd_proc(
 /// 出さない設定のとき・全画面のアプリの間（その設定のとき）は消す。
 unsafe fn update_badge(observed: Option<&Observed>) {
     let params = current_params();
+    // きっかけ（キーを打った・入力欄をクリックした・モードが切り替わった）を調べる。
+    // 出さないときも毎回見て、古いきっかけを残さない。
+    let now = GetTickCount();
+    let key = KEY_TICK.swap(0, Ordering::Relaxed) != 0;
+    let click = CLICK_TICK.swap(0, Ordering::Relaxed) != 0;
+    let trigger = STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let badge = &mut s.as_mut()?.badge;
+        let mode = observed.map(|o| o.mode);
+        // クリックは、入力位置が分かるとき（入力欄をクリックしたとき）だけ、きっかけにする。
+        let clicked_input = click && observed.is_some_and(|o| o.caret.is_some());
+        let switched = badge.seen.is_some() && mode.is_some() && badge.seen != mode;
+        badge.seen = mode;
+        if key || clicked_input || switched {
+            badge.trigger = Some(now);
+        }
+        badge.trigger
+    });
+    if !ime_logic::badge_visible(params.badge_when, trigger, now, params.badge_hold_ms) {
+        hide_badge();
+        return;
+    }
     let target = match (params.badge, observed) {
         (Badge::Off, _) | (_, None) => None,
         (_, Some(_)) if params.hide_in_fullscreen && is_fullscreen_app_running() => None,
@@ -693,8 +755,10 @@ unsafe fn update_badge(observed: Option<&Observed>) {
         let was_hidden = badge.mode.is_none();
         badge.mode = Some(mode);
         badge.size = size;
-        if was_hidden {
-            let _ = SetLayeredWindowAttributes(badge.hwnd, COLORREF(0), BADGE_ALPHA, LWA_ALPHA);
+        let alpha = (params.badge_opacity.min(100) * 255 / 100) as u8;
+        if was_hidden || badge.alpha != alpha {
+            badge.alpha = alpha;
+            let _ = SetLayeredWindowAttributes(badge.hwnd, COLORREF(0), alpha, LWA_ALPHA);
         }
         let _ = SetWindowPos(
             badge.hwnd,

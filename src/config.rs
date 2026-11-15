@@ -231,6 +231,12 @@ pub struct ImeIndicatorSettings {
     pub badge: String,
     /// 小さな印の一辺（96 DPI 基準のピクセル。12〜48）。
     pub badge_size: u32,
+    /// 小さな印を出すとき（`"typing"`＝打ち始めたときだけ / `"always"`＝出し続ける）。
+    pub badge_when: String,
+    /// 「打ち始めたときだけ」のときに、出しておく時間（ミリ秒。1000〜10000）。
+    pub badge_hold_ms: u64,
+    /// 小さな印の不透明度（%。20〜100）。
+    pub badge_opacity: u32,
 }
 
 impl Default for ImeIndicatorSettings {
@@ -247,6 +253,9 @@ impl Default for ImeIndicatorSettings {
             flash: true,
             badge: "caret".to_string(),
             badge_size: crate::ime_logic::DEFAULT_BADGE_SIZE,
+            badge_when: "typing".to_string(),
+            badge_hold_ms: crate::ime_logic::DEFAULT_BADGE_HOLD_MS,
+            badge_opacity: crate::ime_logic::DEFAULT_BADGE_OPACITY,
         }
     }
 }
@@ -493,6 +502,9 @@ pub fn save_from_settings_window(settings: &Settings) -> Result<(), String> {
             "flash": settings.ime_indicator.flash,
             "badge": settings.ime_indicator.badge,
             "badge_size": settings.ime_indicator.badge_size,
+            "badge_when": settings.ime_indicator.badge_when,
+            "badge_hold_ms": settings.ime_indicator.badge_hold_ms,
+            "badge_opacity": settings.ime_indicator.badge_opacity,
         },
         "log": {
             "enabled": settings.log.enabled,
