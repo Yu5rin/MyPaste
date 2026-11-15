@@ -205,7 +205,7 @@ impl Params {
         position: Position::Center,
         theme: Theme::Dark,
         opacity: ime_logic::DEFAULT_OPACITY,
-        hide_in_fullscreen: false,
+        hide_in_fullscreen: true,
         hide_from_capture: true,
         flash: true,
         badge_enabled: false,

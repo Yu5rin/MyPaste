@@ -290,7 +290,7 @@ impl Default for ImeIndicatorSettings {
             position: "center".to_string(),
             theme: "dark".to_string(),
             opacity: crate::ime_logic::DEFAULT_OPACITY,
-            hide_in_fullscreen: false,
+            hide_in_fullscreen: true,
             hide_from_capture: true,
             flash: true,
             badge_enabled: false,
@@ -1413,7 +1413,7 @@ mod tests {
         assert_eq!(s.ime_indicator.position, "center");
         assert_eq!(s.ime_indicator.theme, "dark");
         assert_eq!(s.ime_indicator.opacity, 90);
-        assert!(!s.ime_indicator.hide_in_fullscreen);
+        assert!(s.ime_indicator.hide_in_fullscreen);
         assert!(!s.log.enabled);
         // キー割り当ては空
         assert!(s.hotkeys.is_empty());

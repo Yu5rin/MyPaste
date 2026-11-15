@@ -1268,6 +1268,8 @@ fn register_snippets(texts: &[String]) {
         return;
     }
     log::info!("履歴から定型文に {added} 件を登録しました");
+    // 一覧の「定型文」タブでも、グループごとにまとまって並ぶようにする。
+    crate::snippets::sort_by_group(&mut list, None);
     set_snippets(list);
 }
 

@@ -78,6 +78,8 @@ src/
  ├ clip_history.rs  // クリップボードの履歴の判断ロジック（Win32 非依存）
  ├ clip_store.rs    // クリップボードの履歴の保存（DPAPI で暗号化）
  ├ clip_images.rs   // 画像の履歴の判断ロジック（Win32 非依存）
+ ├ png.rs           // 画像を PNG にする（Win32 非依存）
+ ├ ocr.rs           // 画像の文字を読み取る（Windows の文字認識）
  ├ clip_image_store.rs // 画像の履歴の保存と描画（圧縮して DPAPI で暗号化）
  ├ history_window.rs // クリップボードの履歴と定型文の一覧の画面
  ├ snippets.rs      // 定型文の検証と CSV の読み書き（Win32 非依存）
