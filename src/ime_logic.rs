@@ -269,18 +269,20 @@ pub fn badge_visible(
 /// 小さな印を出すきっかけになった出来事。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BadgeEvents {
-    /// マウスのボタンを押した。
+    /// マウスのボタンを押した（押してから少しの間は、押したことにしておく。[`BADGE_CLICK_PENDING_MS`]）。
     pub click: bool,
+    /// ボタンを押したとき、マウスカーソルが文字入力の形（I の形）だった。
+    pub click_ibeam: bool,
     /// 入力モードが切り替わった。
     pub mode_switched: bool,
-    /// マウスカーソルが、いま文字入力の形（I の形）をしている。
-    pub ibeam: bool,
     /// マウスカーソルが文字入力の形（I の形）に変わった。
     pub ibeam_entered: bool,
     /// 入力位置（キャレット）が分かる。
     pub caret_known: bool,
     /// 入力欄に来た（入力位置が分かるようになった・入力位置のある別の入力欄に移った）。
     pub caret_appeared: bool,
+    /// 打っている最中（最後にキーを打ってから [`BADGE_TYPING_QUIET_MS`] たっていない）。
+    pub typing: bool,
 }
 
 /// キーを打つこと以外の、きっかけとして数えるか。印は「これから文字を打つ場所で、打つ前に
@@ -289,7 +291,8 @@ pub struct BadgeEvents {
 /// - モードを切り替えた: いつも数える。
 /// - クリック: 入力欄をクリックしたときだけ。入力位置が分かるか（「おまかせ」では）マウスカーソルが
 ///   文字入力の形のときに押した場合。ボタンや余白のクリックは数えない。
-/// - 入力欄に来た: 「おまかせ」のとき。
+/// - 入力欄に来た: 「おまかせ」のとき。ただし打っている最中は数えない（Excel のセルのように、
+///   打ち始めると入力位置ができるアプリで、打っている文字の横に出さないように）。
 /// - マウスカーソルが文字入力の形に変わった: 「おまかせ」で `on_ibeam` が真、入力位置が
 ///   分からないときだけ（分かるときは、入力位置の横に出すので要らない）。
 pub fn badge_triggered(when: BadgeWhen, on_ibeam: bool, events: BadgeEvents) -> bool {
@@ -298,11 +301,113 @@ pub fn badge_triggered(when: BadgeWhen, on_ibeam: bool, events: BadgeEvents) -> 
         BadgeWhen::Typing => events.mode_switched || (events.click && events.caret_known),
         BadgeWhen::Auto => {
             events.mode_switched
-                || events.caret_appeared
-                || (events.click && (events.caret_known || events.ibeam))
+                || (events.caret_appeared && !events.typing)
+                || (events.click && (events.caret_known || events.click_ibeam))
                 || (on_ibeam && events.ibeam_entered && !events.caret_known)
         }
     }
+}
+
+/// クリックを、押してからこの時間（ミリ秒）の間は「押した」ことにしておく。入力欄をクリックしても、
+/// 入力位置が分かるようになるのは少しあとなので（押した直後の 1 回の監視では、まだ分からない）。
+pub const BADGE_CLICK_PENDING_MS: u64 = 400;
+
+/// 入力位置が、この回数続けて分からなかったら「入力位置が無くなった」とみなす。1 回だけ
+/// 読み取れなかった（相手が忙しかった など）だけで、入力欄に来直したことにしないように。
+pub const CARET_GONE_POLLS: u8 = 3;
+
+/// 監視 1 回分の、小さな印を出すかどうかに使う様子。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BadgeInput {
+    /// いまの時刻（`GetTickCount` のミリ秒）。
+    pub now: u32,
+    /// 前回から、文字のキーを打った。
+    pub key: bool,
+    /// 前回から、マウスのボタンを押した。
+    pub click: bool,
+    /// マウスカーソルが、いま文字入力の形（I の形）をしている。
+    pub ibeam: bool,
+    /// 読み取った入力モード（読み取れなかったら `None`）。
+    pub mode: Option<ImeMode>,
+    /// フォーカス先のウィンドウ（読み取れなかったら 0）。
+    pub focus: isize,
+    /// 入力位置（キャレット）が分かる。
+    pub caret_known: bool,
+}
+
+/// 小さな印のきっかけを、監視のたびに数えるための状態。
+#[derive(Debug, Default)]
+pub struct BadgeTracker {
+    /// 最後に読み取ったモード（切り替わったことを知るため）。
+    seen: Option<ImeMode>,
+    /// マウスカーソルが文字入力の形だったか（変わった瞬間を知るため）。
+    ibeam: bool,
+    /// 入力位置が分かっていたか・続けて分からなかった回数・分かっていたときの入力先。
+    caret_seen: bool,
+    caret_missing: u8,
+    seen_focus: isize,
+    /// まだきっかけとして数えていないクリック（押した時刻と、そのとき I の形だったか）。
+    click: Option<(u32, bool)>,
+    /// 最後に文字のキーを打った時刻。そのあとにきっかけがあったら `None` に戻す
+    /// （モードを切り替えるキーも打ったキーに数えるので、切り替えたあとに「打っている間」として
+    /// 印を消さないように）。
+    pub key: Option<u32>,
+    /// 最後のきっかけの時刻。そのあとでキーを打ったら `None` に戻す。
+    pub trigger: Option<u32>,
+}
+
+impl BadgeTracker {
+    /// 監視 1 回分の様子を受け取り、キーを打った時刻ときっかけの時刻を更新する。
+    pub fn step(&mut self, when: BadgeWhen, on_ibeam: bool, input: BadgeInput) {
+        let now = input.now;
+        let within = |at: u32, ms: u64| u64::from(now.wrapping_sub(at)) < ms;
+        if input.key {
+            // 打ち始めたら、それまでのきっかけは終わり（入力位置の横の印を消す）。
+            self.key = Some(now);
+            self.trigger = None;
+        }
+        if input.click {
+            self.click = Some((now, input.ibeam));
+        }
+        self.click = self.click.filter(|(at, _)| within(*at, BADGE_CLICK_PENDING_MS));
+
+        let caret_appeared = if input.caret_known {
+            let appeared = !self.caret_seen || input.focus != self.seen_focus;
+            self.caret_seen = true;
+            self.caret_missing = 0;
+            self.seen_focus = input.focus;
+            appeared
+        } else {
+            self.caret_missing = self.caret_missing.saturating_add(1);
+            if self.caret_missing >= CARET_GONE_POLLS {
+                self.caret_seen = false;
+            }
+            false
+        };
+        let events = BadgeEvents {
+            click: self.click.is_some(),
+            click_ibeam: self.click.is_some_and(|(_, ibeam)| ibeam),
+            mode_switched: self.seen.is_some() && input.mode.is_some() && self.seen != input.mode,
+            ibeam_entered: input.ibeam && !self.ibeam,
+            caret_known: input.caret_known,
+            caret_appeared,
+            typing: self.key.is_some_and(|at| within(at, BADGE_TYPING_QUIET_MS)),
+        };
+        self.seen = input.mode;
+        self.ibeam = input.ibeam;
+        if badge_triggered(when, on_ibeam, events) {
+            self.trigger = Some(now);
+            // きっかけより前に打ったキーは、もう「打っている間」に数えない。
+            self.key = None;
+            self.click = None;
+        }
+    }
+}
+
+/// 2 つの四角（`left, top, right, bottom`）が重なるか、接しているか。幅の無い入力位置
+/// （縦線だけのキャレット）も数えるため、端が触れているだけでも重なるとみなす。
+pub fn rects_touch(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
+    a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
 }
 
 /// 小さな印の色（背景, 文字。`0x00BBGGRR`）。日本語を入力するモードは赤、半角英数は青にして、
@@ -793,8 +898,8 @@ mod tests {
         let none = BadgeEvents::default();
         let click = BadgeEvents { click: true, ..none };
         let click_in_input = BadgeEvents { click: true, caret_known: true, ..none };
-        let click_on_text = BadgeEvents { click: true, ibeam: true, ..none };
-        let ibeam = BadgeEvents { ibeam: true, ibeam_entered: true, ..none };
+        let click_on_text = BadgeEvents { click: true, click_ibeam: true, ..none };
+        let ibeam = BadgeEvents { ibeam_entered: true, ..none };
         let ibeam_at_caret = BadgeEvents { caret_known: true, ..ibeam };
         let arrived = BadgeEvents { caret_known: true, caret_appeared: true, ..none };
         let switched = BadgeEvents { mode_switched: true, ..none };
@@ -815,5 +920,135 @@ mod tests {
         assert!(!badge_triggered(Typing, true, click_on_text));
         assert!(!badge_triggered(Typing, true, ibeam));
         assert!(!badge_triggered(Always, true, switched));
+        // 打っている最中に入力位置ができた（Excel のセルで打ち始めた など）ときは数えない。
+        let arrived_while_typing = BadgeEvents { typing: true, ..arrived };
+        assert!(!badge_triggered(Auto, true, arrived_while_typing));
+        assert!(badge_triggered(Auto, true, BadgeEvents { typing: true, ..switched }));
+    }
+
+    /// 入力位置の横に出し続ける「おまかせ」で、監視を 100ms ごとに進めながら、見えているかを返す。
+    fn run(tracker: &mut BadgeTracker, input: BadgeInput) -> bool {
+        tracker.step(BadgeWhen::Auto, true, input);
+        let moment = BadgeMoment {
+            at_caret: input.caret_known,
+            key: tracker.key,
+            trigger: tracker.trigger,
+            now: input.now,
+        };
+        badge_visible(BadgeWhen::Auto, true, moment, 2000)
+    }
+
+    fn at_caret(now: u32, mode: ImeMode) -> BadgeInput {
+        BadgeInput {
+            now,
+            mode: Some(mode),
+            focus: 7,
+            caret_known: true,
+            ..BadgeInput::default()
+        }
+    }
+
+    #[test]
+    fn mode_switch_key_does_not_hide_the_badge_afterwards() {
+        // 半角/全角キーで切り替えた。キーそのものも打ったキーに数えられる。
+        let mut t = BadgeTracker::default();
+        for now in (10_000..20_000).step_by(100) {
+            run(&mut t, at_caret(now, ImeMode::AlnumHalf));
+        }
+        // キーを打ったと分かった監視では、まだモードが変わっていないことがある（その 1 回は消える）。
+        run(&mut t, BadgeInput { key: true, ..at_caret(20_000, ImeMode::AlnumHalf) });
+        // 次の監視でモードが変わったと分かる。それからは消えずに出し続ける。
+        for now in (20_100..30_000).step_by(100) {
+            assert!(run(&mut t, at_caret(now, ImeMode::Hiragana)), "{now}");
+        }
+        // そのあと打ち始めたら、また消す。
+        assert!(!run(&mut t, BadgeInput { key: true, ..at_caret(30_000, ImeMode::Hiragana) }));
+        assert!(!run(&mut t, at_caret(30_100, ImeMode::Hiragana)));
+    }
+
+    #[test]
+    fn clicking_another_field_soon_after_typing_keeps_the_badge() {
+        let mut t = BadgeTracker::default();
+        run(&mut t, at_caret(10_000, ImeMode::Hiragana));
+        assert!(!run(&mut t, BadgeInput { key: true, ..at_caret(10_100, ImeMode::Hiragana) }));
+        // 1 秒後に別の入力欄をクリックした。
+        assert!(run(&mut t, BadgeInput { click: true, focus: 8, ..at_caret(11_100, ImeMode::Hiragana) }));
+        for now in (11_200..20_000).step_by(100) {
+            let input = BadgeInput { focus: 8, ..at_caret(now, ImeMode::Hiragana) };
+            assert!(run(&mut t, input), "{now}");
+        }
+    }
+
+    #[test]
+    fn caret_that_appears_while_typing_is_not_a_trigger() {
+        // Excel のセルで打ち始めると、そこで初めて入力位置ができる。
+        let mut t = BadgeTracker::default();
+        let no_caret = |now| BadgeInput { caret_known: false, ..at_caret(now, ImeMode::Hiragana) };
+        run(&mut t, no_caret(10_000));
+        run(&mut t, BadgeInput { key: true, ..no_caret(10_100) });
+        for now in (10_200..15_000).step_by(100) {
+            assert!(!run(&mut t, at_caret(now, ImeMode::Hiragana)), "{now}");
+        }
+    }
+
+    #[test]
+    fn one_missed_caret_read_is_not_arriving_again() {
+        let mut t = BadgeTracker::default();
+        let missed = |now| BadgeInput { caret_known: false, ..at_caret(now, ImeMode::Hiragana) };
+        run(&mut t, at_caret(10_000, ImeMode::Hiragana));
+        assert_eq!(t.trigger, Some(10_000));
+        // 1 回（2 回）だけ入力位置を読み取れなかった（相手が忙しかった など）。
+        run(&mut t, missed(10_100));
+        run(&mut t, missed(10_200));
+        // 読み取れるようになっても、入力欄に来直したことにはしない。
+        run(&mut t, at_caret(10_300, ImeMode::Hiragana));
+        assert_eq!(t.trigger, Some(10_000));
+        // 3 回続けて分からなければ、入力位置は無くなったとみなし、次に分かったら入力欄に来たとする。
+        for now in [20_000, 20_100, 20_200] {
+            run(&mut t, missed(now));
+        }
+        run(&mut t, at_caret(20_300, ImeMode::Hiragana));
+        assert_eq!(t.trigger, Some(20_300));
+    }
+
+    #[test]
+    fn click_counts_if_the_caret_shows_up_shortly_after() {
+        // 「打ち始めたときだけ」: 入力位置の無い所から、入力欄をクリックした。押した直後の監視では、
+        // まだ入力位置が分からない。
+        let step = |t: &mut BadgeTracker, input| t.step(BadgeWhen::Typing, true, input);
+        let base = |now| BadgeInput { now, mode: Some(ImeMode::Hiragana), focus: 7, ..BadgeInput::default() };
+        let mut t = BadgeTracker::default();
+        step(&mut t, base(10_000));
+        step(&mut t, BadgeInput { click: true, ..base(10_100) });
+        assert_eq!(t.trigger, None);
+        step(&mut t, BadgeInput { caret_known: true, ..base(10_300) });
+        assert_eq!(t.trigger, Some(10_300));
+        // 押してから時間がたってから入力位置が分かっても、数えない。
+        let mut t = BadgeTracker::default();
+        step(&mut t, BadgeInput { click: true, ..base(10_100) });
+        step(&mut t, base(10_200));
+        step(&mut t, BadgeInput { caret_known: true, ..base(10_100 + BADGE_CLICK_PENDING_MS as u32) });
+        assert_eq!(t.trigger, None);
+        // 「おまかせ」: 押したときに文字入力の形なら、すぐ数える。
+        let mut t = BadgeTracker::default();
+        t.step(BadgeWhen::Auto, true, BadgeInput { click: true, ibeam: true, ..base(10_100) });
+        assert_eq!(t.trigger, Some(10_100));
+        // ボタンを押して、そのあとで文字入力の形の上へ動かしただけなら、クリックとしては数えない。
+        let mut t = BadgeTracker::default();
+        t.step(BadgeWhen::Auto, false, BadgeInput { click: true, ..base(10_100) });
+        t.step(BadgeWhen::Auto, false, BadgeInput { ibeam: true, ..base(10_200) });
+        assert_eq!(t.trigger, None);
+    }
+
+    #[test]
+    fn rects_touch_counts_thin_carets() {
+        let window = (100, 100, 500, 400);
+        assert!(rects_touch((200, 200, 201, 220), window));
+        // 幅の無いキャレット
+        assert!(rects_touch((200, 200, 200, 220), window));
+        // 窓の外（上へ流れて見えなくなった）
+        assert!(!rects_touch((200, 40, 201, 60), window));
+        assert!(!rects_touch((600, 200, 601, 220), window));
+        assert!(!rects_touch((-50, 200, -49, 220), window));
     }
 }

@@ -30,7 +30,7 @@
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -47,7 +47,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{IAccessible, ObjectFromLresult};
-use windows::Win32::System::SystemInformation::GetTickCount;
+use windows::Win32::System::SystemInformation::{GetTickCount, OSVERSIONINFOW};
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
@@ -59,7 +59,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorInfo, GetCursorPos,
     SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
     LoadCursorW, CURSORINFO, IDC_IBEAM,
-    GetForegroundWindow, GetGUIThreadInfo, GetMessageW, GetWindowThreadProcessId, KillTimer,
+    GetForegroundWindow, GetGUIThreadInfo, GetMessageW, GetWindowRect, GetWindowThreadProcessId,
+    KillTimer,
     PostMessageW, PostThreadMessageW, RegisterClassW, SendMessageTimeoutW,
     SetLayeredWindowAttributes, SetTimer, SetWindowPos, ShowWindow, TranslateMessage,
     GUITHREADINFO, OBJID_CARET, WM_GETOBJECT, HTTRANSPARENT, HWND_TOPMOST, LWA_ALPHA, MA_NOACTIVATE, MSG, SMTO_ABORTIFHUNG,
@@ -70,7 +71,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::config::ImeIndicatorSettings;
 use crate::ime_logic::{
-    self, Badge, BadgeEvents, BadgeMoment, BadgeWhen, ImeMode, ModeTracker, Position, ReadabilityLog, Theme};
+    self, Badge, BadgeInput, BadgeMoment, BadgeTracker, BadgeWhen, ImeMode, ModeTracker, Position,
+    ReadabilityLog, Theme,
+};
 
 /// IME の状態を調べる間隔（ミリ秒）。
 const POLL_INTERVAL_MS: u32 = 100;
@@ -96,6 +99,8 @@ const TIMER_ANIM: usize = 2;
 const TIMER_BADGE: usize = 3;
 /// アクセシビリティの情報を問い合わせるときに待つ時間（ミリ秒）。
 const ACC_QUERY_TIMEOUT_MS: u32 = 100;
+/// 専用のスレッドで調べた入力位置を、この時間（ミリ秒）より新しいときだけ使う。
+const ACC_RESULT_FRESH_MS: u32 = 400;
 /// 小さな印をマウスに付いて動かすときの、位置を直す間隔（ミリ秒）。
 const BADGE_FOLLOW_INTERVAL_MS: u32 = 30;
 /// 小さな印の不透明度（0〜255）。
@@ -397,18 +402,8 @@ struct BadgeState {
     follows_mouse: bool,
     /// 作成済みのフォントと、その文字の高さ。
     font: Option<(HFONT, i32)>,
-    /// 最後に読み取ったモード（切り替わったことを知るため。読み取れなかったら `None`）。
-    seen: Option<ImeMode>,
-    /// マウスカーソルが文字入力の形（I の形）だったか（変わった瞬間を知るため）。
-    ibeam: bool,
-    /// 入力位置が分かっていたか・そのときの入力先（入力欄に来たことを知るため）。
-    caret_seen: bool,
-    seen_focus: isize,
-    /// 最後に文字のキーを打った時刻。
-    key: Option<u32>,
-    /// 最後のきっかけ（入力欄に来た・クリックした・モードが切り替わった など）の時刻。
-    /// そのあとでキーを打ったら `None` に戻す。
-    trigger: Option<u32>,
+    /// きっかけ（入力欄に来た・クリックした・モードが切り替わった など）と、キーを打った時刻。
+    tracker: BadgeTracker,
     /// いまの不透明度（0〜255。変わったときだけ当て直す）。
     alpha: u8,
 }
@@ -442,7 +437,8 @@ thread_local! {
 
 fn thread_main(ready: mpsc::Sender<u32>) {
     unsafe {
-        // 入力位置をアクセシビリティの情報から調べるのに COM を使う（このスレッドは終了まで動く）。
+        // 念のため COM を初期化しておく（このスレッドは終了まで動く。入力位置をアクセシビリティの
+        // 情報から調べるのは、専用のスレッドで行う）。
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let Some(hwnd) = create_window() else {
             let _ = ready.send(0);
@@ -464,12 +460,7 @@ fn thread_main(ready: mpsc::Sender<u32>) {
                     size: 0,
                     follows_mouse: false,
                     font: None,
-                    seen: None,
-                    ibeam: false,
-                    caret_seen: false,
-                    seen_focus: 0,
-                    key: None,
-                    trigger: None,
+                    tracker: BadgeTracker::default(),
                     alpha: 0,
                 },
                 capture_hidden: None,
@@ -583,9 +574,32 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
     }
 }
 
+/// 写さない指定（`WDA_EXCLUDEFROMCAPTURE`）が使える Windows のビルド番号（Windows 10 バージョン 2004）。
+const BUILD_EXCLUDE_FROM_CAPTURE: u32 = 19041;
+
+#[link(name = "ntdll")]
+extern "system" {
+    /// Windows の本当のバージョンを返す（`GetVersionExW` と違い、マニフェストに左右されない）。
+    fn RtlGetVersion(info: *mut OSVERSIONINFOW) -> i32;
+}
+
+/// Windows のビルド番号。取れなければ 0。
+fn windows_build() -> u32 {
+    let mut info = OSVERSIONINFOW {
+        dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+        ..Default::default()
+    };
+    // 0 は STATUS_SUCCESS。
+    if unsafe { RtlGetVersion(&mut info) } == 0 {
+        info.dwBuildNumber
+    } else {
+        0
+    }
+}
+
 /// 表示のウィンドウを、スクリーンショットや画面共有に写すかどうかを、設定に合わせる
-/// （変わったときだけ）。写さない指定は Windows 10 バージョン 2004 以降で使える。それより前では
-/// 使えないので、そのまま写る。
+/// （変わったときだけ）。写さない指定は Windows 10 バージョン 2004（ビルド 19041）以降で使える。
+/// それより前では、写さない代わりに黒い四角が写ってしまうので指定せず、そのまま写す。
 unsafe fn apply_capture_setting() {
     let hide = current_params().hide_from_capture;
     let windows = STATE.with(|s| {
@@ -600,7 +614,11 @@ unsafe fn apply_capture_setting() {
     let Some(windows) = windows else {
         return;
     };
-    let affinity = if hide { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
+    let affinity = if hide && windows_build() >= BUILD_EXCLUDE_FROM_CAPTURE {
+        WDA_EXCLUDEFROMCAPTURE
+    } else {
+        WDA_NONE
+    };
     for window in windows {
         if !window.is_invalid() {
             if let Err(e) = SetWindowDisplayAffinity(window, affinity) {
@@ -614,7 +632,11 @@ unsafe fn apply_capture_setting() {
 unsafe fn on_poll() {
     apply_capture_setting();
     let enabled = is_enabled();
-    let observed = if enabled { query_foreground_ime() } else { None };
+    let observed = if enabled {
+        query_foreground_ime(needs_accessible_caret(&current_params()))
+    } else {
+        None
+    };
 
     let to_show = STATE.with(|s| {
         let mut s = s.borrow_mut();
@@ -738,29 +760,17 @@ unsafe fn update_badge(observed: Option<&Observed>) {
     let times = STATE.with(|s| {
         let mut s = s.borrow_mut();
         let badge = &mut s.as_mut()?.badge;
-        let mode = observed.map(|o| o.mode);
-        let focus = observed.map_or(0, |o| o.focus.0 as isize);
-        let events = BadgeEvents {
+        let input = BadgeInput {
+            now,
+            key,
             click,
-            mode_switched: badge.seen.is_some() && mode.is_some() && badge.seen != mode,
             ibeam,
-            ibeam_entered: ibeam && !badge.ibeam,
+            mode: observed.map(|o| o.mode),
+            focus: observed.map_or(0, |o| o.focus.0 as isize),
             caret_known,
-            caret_appeared: caret_known && (!badge.caret_seen || focus != badge.seen_focus),
         };
-        badge.seen = mode;
-        badge.ibeam = ibeam;
-        badge.caret_seen = caret_known;
-        badge.seen_focus = focus;
-        if key {
-            // 打ち始めたら、それまでのきっかけは終わり（入力位置の横の印を消す）。
-            badge.key = Some(now);
-            badge.trigger = None;
-        }
-        if ime_logic::badge_triggered(params.badge_when, params.badge_on_ibeam, events) {
-            badge.trigger = Some(now);
-        }
-        Some((badge.key, badge.trigger))
+        badge.tracker.step(params.badge_when, params.badge_on_ibeam, input);
+        Some((badge.tracker.key, badge.tracker.trigger))
     });
     let (key, trigger) = times.unwrap_or((None, None));
     let moment = BadgeMoment {
@@ -984,8 +994,20 @@ unsafe fn is_fullscreen_app_running() -> bool {
     )
 }
 
-/// 前面ウィンドウのフォーカス先の IME 状態を調べる。取れなければ `None`。
-unsafe fn query_foreground_ime() -> Option<Observed> {
+/// アクセシビリティの情報から入力位置を調べる必要があるか。入力位置を使う設定のときだけ調べる
+/// （ブラウザーなどへ、別のプロセスへの問い合わせを 100ms ごとに送らないように）。
+///
+/// 「打ち始めたときだけ」では、入力欄をクリックしたかを入力位置で見分けるので、マウスの横に
+/// 出すときも調べる。
+fn needs_accessible_caret(params: &Params) -> bool {
+    (params.flash && params.position == Position::Caret)
+        || (params.badge_enabled
+            && (params.badge == Badge::Caret || params.badge_when == BadgeWhen::Typing))
+}
+
+/// 前面ウィンドウのフォーカス先の IME 状態を調べる。取れなければ `None`。`accessible` が真なら、
+/// Windows のキャレットを使わないアプリの入力位置も、アクセシビリティの情報から調べる。
+unsafe fn query_foreground_ime(accessible: bool) -> Option<Observed> {
     let foreground = GetForegroundWindow();
     if foreground.is_invalid() {
         return None;
@@ -1017,7 +1039,6 @@ unsafe fn query_foreground_ime() -> Option<Observed> {
     } else {
         foreground
     };
-    let caret = if have_info { caret_rect(&info) } else { None };
 
     let ime_window = ImmGetDefaultIMEWnd(focus);
     if ime_window.is_invalid() {
@@ -1026,6 +1047,15 @@ unsafe fn query_foreground_ime() -> Option<Observed> {
 
     let open = send_ime_control(ime_window, IMC_GETOPENSTATUS)?;
     let conversion = send_ime_control(ime_window, IMC_GETCONVERSIONMODE)?;
+    // 入力位置は、IME の状態を読み取れてから調べる。アクセシビリティの情報は、専用のスレッドで
+    // 調べたものを使う（相手が固まっても、この監視を止めないように）。
+    let caret = if have_info {
+        system_caret_rect(&info)
+            .or_else(|| if accessible { cached_accessible_caret(info.hwndFocus) } else { None })
+            .filter(|rc| caret_in_window(rc, focus))
+    } else {
+        None
+    };
     Some(Observed {
         focus,
         mode: ime_logic::mode_from_status(open != 0, conversion as u32),
@@ -1038,8 +1068,95 @@ unsafe fn query_foreground_ime() -> Option<Observed> {
 /// まず Windows のキャレットを見る。それを使わないアプリ（ブラウザーや、その仕組みで作られた
 /// アプリ）は、アクセシビリティの情報として入力位置を知らせていることが多いので、そちらも見る。
 /// どちらも、入力欄に入力位置があるときだけ取れる（ボタンや本文を選んでいるときは取れない）。
+/// その場で問い合わせるので、呼び出すスレッドは COM を初期化しておくこと（入力モードの監視は
+/// これを使わず、専用のスレッドで調べた結果を使う）。
 pub(crate) unsafe fn caret_rect(info: &GUITHREADINFO) -> Option<RECT> {
     system_caret_rect(info).or_else(|| accessible_caret_rect(info.hwndFocus))
+}
+
+/// 入力位置が、フォーカス先のウィンドウの中にあるか。外にあるとき（入力欄が流れて見えなく
+/// なったなど）は、入力位置が分からないことにする（ウィンドウや画面の端に印を出さないように）。
+/// ウィンドウの位置が取れなければ、中にあることにする。
+unsafe fn caret_in_window(caret: &RECT, focus: HWND) -> bool {
+    let mut window = RECT::default();
+    if GetWindowRect(focus, &mut window).is_err() {
+        return true;
+    }
+    ime_logic::rects_touch(
+        (caret.left, caret.top, caret.right, caret.bottom),
+        (window.left, window.top, window.right, window.bottom),
+    )
+}
+
+/// 入力位置をアクセシビリティの情報から調べる、専用のスレッドとのやり取り。
+///
+/// アクセシビリティの問い合わせ（`WM_GETOBJECT` のあとの `get_accState`・`accLocation`）は
+/// 時間を区切れないので、相手のアプリが固まると、問い合わせたスレッドも止まる。そこで監視の
+/// スレッドでは調べず、専用のスレッドに頼んで、出た結果を次の監視で使う。専用のスレッドは
+/// 終了を待たない（止まっていても、アプリの終了を妨げない）。
+struct AccCaret {
+    /// 調べてほしいフォーカス先（最新の 1 つだけ。0 は無し）。
+    request: isize,
+    /// 最後に調べた結果（フォーカス先・入力位置・調べ終えた時刻）。
+    result: Option<(isize, Option<RECT>, u32)>,
+    /// 専用のスレッドを作ったか。
+    started: bool,
+}
+
+static ACC_CARET: Mutex<AccCaret> = Mutex::new(AccCaret {
+    request: 0,
+    result: None,
+    started: false,
+});
+/// 専用のスレッドに、新しい頼みが来たことを知らせる。
+static ACC_CARET_WAKE: Condvar = Condvar::new();
+
+/// `focus` の入力位置を、専用のスレッドで調べた結果から返す。同じフォーカス先の新しい結果が
+/// 無ければ `None`（いまは分からないことにする）。あわせて、次の結果を頼んでおく。
+fn cached_accessible_caret(focus: HWND) -> Option<RECT> {
+    if focus.is_invalid() {
+        return None;
+    }
+    let focus = focus.0 as isize;
+    let now = unsafe { GetTickCount() };
+    let mut acc = ACC_CARET.lock().unwrap_or_else(|p| p.into_inner());
+    if !acc.started {
+        acc.started = true;
+        let spawned = std::thread::Builder::new()
+            .name("accessible-caret".into())
+            .spawn(accessible_caret_thread);
+        if let Err(e) = spawned {
+            log::warn!("入力位置を調べるスレッドを開始できませんでした: {e}");
+        }
+    }
+    acc.request = focus;
+    ACC_CARET_WAKE.notify_one();
+    match acc.result {
+        Some((window, rect, at)) if window == focus && now.wrapping_sub(at) < ACC_RESULT_FRESH_MS => {
+            rect
+        }
+        _ => None,
+    }
+}
+
+/// 入力位置を調べる専用のスレッド。頼まれたフォーカス先を調べ、結果を置く（終了まで動く）。
+fn accessible_caret_thread() {
+    unsafe {
+        // アクセシビリティの情報を受け取るのに COM を使う。
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+    loop {
+        let focus = {
+            let mut acc = ACC_CARET.lock().unwrap_or_else(|p| p.into_inner());
+            while acc.request == 0 {
+                acc = ACC_CARET_WAKE.wait(acc).unwrap_or_else(|p| p.into_inner());
+            }
+            std::mem::take(&mut acc.request)
+        };
+        let rect = unsafe { accessible_caret_rect(HWND(focus as *mut core::ffi::c_void)) };
+        let at = unsafe { GetTickCount() };
+        ACC_CARET.lock().unwrap_or_else(|p| p.into_inner()).result = Some((focus, rect, at));
+    }
 }
 
 /// アクセシビリティの情報（`OBJID_CARET`）から、入力位置を画面座標で返す。

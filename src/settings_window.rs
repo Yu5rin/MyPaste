@@ -32,9 +32,10 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HFONT};
 use windows::Win32::UI::Controls::NMHDR;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    IsWindow,
+    GetDlgItem, IsWindow,
     DefWindowProcW, DestroyWindow, PostQuitMessage, SetForegroundWindow, ShowWindow, WM_CLOSE,
     WM_NOTIFY,
     MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, SW_SHOW, SW_SHOWNORMAL, WM_COMMAND,
@@ -42,7 +43,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::clip_history::{self, MenuPosition, Theme as HistoryTheme, Trigger};
-use crate::config::{self, ClipboardHistorySettings, Settings};
+use crate::config::{self, ClipboardHistorySettings, ImeIndicatorSettings, Settings};
 use crate::hotkey_rules;
 use crate::ime_indicator::{Params, Timing};
 use crate::ime_logic::{
@@ -760,21 +761,50 @@ unsafe fn read_form(hwnd: HWND) -> Result<Form, (i32, String)> {
     })
 }
 
+/// 欄が使える（灰色になっていない）か。
+unsafe fn field_enabled(hwnd: HWND, id: i32) -> bool {
+    GetDlgItem(hwnd, id).is_ok_and(|control| IsWindowEnabled(control).as_bool())
+}
+
+/// 欄の値を読む。使えない（灰色の）欄は、誤りがあっても止めず、保存してある値 `saved` を使う
+/// （使えない欄へは移れないので、直しようがない）。
+unsafe fn read_field<T>(
+    hwnd: HWND,
+    id: i32,
+    saved: T,
+    read: impl FnOnce() -> Result<T, (i32, String)>,
+) -> Result<T, (i32, String)> {
+    if field_enabled(hwnd, id) {
+        read()
+    } else {
+        Ok(read().unwrap_or(saved))
+    }
+}
+
 /// 入力モード表示の出し方（位置・色・時間・大きさ・不透明度・全画面）を読む。
 unsafe fn read_ime_params(hwnd: HWND) -> Result<Params, (i32, String)> {
-    let timing = read_timing(hwnd)?;
-    let size = read_size(hwnd)?;
-    let opacity = parse_in_range(
-        &get_text(hwnd, ID_OPACITY),
-        u64::from(OPACITY_MIN),
-        u64::from(OPACITY_MAX),
-    )
-    .ok_or_else(|| {
-        (
-            ID_OPACITY,
-            format!("不透明度は {OPACITY_MIN}〜{OPACITY_MAX} の数で入力してください。"),
+    let saved = CONTEXT.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|context| context.settings.ime_indicator.clone())
+            .unwrap_or_default()
+    });
+    let timing = read_timing(hwnd, &saved)?;
+    let size = read_field(hwnd, ID_SIZE, saved.size, || read_size(hwnd))?;
+    let opacity = read_field(hwnd, ID_OPACITY, saved.opacity, || {
+        parse_in_range(
+            &get_text(hwnd, ID_OPACITY),
+            u64::from(OPACITY_MIN),
+            u64::from(OPACITY_MAX),
         )
-    })? as u32;
+        .map(|v| v as u32)
+        .ok_or_else(|| {
+            (
+                ID_OPACITY,
+                format!("不透明度は {OPACITY_MIN}〜{OPACITY_MAX} の数で入力してください。"),
+            )
+        })
+    })?;
     let position = combo_index(hwnd, ID_POSITION)
         .and_then(|i| Position::ALL.get(i))
         .map(|(p, _, _)| *p)
@@ -783,24 +813,13 @@ unsafe fn read_ime_params(hwnd: HWND) -> Result<Params, (i32, String)> {
         .and_then(|i| Theme::ALL.get(i))
         .map(|(t, _, _)| *t)
         .unwrap_or(Theme::Dark);
-    Ok(Params {
-        timing,
-        size,
-        position,
-        theme,
-        opacity,
-        hide_in_fullscreen: is_checked(hwnd, ID_FULLSCREEN),
-        hide_from_capture: is_checked(hwnd, ID_NO_CAPTURE),
-        flash: is_checked(hwnd, ID_FLASH),
-        badge_enabled: is_checked(hwnd, ID_BADGE_ENABLED),
-        badge: combo_index(hwnd, ID_BADGE)
-            .and_then(|i| BADGE_PLACES.get(i))
-            .map_or(Badge::Caret, |(b, _)| *b),
-        badge_size: parse_in_range(
+    let badge_size = read_field(hwnd, ID_BADGE_SIZE, saved.badge_size, || {
+        parse_in_range(
             &get_text(hwnd, ID_BADGE_SIZE),
             u64::from(ime_logic::BADGE_SIZE_MIN),
             u64::from(ime_logic::BADGE_SIZE_MAX),
         )
+        .map(|v| v as u32)
         .ok_or_else(|| {
             (
                 ID_BADGE_SIZE,
@@ -810,13 +829,10 @@ unsafe fn read_ime_params(hwnd: HWND) -> Result<Params, (i32, String)> {
                     ime_logic::BADGE_SIZE_MAX
                 ),
             )
-        })? as u32,
-        badge_when: combo_index(hwnd, ID_BADGE_WHEN)
-            .and_then(|i| BadgeWhen::ALL.get(i))
-            .map_or(BadgeWhen::Auto, |(w, _, _)| *w),
-        badge_on_ibeam: is_checked(hwnd, ID_BADGE_IBEAM),
-        badge_keep_at_caret: is_checked(hwnd, ID_BADGE_KEEP),
-        badge_hold_ms: ime_logic::parse_seconds(
+        })
+    })?;
+    let badge_hold_ms = read_field(hwnd, ID_BADGE_HOLD, saved.badge_hold_ms, || {
+        ime_logic::parse_seconds(
             &get_text(hwnd, ID_BADGE_HOLD),
             ime_logic::BADGE_HOLD_MS_MIN,
             ime_logic::BADGE_HOLD_MS_MAX,
@@ -830,12 +846,15 @@ unsafe fn read_ime_params(hwnd: HWND) -> Result<Params, (i32, String)> {
                     ime_logic::format_seconds(ime_logic::BADGE_HOLD_MS_MAX)
                 ),
             )
-        })?,
-        badge_opacity: parse_in_range(
+        })
+    })?;
+    let badge_opacity = read_field(hwnd, ID_BADGE_OPACITY, saved.badge_opacity, || {
+        parse_in_range(
             &get_text(hwnd, ID_BADGE_OPACITY),
             u64::from(ime_logic::BADGE_OPACITY_MIN),
             u64::from(ime_logic::BADGE_OPACITY_MAX),
         )
+        .map(|v| v as u32)
         .ok_or_else(|| {
             (
                 ID_BADGE_OPACITY,
@@ -845,34 +864,62 @@ unsafe fn read_ime_params(hwnd: HWND) -> Result<Params, (i32, String)> {
                     ime_logic::BADGE_OPACITY_MAX
                 ),
             )
-        })? as u32,
+        })
+    })?;
+    Ok(Params {
+        timing,
+        size,
+        position,
+        theme,
+        opacity,
+        hide_in_fullscreen: is_checked(hwnd, ID_FULLSCREEN),
+        hide_from_capture: is_checked(hwnd, ID_NO_CAPTURE),
+        flash: is_checked(hwnd, ID_FLASH),
+        badge_enabled: is_checked(hwnd, ID_BADGE_ENABLED),
+        badge: combo_index(hwnd, ID_BADGE)
+            .and_then(|i| BADGE_PLACES.get(i))
+            .map_or(Badge::Caret, |(b, _)| *b),
+        badge_size,
+        badge_when: combo_index(hwnd, ID_BADGE_WHEN)
+            .and_then(|i| BadgeWhen::ALL.get(i))
+            .map_or(BadgeWhen::Auto, |(w, _, _)| *w),
+        badge_on_ibeam: is_checked(hwnd, ID_BADGE_IBEAM),
+        badge_keep_at_caret: is_checked(hwnd, ID_BADGE_KEEP),
+        badge_hold_ms,
+        badge_opacity,
     })
 }
 
-/// 表示時間とフェードアウトの時間（秒で入力）を読む。
-unsafe fn read_timing(hwnd: HWND) -> Result<Timing, (i32, String)> {
-    let hold_ms = ime_logic::parse_seconds(&get_text(hwnd, ID_HOLD), HOLD_MS_MIN, HOLD_MS_MAX)
-        .ok_or_else(|| {
-            (
-                ID_HOLD,
-                format!(
-                    "表示時間は {}〜{} 秒の数で入力してください（例: 0.4、1.5）。",
-                    ime_logic::format_seconds(HOLD_MS_MIN),
-                    ime_logic::format_seconds(HOLD_MS_MAX)
-                ),
-            )
-        })?;
-    let fade_ms = ime_logic::parse_seconds(&get_text(hwnd, ID_FADE), FADE_MS_MIN, FADE_MS_MAX)
-        .ok_or_else(|| {
-            (
-                ID_FADE,
-                format!(
-                    "フェードアウトは {}〜{} 秒の数で入力してください（例: 0.25）。",
-                    ime_logic::format_seconds(FADE_MS_MIN),
-                    ime_logic::format_seconds(FADE_MS_MAX)
-                ),
-            )
-        })?;
+/// 表示時間とフェードアウトの時間（秒で入力）を読む。使えない欄は、保存してある値を使う。
+unsafe fn read_timing(hwnd: HWND, saved: &ImeIndicatorSettings) -> Result<Timing, (i32, String)> {
+    let hold_ms = read_field(hwnd, ID_HOLD, saved.hold_ms, || {
+        ime_logic::parse_seconds(&get_text(hwnd, ID_HOLD), HOLD_MS_MIN, HOLD_MS_MAX).ok_or_else(
+            || {
+                (
+                    ID_HOLD,
+                    format!(
+                        "表示時間は {}〜{} 秒の数で入力してください（例: 0.4、1.5）。",
+                        ime_logic::format_seconds(HOLD_MS_MIN),
+                        ime_logic::format_seconds(HOLD_MS_MAX)
+                    ),
+                )
+            },
+        )
+    })?;
+    let fade_ms = read_field(hwnd, ID_FADE, saved.fade_ms, || {
+        ime_logic::parse_seconds(&get_text(hwnd, ID_FADE), FADE_MS_MIN, FADE_MS_MAX).ok_or_else(
+            || {
+                (
+                    ID_FADE,
+                    format!(
+                        "フェードアウトは {}〜{} 秒の数で入力してください（例: 0.25）。",
+                        ime_logic::format_seconds(FADE_MS_MIN),
+                        ime_logic::format_seconds(FADE_MS_MAX)
+                    ),
+                )
+            },
+        )
+    })?;
     Ok(Timing { hold_ms, fade_ms })
 }
 
@@ -1062,8 +1109,23 @@ unsafe fn on_save(hwnd: HWND, close: bool) {
     } else {
         form.history.enabled
     };
+    // 一覧の不透明度（Shift+ホイール）と「出したまま」（K キー・見出し）は、この画面を開いている
+    // 間に一覧で変えられていることがある。この画面で変えていなければ、いま保存されている値を残す。
+    let opened = clip_history::Config::from_settings(&settings.clipboard_history);
+    let history_opacity = if form.history.opacity == opened.opacity {
+        saved_now.clipboard_history.opacity
+    } else {
+        form.history.opacity
+    };
+    let history_keep_open = if form.history.keep_open == opened.keep_open {
+        saved_now.clipboard_history.keep_open
+    } else {
+        form.history.keep_open
+    };
     settings.clipboard_history = form.history;
     settings.clipboard_history.enabled = history_enabled;
+    settings.clipboard_history.opacity = history_opacity;
+    settings.clipboard_history.keep_open = history_keep_open;
 
     if let Err(e) = config::save_from_settings_window(&settings) {
         log::error!("設定の保存に失敗: {e}");
@@ -1087,6 +1149,15 @@ unsafe fn on_save(hwnd: HWND, close: bool) {
 
     let _ = tx.send(TrayMessage::SettingsSaved(Box::new(settings.clone())));
     log::info!("設定を保存しました");
+    // 画面と違う値を残した欄（トレイメニューや一覧で変えられていたもの）は、保存した値に合わせて
+    // おく。合わせないと、もう一度「適用」したときに、画面で変えたものとして書き戻してしまう。
+    set_checked(hwnd, ID_IME_ENABLED, settings.ime_indicator.enabled);
+    update_ime_fields(hwnd);
+    let history = clip_history::Config::from_settings(&settings.clipboard_history);
+    set_checked(hwnd, ID_CH_ENABLED, history.enabled);
+    set_text(hwnd, ID_CH_OPACITY, &history.opacity.to_string());
+    set_checked(hwnd, ID_CH_KEEP_OPEN, history.keep_open);
+    update_history_fields(hwnd);
     // 「適用」のあとも続けて編集できるよう、保存した内容を今の状態として覚える。
     CONTEXT.with(|c| {
         if let Some(context) = c.borrow_mut().as_mut() {
