@@ -371,8 +371,12 @@ pub fn is_open() -> bool {
 /// アプリが Ctrl の「離した」を送っているので、Windows に聞いても分からない）。
 pub fn begin_session(ctrl_held: bool) {
     keys().prune(unsafe { GetTickCount() });
-    let ctrl_down = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0;
-    CTRL_HELD.store(ctrl_down || ctrl_held, Ordering::SeqCst);
+    // Ctrl を押しているかは、キーボードフックがいつも覚えている。ここで Windows に聞き直すと、
+    // 2 回押しの 2 回目を離した知らせの途中（まだ「押している」と返る）に当たって、押したままと
+    // 取り違えることがある。一覧を出したキーの Ctrl を押し続けているときだけ、ここで足す。
+    if ctrl_held {
+        CTRL_HELD.store(true, Ordering::SeqCst);
+    }
     CLOSE_REQUESTED.store(false, Ordering::SeqCst);
     REOPENING.store(false, Ordering::SeqCst);
     OPEN.store(true, Ordering::SeqCst);
