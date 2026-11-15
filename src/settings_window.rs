@@ -125,6 +125,7 @@ const ID_BADGE_HOLD: i32 = 186;
 const ID_BADGE_OPACITY: i32 = 187;
 const ID_BADGE_IBEAM: i32 = 188;
 const ID_BADGE_ENABLED: i32 = 189;
+const ID_BADGE_KEEP: i32 = 190;
 
 /// 画面の中身の大きさ（96 DPI 基準）。ノート PC（1366x768、表示 125%）でも収まる大きさにする。
 const CLIENT_W: i32 = 500;
@@ -221,7 +222,8 @@ const PAGE_IME: &[Item] = &[
     item(237, Kind::Label, "不透明度", 366, 348, 56, 24),
     item(ID_BADGE_OPACITY, Kind::NumberEdit, "", 424, 348, 34, 24),
     item(238, Kind::Label, "%", 462, 348, 16, 24),
-    item(ID_BADGE_IBEAM, Kind::Check, "マウスカーソルが文字入力の形（I）になったら出す（おまかせのとき）", 24, 374, 452, 22),
+    item(ID_BADGE_KEEP, Kind::Check, "入力位置では出し続ける", 24, 374, 170, 22),
+    item(ID_BADGE_IBEAM, Kind::Check, "マウスが文字入力の形（I）になったら出す", 200, 374, 280, 22),
     item(ID_FULLSCREEN, Kind::Check, "全画面のアプリ（ゲーム・動画・発表など）では表示しない", 16, 404, 468, 22),
 ];
 
@@ -452,6 +454,7 @@ unsafe fn fill_form(hwnd: HWND, form: &Form) {
     set_text(hwnd, ID_BADGE_HOLD, &ime_logic::format_seconds(ime.badge_hold_ms));
     set_text(hwnd, ID_BADGE_OPACITY, &ime.badge_opacity.to_string());
     set_checked(hwnd, ID_BADGE_IBEAM, ime.badge_on_ibeam);
+    set_checked(hwnd, ID_BADGE_KEEP, ime.badge_keep_at_caret);
     set_checked(hwnd, ID_STARTUP, form.startup);
     set_checked(hwnd, ID_UPDATE, form.check_update);
     set_checked(hwnd, ID_UPDATE_PERIODIC, form.update_every_hours > 0);
@@ -488,6 +491,7 @@ unsafe fn update_ime_fields(hwnd: HWND) {
         .map_or(BadgeWhen::Auto, |(w, _, _)| *w);
     ui::set_enabled(hwnd, ID_BADGE_HOLD, on && when != BadgeWhen::Always);
     ui::set_enabled(hwnd, ID_BADGE_IBEAM, on && when == BadgeWhen::Auto);
+    ui::set_enabled(hwnd, ID_BADGE_KEEP, on && when == BadgeWhen::Auto);
 }
 
 /// 今の欄の中身を「保存済みの状態」として覚える。
@@ -807,6 +811,7 @@ unsafe fn read_ime_params(hwnd: HWND) -> Result<Params, (i32, String)> {
             .and_then(|i| BadgeWhen::ALL.get(i))
             .map_or(BadgeWhen::Auto, |(w, _, _)| *w),
         badge_on_ibeam: is_checked(hwnd, ID_BADGE_IBEAM),
+        badge_keep_at_caret: is_checked(hwnd, ID_BADGE_KEEP),
         badge_hold_ms: ime_logic::parse_seconds(
             &get_text(hwnd, ID_BADGE_HOLD),
             ime_logic::BADGE_HOLD_MS_MIN,
@@ -1042,6 +1047,7 @@ unsafe fn on_save(hwnd: HWND, close: bool) {
     settings.ime_indicator.badge_hold_ms = ime.badge_hold_ms;
     settings.ime_indicator.badge_opacity = ime.badge_opacity;
     settings.ime_indicator.badge_on_ibeam = ime.badge_on_ibeam;
+    settings.ime_indicator.badge_keep_at_caret = ime.badge_keep_at_caret;
     settings.log.enabled = form.log;
     settings.update.check_on_startup = form.check_update;
     settings.update.check_every_hours = form.update_every_hours;

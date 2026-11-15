@@ -241,6 +241,8 @@ pub struct ImeIndicatorSettings {
     pub badge_opacity: u32,
     /// 「おまかせ」のとき、マウスカーソルが文字入力の形（I の形）になったら小さな印を出すか。
     pub badge_on_ibeam: bool,
+    /// 「おまかせ」のとき、入力位置の横では出し続けるか（打っている間は消す）。
+    pub badge_keep_at_caret: bool,
 }
 
 impl Default for ImeIndicatorSettings {
@@ -262,6 +264,7 @@ impl Default for ImeIndicatorSettings {
             badge_hold_ms: crate::ime_logic::DEFAULT_BADGE_HOLD_MS,
             badge_opacity: crate::ime_logic::DEFAULT_BADGE_OPACITY,
             badge_on_ibeam: true,
+            badge_keep_at_caret: true,
         }
     }
 }
@@ -513,6 +516,7 @@ pub fn save_from_settings_window(settings: &Settings) -> Result<(), String> {
             "badge_hold_ms": settings.ime_indicator.badge_hold_ms,
             "badge_opacity": settings.ime_indicator.badge_opacity,
             "badge_on_ibeam": settings.ime_indicator.badge_on_ibeam,
+            "badge_keep_at_caret": settings.ime_indicator.badge_keep_at_caret,
         },
         "log": {
             "enabled": settings.log.enabled,

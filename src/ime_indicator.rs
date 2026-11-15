@@ -68,7 +68,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::ImeIndicatorSettings;
-use crate::ime_logic::{self, Badge, BadgeEvents, BadgeWhen, ImeMode, ModeTracker, Position, ReadabilityLog, Theme};
+use crate::ime_logic::{
+    self, Badge, BadgeEvents, BadgeMoment, BadgeWhen, ImeMode, ModeTracker, Position, ReadabilityLog, Theme};
 
 /// IME の状態を調べる間隔（ミリ秒）。
 const POLL_INTERVAL_MS: u32 = 100;
@@ -154,6 +155,8 @@ pub struct Params {
     pub badge_opacity: u32,
     /// 「おまかせ」のとき、マウスカーソルが文字入力の形になったら小さな印を出す。
     pub badge_on_ibeam: bool,
+    /// 「おまかせ」のとき、入力位置の横では出し続ける（打っている間は消す）。
+    pub badge_keep_at_caret: bool,
 }
 
 /// キーを打った・マウスのボタンを押した時刻（`GetTickCount`。0 は「まだ見ていないものは無い」）。
@@ -190,6 +193,7 @@ impl Params {
         badge_hold_ms: ime_logic::DEFAULT_BADGE_HOLD_MS,
         badge_opacity: ime_logic::DEFAULT_BADGE_OPACITY,
         badge_on_ibeam: true,
+        badge_keep_at_caret: true,
     };
 
     /// 設定ファイルの値から作る（範囲外は丸め、知らない値は既定にする）。
@@ -212,6 +216,7 @@ impl Params {
             badge_hold_ms: settings.badge_hold_ms,
             badge_opacity: settings.badge_opacity,
             badge_on_ibeam: settings.badge_on_ibeam,
+            badge_keep_at_caret: settings.badge_keep_at_caret,
         }
         .clamped()
     }
@@ -389,7 +394,13 @@ struct BadgeState {
     seen: Option<ImeMode>,
     /// マウスカーソルが文字入力の形（I の形）だったか（変わった瞬間を知るため）。
     ibeam: bool,
-    /// 最後のきっかけ（キーを打った・クリックした・モードが切り替わった など）の時刻。
+    /// 入力位置が分かっていたか・そのときの入力先（入力欄に来たことを知るため）。
+    caret_seen: bool,
+    seen_focus: isize,
+    /// 最後に文字のキーを打った時刻。
+    key: Option<u32>,
+    /// 最後のきっかけ（入力欄に来た・クリックした・モードが切り替わった など）の時刻。
+    /// そのあとでキーを打ったら `None` に戻す。
     trigger: Option<u32>,
     /// いまの不透明度（0〜255。変わったときだけ当て直す）。
     alpha: u8,
@@ -448,6 +459,9 @@ fn thread_main(ready: mpsc::Sender<u32>) {
                     font: None,
                     seen: None,
                     ibeam: false,
+                    caret_seen: false,
+                    seen_focus: 0,
+                    key: None,
                     trigger: None,
                     alpha: 0,
                 },
@@ -685,28 +699,47 @@ unsafe fn update_badge(observed: Option<&Observed>) {
     let click = CLICK_TICK.swap(0, Ordering::Relaxed) != 0;
     let ibeam = cursor_is_ibeam();
     let caret_known = observed.is_some_and(|o| o.caret.is_some());
-    let trigger = STATE.with(|s| {
+    let times = STATE.with(|s| {
         let mut s = s.borrow_mut();
         let badge = &mut s.as_mut()?.badge;
         let mode = observed.map(|o| o.mode);
+        let focus = observed.map_or(0, |o| o.focus.0 as isize);
         let events = BadgeEvents {
-            key,
             click,
             mode_switched: badge.seen.is_some() && mode.is_some() && badge.seen != mode,
             ibeam,
             ibeam_entered: ibeam && !badge.ibeam,
             caret_known,
+            caret_appeared: caret_known && (!badge.caret_seen || focus != badge.seen_focus),
         };
         badge.seen = mode;
         badge.ibeam = ibeam;
+        badge.caret_seen = caret_known;
+        badge.seen_focus = focus;
+        if key {
+            // 打ち始めたら、それまでのきっかけは終わり（入力位置の横の印を消す）。
+            badge.key = Some(now);
+            badge.trigger = None;
+        }
         if ime_logic::badge_triggered(params.badge_when, params.badge_on_ibeam, events) {
             badge.trigger = Some(now);
         }
-        badge.trigger
+        Some((badge.key, badge.trigger))
     });
-    // 入力位置の横に出せるとき（入力位置が分かり、そこに出す設定のとき）。
-    let at_caret = params.badge == Badge::Caret && caret_known;
-    if !ime_logic::badge_visible(params.badge_when, at_caret, trigger, now, params.badge_hold_ms) {
+    let (key, trigger) = times.unwrap_or((None, None));
+    let moment = BadgeMoment {
+        // 入力位置の横に出せるとき（入力位置が分かり、そこに出す設定のとき）。
+        at_caret: params.badge == Badge::Caret && caret_known,
+        key,
+        trigger,
+        now,
+    };
+    if !ime_logic::badge_visible(
+        params.badge_when,
+        params.badge_keep_at_caret,
+        moment,
+        params.badge_hold_ms,
+    ) {
         hide_badge();
         return;
     }
