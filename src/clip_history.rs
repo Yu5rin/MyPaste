@@ -57,6 +57,9 @@ pub struct History {
     pinned: Vec<String>,
     /// そのほか（新しい順）。
     items: VecDeque<String>,
+    /// `items` の 1 件ずつの「いつ入ったか」（大きいほど新しい通し番号。画像の履歴と同じ並びに
+    /// 混ぜて出すのに使う）。`items` と同じ順・同じ数。
+    stamps: VecDeque<u64>,
     max: usize,
 }
 
@@ -73,6 +76,8 @@ pub struct Saved {
     pub pinned: Vec<String>,
     /// ピン留めしていないもの（新しい順）。
     pub items: Vec<String>,
+    /// `items` の 1 件ずつの通し番号（無い・数が合わないときは、並び順から付け直す）。
+    pub stamps: Vec<u64>,
 }
 
 impl History {
@@ -80,6 +85,7 @@ impl History {
         Self {
             pinned: Vec::new(),
             items: VecDeque::new(),
+            stamps: VecDeque::new(),
             max: clamp_items(max),
         }
     }
@@ -96,8 +102,13 @@ impl History {
             }
         }
         // 古いものから順に入れると、新しいものが先頭に来て、重複は新しい方が残る。
-        for text in saved.items.iter().rev() {
-            history.push(text);
+        let stamped = saved.stamps.len() == saved.items.len();
+        for (i, text) in saved.items.iter().enumerate().rev() {
+            if stamped {
+                history.push_at(text, saved.stamps[i]);
+            } else {
+                history.push(text);
+            }
         }
         history
     }
@@ -107,13 +118,44 @@ impl History {
         Saved {
             pinned: self.pinned.clone(),
             items: self.items.iter().cloned().collect(),
+            stamps: self.stamps.iter().copied().collect(),
         }
+    }
+
+    /// いちばん新しい通し番号（無ければ 0）。
+    pub fn max_stamp(&self) -> u64 {
+        self.stamps.iter().copied().max().unwrap_or(0)
+    }
+
+    /// ピン留めしたもの（新しく留めたものが先）。
+    pub fn pinned(&self) -> Vec<String> {
+        self.pinned.clone()
+    }
+
+    /// ピン留めしていないもの（新しい順）と、その通し番号。
+    pub fn unpinned(&self) -> Vec<(String, u64)> {
+        self.items.iter().cloned().zip(self.stamps.iter().copied()).collect()
+    }
+
+    fn truncate(&mut self) {
+        self.items.truncate(self.max);
+        self.stamps.truncate(self.max);
+    }
+
+    fn remove_at(&mut self, index: usize) -> Option<String> {
+        self.stamps.remove(index);
+        self.items.remove(index)
+    }
+
+    fn push_front(&mut self, text: String, stamp: u64) {
+        self.items.push_front(text);
+        self.stamps.push_front(stamp);
     }
 
     /// 覚えておく件数を変える（減らしたときは古いものから消す。ピン留めしたものは消さない）。
     pub fn set_max(&mut self, max: usize) {
         self.max = clamp_items(max);
-        self.items.truncate(self.max);
+        self.truncate();
     }
 
     /// 全体の大きさが上限を超えていたら、古いものから消す（いちばん新しいものと、
@@ -121,6 +163,7 @@ impl History {
     fn trim_to_total(&mut self) {
         let mut total: usize = self.items.iter().map(String::len).sum();
         while total > MAX_TOTAL_BYTES && self.items.len() > 1 {
+            self.stamps.pop_back();
             if let Some(old) = self.items.pop_back() {
                 total -= old.len();
             }
@@ -131,17 +174,26 @@ impl History {
     /// すでにある文字なら、前のものを消していちばん新しい位置へ移す（ピン留めしたものと
     /// 同じなら、何もしない）。履歴が変わったら `true`。
     pub fn push(&mut self, text: &str) -> bool {
+        self.push_at(text, self.max_stamp() + 1)
+    }
+
+    /// [`History::push`] と同じ。通し番号 `stamp` を付ける（画像の履歴と通しの番号）。
+    pub fn push_at(&mut self, text: &str, stamp: u64) -> bool {
         if !is_storable(text) || self.pinned.iter().any(|t| t == text) {
             return false;
         }
         if self.items.front().is_some_and(|t| t == text) {
+            // 並びは変わらないが、画像より新しくコピーし直したことは覚える。
+            if let Some(front) = self.stamps.front_mut() {
+                *front = (*front).max(stamp);
+            }
             return false;
         }
         if let Some(i) = self.items.iter().position(|t| t == text) {
-            self.items.remove(i);
+            self.remove_at(i);
         }
-        self.items.push_front(text.to_string());
-        self.items.truncate(self.max);
+        self.push_front(text.to_string(), stamp);
+        self.truncate();
         self.trim_to_total();
         true
     }
@@ -169,31 +221,54 @@ impl History {
         let Some(i) = self.items.iter().position(|t| t == text) else {
             return false;
         };
-        self.items.remove(i);
+        self.remove_at(i);
         self.pinned.insert(0, text.to_string());
         true
     }
 
     /// ピン留めを外す（ピン留めしていないものの先頭へ戻す）。変わったら `true`。
+    #[cfg(test)]
     pub fn unpin(&mut self, text: &str) -> bool {
+        self.unpin_at(text, self.max_stamp() + 1)
+    }
+
+    /// [`History::unpin`] と同じ。通し番号 `stamp` を付ける。
+    pub fn unpin_at(&mut self, text: &str, stamp: u64) -> bool {
         let Some(i) = self.pinned.iter().position(|t| t == text) else {
             return false;
         };
         let text = self.pinned.remove(i);
-        self.items.push_front(text);
-        self.items.truncate(self.max);
+        self.push_front(text, stamp);
+        self.truncate();
         self.trim_to_total();
         true
     }
 
     /// 貼り付けたものを、いちばん新しい位置へ移す（ピン留めしたものは動かさない）。
     /// 変わったら `true`。
+    #[cfg(test)]
     pub fn move_to_top(&mut self, text: &str) -> bool {
+        if self.items.front().is_some_and(|t| t == text) {
+            return false;
+        }
+        self.move_to_top_at(text, self.max_stamp() + 1)
+    }
+
+    /// [`History::move_to_top`] と同じ。通し番号 `stamp` を付ける（画像より上に出すため、
+    /// すでに文字の中でいちばん上のときも、通し番号は付け直す）。
+    pub fn move_to_top_at(&mut self, text: &str, stamp: u64) -> bool {
         match self.items.iter().position(|t| t == text) {
-            Some(0) | None => false,
+            None => false,
+            Some(0) => {
+                let changed = self.stamps.front().is_some_and(|s| *s < stamp);
+                if let Some(front) = self.stamps.front_mut() {
+                    *front = (*front).max(stamp);
+                }
+                changed
+            }
             Some(i) => {
-                if let Some(item) = self.items.remove(i) {
-                    self.items.push_front(item);
+                if let Some(item) = self.remove_at(i) {
+                    self.push_front(item, stamp);
                 }
                 true
             }
@@ -208,7 +283,7 @@ impl History {
         }
         match self.items.iter().position(|t| t == text) {
             Some(i) => {
-                self.items.remove(i);
+                self.remove_at(i);
                 true
             }
             None => false,
@@ -223,12 +298,14 @@ impl History {
     /// ピン留めしていないものを消す（「履歴を消す」）。
     pub fn clear_unpinned(&mut self) {
         self.items.clear();
+        self.stamps.clear();
     }
 
     /// ピン留めしたものも含めて、すべて消す（記録をやめたとき）。
     pub fn clear(&mut self) {
         self.pinned.clear();
         self.items.clear();
+        self.stamps.clear();
     }
 }
 
@@ -257,6 +334,7 @@ pub fn from_json(text: &str) -> Result<Saved, String> {
         .map(|items| Saved {
             pinned: Vec::new(),
             items,
+            stamps: Vec::new(),
         })
         .map_err(|e| e.to_string())
 }
@@ -751,10 +829,23 @@ mod tests {
             Saved {
                 pinned: vec![],
                 items: vec!["a".into(), " ".into(), "b".into(), "a".into()],
+                stamps: vec![],
             },
             100,
         );
         assert_eq!(items(&restored), ["a", "b"]);
+        // 通し番号は、保存して読み直しても同じ。付け直すとき（前の版の形）は、新しいほど大きい。
+        let mut h = History::new(100);
+        h.push_at("古い", 3);
+        h.push_at("新しい", 8);
+        assert!(!h.push_at("新しい", 12));
+        assert_eq!(h.max_stamp(), 12);
+        let again = History::from_saved(from_json(&to_json(&h.to_saved())).unwrap(), 100);
+        assert_eq!(again.unpinned(), vec![("新しい".to_string(), 12), ("古い".to_string(), 3)]);
+        assert!(h.move_to_top_at("古い", 20));
+        assert_eq!(h.unpinned()[0], ("古い".to_string(), 20));
+        let stamps: Vec<u64> = restored.unpinned().iter().map(|(_, s)| *s).collect();
+        assert!(stamps[0] > stamps[1]);
         // 前の版の形（文字列の配列）も読める。
         assert_eq!(from_json(r#"["x","y"]"#).unwrap().items, ["x", "y"]);
         assert!(from_json("壊れた").is_err());

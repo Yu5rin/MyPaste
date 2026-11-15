@@ -14,6 +14,10 @@
 //! 履歴は Delete で 1 件を消せる。右クリック（またはアプリケーションキー）で、定型文への登録・
 //! 削除・定型文の編集のメニューを出す。
 //!
+//! 一覧は前面（アクティブ）にしない。前面にすると、元のアプリの入力欄からカーソルが外れて
+//! 貼り付けられなくなることがあるため。キー操作はキーボードフック（[`hook_key`]）から、一覧の外の
+//! クリックとホイールはマウスフックから受け取る。
+//!
 //! 実行スレッド（[`crate::actions`]）で、閉じるまで専用のメッセージループを回す。
 //! ページ分けと表示する文の整え方は [`crate::clip_history`] / [`crate::snippets`] にあり、
 //! Linux でもテストできる。
@@ -66,7 +70,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::clip_history::{self, MenuPosition, Palette, Theme};
 use crate::config::Snippet;
-use crate::clip_images::{self, Entry, Thumb};
+use crate::clip_images::{self, Item, Thumb};
 use crate::ui;
 use crate::{clip_image_store, ime_indicator, snippets};
 
@@ -292,13 +296,13 @@ pub enum Pick {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Resume {
     tab: usize,
-    places: [(Option<usize>, usize); 3],
+    places: [(Option<usize>, usize); 2],
 }
 
 impl Resume {
     /// 出していたタブで選ぶ位置を変える（貼り付けたものが、いちばん上に移ったとき）。
     pub fn with_selected(mut self, position: usize) -> Resume {
-        self.places[self.tab % 3].0 = Some(position);
+        self.places[self.tab % 2].0 = Some(position);
         self
     }
 }
@@ -368,19 +372,16 @@ pub fn request_close() {
 enum Tab {
     History,
     Snippets,
-    Images,
 }
 
 impl Tab {
     /// 見出しに並べる順と、その名前。
-    const ALL: [(Tab, &'static str); 3] =
-        [(Tab::History, "履歴"), (Tab::Snippets, "定型文"), (Tab::Images, "画像")];
+    const ALL: [(Tab, &'static str); 2] = [(Tab::History, "履歴"), (Tab::Snippets, "定型文")];
 
     fn index(self) -> usize {
         match self {
             Tab::History => 0,
             Tab::Snippets => 1,
-            Tab::Images => 2,
         }
     }
 
@@ -397,12 +398,9 @@ impl Tab {
 
 /// 画面を開いている間の状態。
 struct State {
-    /// 履歴（ピン留めしたものが先、続けて新しい順）と、ピン留めしているか。一覧で消したものは
-    /// 除いていく。
-    history: Vec<(String, bool)>,
+    /// 履歴（文字と画像。ピン留めしたものが先、続けて新しい順）。一覧で消したものは除いていく。
+    history: Vec<Item>,
     snippets: Vec<Snippet>,
-    /// 画像（ピン留めしたものが先、続けて新しい順）。
-    images: Vec<Entry>,
     /// 読み込んだ縮小した絵（読めなかったものは `None`）。
     thumbs: HashMap<u64, Option<Rc<Thumb>>>,
     layout: Layout,
@@ -412,7 +410,7 @@ struct State {
     away: u32,
     tab: Tab,
     /// タブごとの (選んでいる位置, 出しているページ)。
-    places: [(Option<usize>, usize); 3],
+    places: [(Option<usize>, usize); 2],
     page_size: usize,
     opacity: u32,
     dpi: u32,
@@ -421,7 +419,7 @@ struct State {
     /// 一覧の背景を塗るブラシ。
     back_brush: HBRUSH,
     /// 見出しの中のタブの範囲（クリックで切り替えるため）。
-    tab_rects: [RECT; 3],
+    tab_rects: [RECT; 2],
     /// 見出しの中の「出したまま」の範囲。
     keep_rect: RECT,
     /// 全文の吹き出しと、そこに出している文（画像のときは絵）。
@@ -443,8 +441,21 @@ impl State {
         match self.tab {
             Tab::History => self.history.len(),
             Tab::Snippets => self.snippets.len(),
-            Tab::Images => self.images.len(),
         }
+    }
+
+    /// 位置 `index` が履歴の画像なら、その番号。
+    fn image_id(&self, index: usize) -> Option<u64> {
+        match (self.tab, self.history.get(index)?) {
+            (Tab::History, Item::Image(entry)) => Some(entry.id),
+            _ => None,
+        }
+    }
+
+    /// 位置 `index` の画像の、縮小した絵。
+    fn thumb_at(&mut self, index: usize) -> Option<Rc<Thumb>> {
+        let id = self.image_id(index)?;
+        self.thumb(id)
     }
 
     /// 縮小した絵（最初に使うときにファイルから読む）。
@@ -473,19 +484,19 @@ impl State {
     /// 位置 `index` の行に出すもの: (番号, 出す文, 行数, ピン留めしているか)。
     fn row(&self, index: usize) -> Option<(usize, String, usize, bool)> {
         match self.tab {
-            Tab::History => {
-                let (text, pinned) = self.history.get(index)?;
-                let (shown, lines) = clip_history::row_text(text);
-                Some((index + 1, shown, lines, *pinned))
-            }
+            Tab::History => match self.history.get(index)? {
+                Item::Text { text, pinned } => {
+                    let (shown, lines) = clip_history::row_text(text);
+                    Some((index + 1, shown, lines, *pinned))
+                }
+                Item::Image(entry) => {
+                    Some((index + 1, clip_images::row_label(entry), 1, entry.pinned))
+                }
+            },
             Tab::Snippets => {
                 let snippet = self.snippets.get(index)?;
                 let lines = clip_history::row_text(&snippet.text).1;
                 Some((index + 1, snippets::display_name(snippet), lines, false))
-            }
-            Tab::Images => {
-                let entry = self.images.get(index)?;
-                Some((index + 1, clip_images::row_label(entry), 1, entry.pinned))
             }
         }
     }
@@ -493,9 +504,11 @@ impl State {
     /// 位置 `index` の全文。
     fn full_text(&self, index: usize) -> Option<String> {
         match self.tab {
-            Tab::History => self.history.get(index).map(|(t, _)| t.clone()),
+            Tab::History => match self.history.get(index)? {
+                Item::Text { text, .. } => Some(text.clone()),
+                Item::Image(_) => None,
+            },
             Tab::Snippets => self.snippets.get(index).map(|s| s.text.clone()),
-            Tab::Images => None,
         }
     }
 }
@@ -511,9 +524,8 @@ fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
 /// 一覧の画面を出し、閉じるまで待つ。画面を前面にできなかったときは `None`
 /// （前面にできないまま出すと、キーで操作できず、閉じられなくなるため）。
 pub unsafe fn choose(
-    history: Vec<(String, bool)>,
+    history: Vec<Item>,
     snippets: Vec<Snippet>,
-    images: Vec<Entry>,
     view: View,
     target: HWND,
     resume: Option<Resume>,
@@ -559,10 +571,10 @@ pub unsafe fn choose(
     let tip = create_tip_window(hwnd);
     let font = ui::create_ui_font(dpi);
     let colors = view.theme.palette().unwrap_or_else(|| system_palette());
-    let counts = [history.len(), snippets.len(), images.len()];
+    let counts = [history.len(), snippets.len()];
     // 前に閉じたときの場所があれば、そこから（件数が減っていれば収まる所へ）。無ければ、
     // 中身のある最初のタブから始める。
-    let mut places = [(None, 0); 3];
+    let mut places = [(None, 0); 2];
     for (i, count) in counts.iter().enumerate() {
         let wanted = resume.and_then(|r| r.places[i].0).unwrap_or(0);
         let selected = (*count > 0).then(|| wanted.min(count - 1));
@@ -576,7 +588,6 @@ pub unsafe fn choose(
         *s.borrow_mut() = Some(State {
             history,
             snippets,
-            images,
             thumbs: HashMap::new(),
             layout,
             keep_open: view.keep_open,
@@ -590,7 +601,7 @@ pub unsafe fn choose(
             font,
             colors,
             back_brush: CreateSolidBrush(COLORREF(colors.back)),
-            tab_rects: [RECT::default(); 3],
+            tab_rects: [RECT::default(); 2],
             keep_rect: RECT::default(),
             tip,
             tip_text: String::new(),
@@ -967,10 +978,10 @@ unsafe fn turn_page(hwnd: HWND, delta: isize) {
 fn choose_current() {
     let chosen = with_state(|st| {
         let pos = st.selected()?;
-        Some(match st.tab {
-            Tab::History => Pick::History(st.full_text(pos)?),
-            Tab::Snippets => Pick::Snippet(st.full_text(pos)?),
-            Tab::Images => Pick::Image(st.images.get(pos)?.id),
+        Some(match (st.tab, st.image_id(pos)) {
+            (Tab::History, Some(id)) => Pick::Image(id),
+            (Tab::History, None) => Pick::History(st.full_text(pos)?),
+            (Tab::Snippets, _) => Pick::Snippet(st.full_text(pos)?),
         })
     })
     .flatten();
@@ -983,19 +994,14 @@ fn choose_current() {
 unsafe fn remove_current(hwnd: HWND) {
     let removed = with_state(|st| {
         let pos = st.selected()?;
-        let count = match st.tab {
-            Tab::History if pos < st.history.len() => {
-                let (text, _) = st.history.remove(pos);
-                st.outcome.removed.push(text);
-                st.history.len()
-            }
-            Tab::Images if pos < st.images.len() => {
-                let entry = st.images.remove(pos);
-                st.outcome.removed_images.push(entry.id);
-                st.images.len()
-            }
-            _ => return None,
-        };
+        if st.tab != Tab::History || pos >= st.history.len() {
+            return None;
+        }
+        match st.history.remove(pos) {
+            Item::Text { text, .. } => st.outcome.removed.push(text),
+            Item::Image(entry) => st.outcome.removed_images.push(entry.id),
+        }
+        let count = st.history.len();
         let selected = (count > 0).then(|| pos.min(count - 1));
         st.set_place(selected, selected.map_or(0, |s| s / st.page_size));
         Some(())
@@ -1013,7 +1019,7 @@ unsafe fn register_current(hwnd: HWND) {
         if st.tab != Tab::History {
             return None;
         }
-        let text = st.selected().and_then(|pos| st.history.get(pos).map(|(t, _)| t.clone()))?;
+        let text = st.selected().and_then(|pos| st.full_text(pos))?;
         // 定型文は貼り付けるときに {date} などを置き換えるので、履歴の文字にある { } は、
         // そのまま貼り付けられるよう {{ }} にして登録する。
         let escaped = text.replace('{', "{{").replace('}', "}}");
@@ -1050,20 +1056,20 @@ unsafe fn register_current(hwnd: HWND) {
 unsafe fn toggle_pin_current(hwnd: HWND) {
     let changed = with_state(|st| {
         let pos = st.selected()?;
-        match st.tab {
-            Tab::History => {
-                let (text, pinned) = st.history.get_mut(pos)?;
+        if st.tab != Tab::History {
+            return None;
+        }
+        match st.history.get_mut(pos)? {
+            Item::Text { text, pinned } => {
                 *pinned = !*pinned;
                 let change = (text.clone(), *pinned);
                 st.outcome.pin_changes.push(change);
             }
-            Tab::Images => {
-                let entry = st.images.get_mut(pos)?;
+            Item::Image(entry) => {
                 entry.pinned = !entry.pinned;
                 let change = (entry.id, entry.pinned);
                 st.outcome.image_pin_changes.push(change);
             }
-            Tab::Snippets => return None,
         }
         Some(())
     })
@@ -1084,13 +1090,11 @@ unsafe fn toggle_keep_open(hwnd: HWND) {
 
 /// 右クリックのメニューを出す。
 unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
-    let Some((tab, has_row, pinned, keep_open)) = with_state(|st| {
-        let pinned = st.selected().is_some_and(|p| match st.tab {
-            Tab::History => st.history.get(p).is_some_and(|(_, pinned)| *pinned),
-            Tab::Images => st.images.get(p).is_some_and(|e| e.pinned),
-            Tab::Snippets => false,
-        });
-        (st.tab, on_row && st.selected().is_some(), pinned, st.keep_open)
+    let Some((tab, has_row, pinned, is_image, keep_open)) = with_state(|st| {
+        let item = st.selected().filter(|_| st.tab == Tab::History).and_then(|p| st.history.get(p));
+        let pinned = item.is_some_and(Item::pinned);
+        let is_image = matches!(item, Some(Item::Image(_)));
+        (st.tab, on_row && st.selected().is_some(), pinned, is_image, st.keep_open)
     }) else {
         return;
     };
@@ -1106,9 +1110,9 @@ unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
             w!("ピン留めする(&I)\tP")
         };
         let _ = AppendMenuW(menu, row_flag, MENU_PIN, pin_label);
-        if tab == Tab::History {
-            let _ = AppendMenuW(menu, row_flag, MENU_REGISTER, w!("定型文に登録(&T)"));
-        }
+        // 定型文に登録できるのは文字だけ。
+        let register_flag = if is_image { MF_STRING | MF_GRAYED } else { row_flag };
+        let _ = AppendMenuW(menu, register_flag, MENU_REGISTER, w!("定型文に登録(&T)"));
         let _ = AppendMenuW(menu, row_flag, MENU_DELETE, w!("この履歴を削除(&D)\tDelete"));
     }
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -1304,13 +1308,11 @@ unsafe fn draw_card(hdc: HDC, rect: RECT, row: usize, selected: bool) {
         with_state(|st| {
             let index = st.page() * st.page_size + row;
             let (number, shown, lines, pinned) = st.row(index)?;
-            // 上の行: 定型文は名前、画像は大きさと日時。履歴は番号だけ。
-            let title = if st.tab == Tab::History { String::new() } else { shown };
+            // 上の行: 定型文は名前、画像は大きさと日時。文字の履歴は番号だけ。
+            let is_image = st.image_id(index).is_some();
+            let title = if st.tab == Tab::History && !is_image { String::new() } else { shown };
             let body = st.full_text(index).map(|t| clip_history::tip_text(&t));
-            let thumb = match st.tab {
-                Tab::Images => st.images.get(index).map(|e| e.id).and_then(|id| st.thumb(id)),
-                _ => None,
-            };
+            let thumb = st.thumb_at(index);
             Some((number, title, lines, pinned, body, thumb, st.dpi, st.font, st.colors))
         })
     else {
@@ -1436,7 +1438,7 @@ unsafe fn paint_header(hwnd: HWND) {
         // タブ: 選んでいるタブは一覧と同じ色にして、つながって見えるようにする。
         let pad = ui::scale(TAB_PAD, dpi);
         let mut left = rect.left;
-        let mut rects = [RECT::default(); 3];
+        let mut rects = [RECT::default(); 2];
         for (i, (this, name)) in Tab::ALL.into_iter().enumerate() {
             let mut tab_rect = RECT {
                 left,
@@ -1518,10 +1520,7 @@ unsafe fn update_tip(hwnd: HWND) {
     let row = selected.and_then(|s| s.checked_sub(page * size)).filter(|r| *r < size);
     let content = with_state(|st| {
         let pos = selected?;
-        let image = match st.tab {
-            Tab::Images => st.images.get(pos).map(|e| e.id).and_then(|id| st.thumb(id)),
-            _ => None,
-        };
+        let image = st.thumb_at(pos);
         Some((st.full_text(pos), image, st.row(pos)?))
     })
     .flatten();

@@ -40,6 +40,57 @@ pub struct Entry {
     pub time: String,
     #[serde(default)]
     pub pinned: bool,
+    /// いつ入ったか（大きいほど新しい通し番号。文字の履歴と同じ並びに混ぜて出すのに使う）。
+    #[serde(default)]
+    pub stamp: u64,
+}
+
+/// 一覧に出す 1 件（文字か画像）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Item {
+    Text { text: String, pinned: bool },
+    Image(Entry),
+}
+
+impl Item {
+    pub fn pinned(&self) -> bool {
+        match self {
+            Item::Text { pinned, .. } => *pinned,
+            Item::Image(entry) => entry.pinned,
+        }
+    }
+}
+
+/// 文字と画像の履歴を、1 つの一覧にまとめる。ピン留めしたもの（文字、画像の順）を先に、続けて
+/// そのほかを新しい順（通し番号の大きい順。同じなら文字が先）に並べる。
+///
+/// `texts` はピン留めしていない文字（新しい順）と通し番号、`images` は [`Index::entries`] の順。
+pub fn merge(pinned_texts: Vec<String>, texts: Vec<(String, u64)>, images: Vec<Entry>) -> Vec<Item> {
+    let mut items: Vec<Item> = pinned_texts
+        .into_iter()
+        .map(|text| Item::Text { text, pinned: true })
+        .collect();
+    let (pinned_images, images): (Vec<Entry>, Vec<Entry>) =
+        images.into_iter().partition(|e| e.pinned);
+    items.extend(pinned_images.into_iter().map(Item::Image));
+    let mut texts = texts.into_iter().peekable();
+    let mut images = images.into_iter().peekable();
+    loop {
+        let text_first = match (texts.peek(), images.peek()) {
+            (Some((_, stamp)), Some(image)) => *stamp >= image.stamp,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        if text_first {
+            if let Some((text, _)) = texts.next() {
+                items.push(Item::Text { text, pinned: false });
+            }
+        } else if let Some(image) = images.next() {
+            items.push(Item::Image(image));
+        }
+    }
+    items
 }
 
 /// 画像の目録（新しい順）。
@@ -73,17 +124,24 @@ impl Index {
         self.trim(max)
     }
 
-    /// いちばん新しい位置へ移す（同じ画像をもう一度コピーしたとき・貼り付けたとき）。
-    /// ピン留めしたものは動かさない。変わったら `true`。
-    pub fn touch(&mut self, id: u64) -> bool {
+    /// いちばん新しい位置へ移し、通し番号 `stamp` を付ける（同じ画像をもう一度コピーしたとき・
+    /// 貼り付けたとき）。ピン留めしたものは動かさない。変わったら `true`。
+    pub fn touch(&mut self, id: u64, stamp: u64) -> bool {
         match self.items.iter().position(|e| e.id == id) {
-            Some(i) if !self.items[i].pinned && self.first_unpinned() != Some(i) => {
-                let entry = self.items.remove(i);
+            Some(i) if !self.items[i].pinned => {
+                let mut entry = self.items.remove(i);
+                let changed = self.first_unpinned() != Some(i) || entry.stamp < stamp;
+                entry.stamp = entry.stamp.max(stamp);
                 self.items.insert(0, entry);
-                true
+                changed
             }
             _ => false,
         }
+    }
+
+    /// いちばん新しい通し番号（無ければ 0）。
+    pub fn max_stamp(&self) -> u64 {
+        self.items.iter().map(|e| e.stamp).max().unwrap_or(0)
     }
 
     fn first_unpinned(&self) -> Option<usize> {
@@ -337,6 +395,7 @@ mod tests {
             hash: id * 7,
             time: String::new(),
             pinned: false,
+            stamp: id,
         }
     }
 
@@ -394,12 +453,37 @@ mod tests {
         }
         assert_eq!(index.find(7, 10, 10), Some(1));
         assert_eq!(index.find(7, 11, 10), None);
-        assert!(index.touch(1));
-        assert!(!index.touch(1));
+        assert!(index.touch(1, 10));
+        assert!(!index.touch(1, 10));
+        assert_eq!(index.max_stamp(), 10);
         let ids: Vec<u64> = index.entries().iter().map(|e| e.id).collect();
         assert_eq!(ids, vec![1, 3, 2]);
         assert!(index.remove(3));
         assert!(!index.remove(3));
+    }
+
+    #[test]
+    fn merge_orders_by_stamp_with_pinned_first() {
+        let mut index = Index::default();
+        for (id, stamp) in [(1, 2), (2, 5), (3, 9)] {
+            let mut e = entry(id, 1);
+            e.stamp = stamp;
+            index.push(e, 10);
+        }
+        index.set_pinned(1, true);
+        let texts = vec![("c".to_string(), 7), ("b".to_string(), 5), ("a".to_string(), 1)];
+        let merged = merge(vec!["p".to_string()], texts, index.entries());
+        let names: Vec<String> = merged
+            .iter()
+            .map(|item| match item {
+                Item::Text { text, .. } => text.clone(),
+                Item::Image(e) => format!("#{}", e.id),
+            })
+            .collect();
+        // ピン留め（文字、画像）→ 新しい順。同じ通し番号なら文字が先。
+        assert_eq!(names, vec!["p", "#1", "#3", "c", "b", "#2", "a"]);
+        assert!(merged[0].pinned() && merged[1].pinned() && !merged[2].pinned());
+        assert!(merge(Vec::new(), Vec::new(), Vec::new()).is_empty());
     }
 
     #[test]

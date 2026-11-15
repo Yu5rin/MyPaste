@@ -541,10 +541,27 @@ unsafe fn record_clipboard() {
     if has_image {
         record_image();
     } else if let Some(text) = read_clipboard_text() {
-        if HISTORY.with(|h| h.borrow_mut().push(&text)) {
+        let stamp = next_stamp();
+        if HISTORY.with(|h| h.borrow_mut().push_at(&text, stamp)) {
             mark_history_changed();
         }
     }
+}
+
+/// 次に履歴に入るものに付ける通し番号（文字と画像で通しの番号。大きいほど新しい）。
+fn next_stamp() -> u64 {
+    let text = HISTORY.with(|h| h.borrow().max_stamp());
+    let image = IMAGES.with(|i| i.borrow().max_stamp());
+    text.max(image) + 1
+}
+
+/// 一覧に出す履歴（文字と画像を 1 つにまとめたもの）。
+fn history_items() -> Vec<clip_images::Item> {
+    let (pinned, texts) = HISTORY.with(|h| {
+        let h = h.borrow();
+        (h.pinned(), h.unpinned())
+    });
+    clip_images::merge(pinned, texts, IMAGES.with(|i| i.borrow().entries()))
 }
 
 /// 保存していた画像の目録を読む。読めたら `true`。読めない間は画像を覚えず、目録も保存しない
@@ -580,7 +597,8 @@ unsafe fn record_image() {
     };
     let hash = clip_images::hash(&dib);
     if let Some(id) = IMAGES.with(|i| i.borrow().find(hash, info.width, info.height)) {
-        if IMAGES.with(|i| i.borrow_mut().touch(id)) {
+        let stamp = next_stamp();
+        if IMAGES.with(|i| i.borrow_mut().touch(id, stamp)) {
             save_image_index();
         }
         return;
@@ -605,6 +623,7 @@ unsafe fn record_image() {
         hash,
         time: format!("{}/{} {:02}:{:02}", now.month, now.day, now.hour, now.minute),
         pinned: false,
+        stamp: next_stamp(),
     };
     let removed = IMAGES.with(|i| i.borrow_mut().push(entry, history_config().max_items));
     clip_image_store::delete(&removed);
@@ -854,15 +873,14 @@ unsafe fn show_history_until_closed() {
     let mut resume = None;
     loop {
         let config = history_config();
-        let items = HISTORY.with(|h| h.borrow().entries());
-        let images = IMAGES.with(|i| i.borrow().entries());
+        let items = history_items();
         let snippets = snippets();
-        if items.is_empty() && snippets.is_empty() && images.is_empty() {
+        if items.is_empty() && snippets.is_empty() {
             ime_indicator::notify("空");
             return;
         }
         let Some(outcome) =
-            history_window::choose(items, snippets, images, config.view, target, resume.take())
+            history_window::choose(items, snippets, config.view, target, resume.take())
         else {
             ime_indicator::notify("不可");
             return;
@@ -934,7 +952,12 @@ unsafe fn apply_history_outcome(
         let changed = HISTORY.with(|h| {
             let mut h = h.borrow_mut();
             outcome.pin_changes.iter().fold(false, |changed, (text, pin)| {
-                let done = if *pin { h.pin(text) } else { h.unpin(text) };
+                let done = if *pin {
+                    h.pin(text)
+                } else {
+                    let stamp = h.max_stamp() + 1;
+                    h.unpin_at(text, stamp)
+                };
                 done || changed
             })
         });
@@ -967,12 +990,11 @@ unsafe fn apply_history_outcome(
     let text = match outcome.chosen {
         Some(history_window::Pick::History(text)) => {
             // 貼り付けたものを、いちばん上に移す（設定で選べる。ピン留めしたものは動かさない）。
-            if config.move_to_top && HISTORY.with(|h| h.borrow_mut().move_to_top(&text)) {
+            let stamp = next_stamp();
+            if config.move_to_top && HISTORY.with(|h| h.borrow_mut().move_to_top_at(&text, stamp)) {
                 mark_history_changed();
                 // ピン留めしたものの次が、いちばん上。
-                moved_to = Some(HISTORY.with(|h| {
-                    h.borrow().entries().iter().filter(|(_, pinned)| *pinned).count()
-                }));
+                moved_to = Some(pinned_count());
             }
             text
         }
@@ -981,11 +1003,10 @@ unsafe fn apply_history_outcome(
             hotkey_rules::expand_placeholders(&text, &local_time())
         }
         Some(history_window::Pick::Image(id)) => {
-            if config.move_to_top && IMAGES.with(|i| i.borrow_mut().touch(id)) {
+            let stamp = next_stamp();
+            if config.move_to_top && IMAGES.with(|i| i.borrow_mut().touch(id, stamp)) {
                 save_image_index();
-                moved_to = Some(IMAGES.with(|i| {
-                    i.borrow().entries().iter().filter(|e| e.pinned).count()
-                }));
+                moved_to = Some(pinned_count());
             }
             pump_messages_until(MENU_REFOCUS_WAIT, || false);
             paste_image(id);
@@ -998,6 +1019,11 @@ unsafe fn apply_history_outcome(
     log::debug!("クリップボードの履歴・定型文から貼り付けます（{} 文字）", text.chars().count());
     paste_text(&Hotkey::unpack(0), &text);
     Some(moved_to)
+}
+
+/// ピン留めしている件数（文字と画像の合計。一覧では、その次が「いちばん上」）。
+fn pinned_count() -> usize {
+    history_items().iter().filter(|item| item.pinned()).count()
 }
 
 /// 履歴の画像を貼り付ける。クリップボードに画像を一時的に置いて Ctrl+V を送り、
