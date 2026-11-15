@@ -14,7 +14,7 @@
 //! 履歴は Delete で 1 件を消せる。右クリック（またはアプリケーションキー）で、定型文への登録・
 //! 削除・定型文の編集のメニューを出す。メニューの「整えて貼り付け」では、文字（履歴の文字と
 //! 定型文）を整えてから貼り付ける（前後の空白を除く・1 行にまとめる・大文字・小文字・全角英数を
-//! 半角に。履歴そのものは変えない）。
+//! 半角に。履歴そのものは変えない）。画像の行では「画像をファイルに保存...」で PNG に書き出せる。
 //!
 //! 検索: Ctrl+F か `/`（または検索の欄をクリック）で、検索の欄に入力欄を出す。入力した言葉で、
 //! 今のタブを絞り込む（大文字と小文字は区別しない。空白で区切ると、すべてを含むもの。定型文は
@@ -59,7 +59,7 @@ use windows::Win32::Graphics::Gdi::{
     PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::SystemInformation::GetTickCount;
+use windows::Win32::System::SystemInformation::{GetLocalTime, GetTickCount};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, EM_SETSEL, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
@@ -277,6 +277,7 @@ const MENU_SEARCH: usize = 8;
 const MENU_MARK: usize = 9;
 const MENU_PASTE_MARKED: usize = 10;
 const MENU_CLEAR_MARKS: usize = 11;
+const MENU_SAVE_IMAGE: usize = 12;
 /// 「整えて貼り付け」の項目（この番号に、[`text_transform::QUICK_FORMATS`] の位置を足す）。
 const MENU_FORMAT_BASE: usize = 20;
 /// ピン留めした行の左端に引く線の太さ（96 DPI 基準）。
@@ -1315,6 +1316,31 @@ fn choose_formatted(format: QuickFormat) {
     }
 }
 
+/// 選んでいる履歴の画像を、保存先を選んで PNG のファイルに書き出す。結果は画面に短く出す。
+unsafe fn save_selected_image(hwnd: HWND) {
+    let Some(id) = with_state(|st| st.selected().and_then(|p| st.image_id(p))).flatten() else {
+        return;
+    };
+    let now = GetLocalTime();
+    let name = format!(
+        "画像_{:04}{:02}{:02}_{:02}{:02}{:02}.png",
+        now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond
+    );
+    let Some(path) = ui::choose_file(hwnd, true, "PNG 画像 (*.png)\0*.png\0", "png", &name) else {
+        return;
+    };
+    match clip_image_store::save_png(id, &path) {
+        Ok((width, height)) => {
+            log::info!("画像の履歴: 画像を保存しました（{width}×{height}）: {}", path.display());
+            ime_indicator::notify("保存");
+        }
+        Err(e) => {
+            log::warn!("画像の履歴: 画像を保存できませんでした: {e}（{}）", path.display());
+            ime_indicator::notify("失敗");
+        }
+    }
+}
+
 /// 選んでいる履歴を 1 件消す（定型文は定型文の画面で消す）。
 unsafe fn remove_current(hwnd: HWND) {
     let removed = with_state(|st| {
@@ -1641,6 +1667,9 @@ unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
         // 定型文に登録できるのは文字だけ。
         let register_flag = if is_image { MF_STRING | MF_GRAYED } else { row_flag };
         let _ = AppendMenuW(menu, register_flag, MENU_REGISTER, w!("定型文に登録(&T)"));
+        // 画像の行だけ。
+        let image_flag = if has_row && is_image { MF_STRING } else { MF_STRING | MF_GRAYED };
+        let _ = AppendMenuW(menu, image_flag, MENU_SAVE_IMAGE, w!("画像をファイルに保存...(&S)"));
         let _ = AppendMenuW(menu, row_flag, MENU_DELETE, w!("この履歴を削除(&D)\tDelete"));
     }
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -1664,6 +1693,10 @@ unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
     )
     .0 as usize;
     let _ = DestroyMenu(menu);
+    if chosen == MENU_SAVE_IMAGE {
+        // 保存先を選ぶ画面は、一覧を前面にしたまま（メニューを出している扱いのまま）出す。
+        save_selected_image(hwnd);
+    }
     let searching = with_state(|st| st.searching).unwrap_or(false);
     if searching {
         // 検索の入力欄に入力している間は、一覧を前面のままにし、入力欄に戻る。

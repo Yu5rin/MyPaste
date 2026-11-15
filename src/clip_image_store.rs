@@ -8,7 +8,8 @@
 //! - `<番号>.img`: 画像そのもの（クリップボードの DIB をそのまま）
 //! - `<番号>.thm`: 一覧に出す縮小した絵
 //!
-//! 件数や容量の上限などの判断は [`crate::clip_images`] にある。
+//! 件数や容量の上限などの判断は [`crate::clip_images`] にある。一覧の「画像をファイルに保存」で
+//! PNG に書き出すのもここ（PNG にするのは [`crate::png`]）。
 
 use std::path::PathBuf;
 
@@ -19,8 +20,8 @@ use windows::Win32::Graphics::Gdi::{
     DIB_RGB_COLORS, HALFTONE, HDC, SRCCOPY,
 };
 
-use crate::clip_images::{self, DibInfo, Index, Thumb};
-use crate::{clip_store, config};
+use crate::clip_images::{self, DibInfo, Index, Pixels, Thumb};
+use crate::{clip_store, config, png};
 
 const INDEX_FILE: &str = "index.dat";
 
@@ -210,17 +211,48 @@ pub unsafe fn make_thumb(dib: &[u8], info: DibInfo) -> Option<Thumb> {
         clip_images::THUMB_MAX_W,
         clip_images::THUMB_MAX_H,
     );
+    let pixels = stretch_dib(dib, info, width, height)?;
+    Some(Thumb {
+        width,
+        height,
+        pixels,
+    })
+}
+
+/// DIB を、`(width, height)` の大きさの、上から下へ並ぶ 32 ビットの絵（BGRA）に描き直す
+/// （色の深さや並びの違いは Windows に任せる。4 バイト目は意味を持たない）。
+unsafe fn stretch_dib(dib: &[u8], info: DibInfo, width: u32, height: u32) -> Option<Vec<u8>> {
+    stretch(
+        dib.as_ptr().cast(),
+        dib.as_ptr().add(info.bits_offset).cast(),
+        info.width,
+        info.height,
+        width,
+        height,
+    )
+}
+
+/// 見出し `header` と画素 `bits` の絵（大きさ `src_w`×`src_h`）を、`(width, height)` の、上から下へ
+/// 並ぶ 32 ビットの絵（BGRA）に描き直す。
+unsafe fn stretch(
+    header: *const BITMAPINFO,
+    bits: *const core::ffi::c_void,
+    src_w: u32,
+    src_h: u32,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
     let screen = GetDC(HWND::default());
     let memory = CreateCompatibleDC(screen);
     ReleaseDC(HWND::default(), screen);
     if memory.is_invalid() {
         return None;
     }
-    let header = top_down_header(width, height);
-    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-    let bitmap = CreateDIBSection(memory, &header, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0);
+    let target = top_down_header(width, height);
+    let mut out: *mut core::ffi::c_void = std::ptr::null_mut();
+    let bitmap = CreateDIBSection(memory, &target, DIB_RGB_COLORS, &mut out, HANDLE::default(), 0);
     let result = match bitmap {
-        Ok(bitmap) if !bits.is_null() => {
+        Ok(bitmap) if !out.is_null() => {
             let old = SelectObject(memory, bitmap);
             SetStretchBltMode(memory, HALFTONE);
             let _ = SetBrushOrgEx(memory, 0, 0, None);
@@ -232,24 +264,20 @@ pub unsafe fn make_thumb(dib: &[u8], info: DibInfo) -> Option<Thumb> {
                 height as i32,
                 0,
                 0,
-                info.width as i32,
-                info.height as i32,
-                Some(dib.as_ptr().add(info.bits_offset).cast()),
-                dib.as_ptr().cast(),
+                src_w as i32,
+                src_h as i32,
+                Some(bits),
+                header,
                 DIB_RGB_COLORS,
                 SRCCOPY,
             );
             let pixels = (drawn != 0).then(|| {
-                std::slice::from_raw_parts(bits as *const u8, width as usize * height as usize * 4)
+                std::slice::from_raw_parts(out as *const u8, width as usize * height as usize * 4)
                     .to_vec()
             });
             SelectObject(memory, old);
             let _ = DeleteObject(bitmap);
-            pixels.map(|pixels| Thumb {
-                width,
-                height,
-                pixels,
-            })
+            pixels
         }
         Ok(bitmap) => {
             let _ = DeleteObject(bitmap);
@@ -259,6 +287,31 @@ pub unsafe fn make_thumb(dib: &[u8], info: DibInfo) -> Option<Thumb> {
     };
     let _ = DeleteDC(memory);
     result
+}
+
+/// DIB の画素（上から下へ、RGBA）。24・32 ビットのものは自分で読み（不透明度を残せる）、
+/// それ以外の形は Windows に 32 ビットの絵として描かせてから読む（不透明として扱う）。
+pub unsafe fn image_pixels(dib: &[u8]) -> Option<Pixels> {
+    if let Some(pixels) = clip_images::dib_pixels(dib) {
+        return Some(pixels);
+    }
+    let info = clip_images::dib_info(dib)?;
+    let bgra = stretch_dib(dib, info, info.width, info.height)?;
+    clip_images::bgra_to_pixels(info.width, info.height, &bgra, false)
+}
+
+/// 履歴の画像を PNG のファイルに書き出す。書き出した画像の (幅, 高さ) を返す。
+pub unsafe fn save_png(id: u64, path: &std::path::Path) -> Result<(u32, u32), String> {
+    let dib = load_image(id).ok_or("画像を読めませんでした")?;
+    let pixels = image_pixels(&dib).ok_or("画像の形式を読み取れませんでした")?;
+    let png = if pixels.has_alpha {
+        png::encode(pixels.width, pixels.height, png::ColorType::Rgba, &pixels.rgba)
+    } else {
+        png::encode(pixels.width, pixels.height, png::ColorType::Rgb, &pixels.to_rgb())
+    }
+    .ok_or("PNG にできませんでした")?;
+    std::fs::write(path, png).map_err(|e| e.to_string())?;
+    Ok((pixels.width, pixels.height))
 }
 
 /// 縮小した絵を、枠 `(x, y, w, h)` の中央に、縦横の比を保って描く。

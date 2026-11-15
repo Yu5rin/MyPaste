@@ -457,6 +457,122 @@ pub fn fit_rect(width: u32, height: u32, box_w: i32, box_h: i32) -> (i32, i32, i
     ((box_w - w) / 2, (box_h - h) / 2, w, h)
 }
 
+/// 画像の画素（上から下へ、1 画素 4 バイトの RGBA）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pixels {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    /// 透けているところがある（無ければ、不透明度を除いて RGB で保存できる）。
+    pub has_alpha: bool,
+}
+
+impl Pixels {
+    /// 1 画素 3 バイトの RGB（不透明度を除く）。
+    pub fn to_rgb(&self) -> Vec<u8> {
+        let mut rgb = Vec::with_capacity(self.rgba.len() / 4 * 3);
+        for px in self.rgba.chunks_exact(4) {
+            rgb.extend_from_slice(&px[..3]);
+        }
+        rgb
+    }
+}
+
+/// 上から下へ並ぶ BGRA（Windows の 32 ビットの絵）を [`Pixels`] にする。`use_alpha` が偽なら
+/// 不透明として扱う（GDI で描いた絵の 4 バイト目は意味を持たない）。真でも、不透明度がすべて 0 なら
+/// 不透明として扱う（スクリーンショットの多くは 4 バイト目を使わず 0 にしている）。
+pub fn bgra_to_pixels(width: u32, height: u32, bgra: &[u8], use_alpha: bool) -> Option<Pixels> {
+    let count = (width as usize).checked_mul(height as usize)?;
+    if count == 0 || bgra.len() != count.checked_mul(4)? {
+        return None;
+    }
+    let use_alpha = use_alpha && bgra.chunks_exact(4).any(|px| px[3] != 0);
+    let mut rgba = Vec::with_capacity(bgra.len());
+    for px in bgra.chunks_exact(4) {
+        rgba.extend_from_slice(&[px[2], px[1], px[0], if use_alpha { px[3] } else { 255 }]);
+    }
+    let has_alpha = use_alpha && rgba.chunks_exact(4).any(|px| px[3] != 255);
+    Some(Pixels {
+        width,
+        height,
+        rgba,
+        has_alpha,
+    })
+}
+
+/// 色の取り出し方（BI_BITFIELDS のマスク）で、1 つの色を 0〜255 にして取り出す。
+fn mask_channel(value: u32, mask: u32) -> u8 {
+    if mask == 0 {
+        return 0;
+    }
+    let shift = mask.trailing_zeros();
+    let bits = (mask >> shift).count_ones();
+    let v = (value & mask) >> shift;
+    if bits >= 8 {
+        (v >> (bits - 8)) as u8
+    } else {
+        let max = (1u32 << bits) - 1;
+        (v * 255 / max) as u8
+    }
+}
+
+/// クリップボードの DIB を、上から下へ並ぶ画素にする。24 ビット（BI_RGB）と 32 ビット（BI_RGB・
+/// BI_BITFIELDS）だけを扱い、下から上へ並ぶもの・上から下へ並ぶもののどちらも読める。それ以外の
+/// 形（色の表を使うもの・16 ビットなど）は `None`（呼ぶ側が Windows に描かせて変換する）。
+pub fn dib_pixels(dib: &[u8]) -> Option<Pixels> {
+    let info = dib_info(dib)?;
+    let u32_at = |at: usize| -> Option<u32> {
+        dib.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let header = u32_at(0)? as usize;
+    let bottom_up = (u32_at(8)? as i32) > 0;
+    let bit_count = u32_at(12)? >> 16;
+    let compression = u32_at(16)?;
+    let (width, height) = (info.width as usize, info.height as usize);
+    let stride = (width * bit_count as usize).div_ceil(32) * 4;
+    // dib_info で、画素が足りていることは確かめてある。
+    let row = |y: usize| -> &[u8] {
+        let source = if bottom_up { height - 1 - y } else { y };
+        let start = info.bits_offset + source * stride;
+        &dib[start..start + stride]
+    };
+    let mut bgra = Vec::with_capacity(width * height * 4);
+    match (bit_count, compression) {
+        (24, 0) => {
+            for y in 0..height {
+                for px in row(y)[..width * 3].chunks_exact(3) {
+                    bgra.extend_from_slice(&[px[0], px[1], px[2], 255]);
+                }
+            }
+            bgra_to_pixels(info.width, info.height, &bgra, false)
+        }
+        (32, 0) => {
+            for y in 0..height {
+                bgra.extend_from_slice(&row(y)[..width * 4]);
+            }
+            bgra_to_pixels(info.width, info.height, &bgra, true)
+        }
+        (32, 3) => {
+            // 色の取り出し方は、見出しの直後（BITMAPINFOHEADER）か、見出しの中（V4・V5）にある。
+            let (red, green, blue) = (u32_at(40)?, u32_at(44)?, u32_at(48)?);
+            let alpha = if header >= 56 { u32_at(52)? } else { 0 };
+            for y in 0..height {
+                for px in row(y)[..width * 4].chunks_exact(4) {
+                    let v = u32::from_le_bytes([px[0], px[1], px[2], px[3]]);
+                    bgra.extend_from_slice(&[
+                        mask_channel(v, blue),
+                        mask_channel(v, green),
+                        mask_channel(v, red),
+                        mask_channel(v, alpha),
+                    ]);
+                }
+            }
+            bgra_to_pixels(info.width, info.height, &bgra, alpha != 0)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,6 +769,71 @@ mod tests {
             pinned: false,
         };
         assert_eq!(search_text(&text), "abc");
+    }
+
+    /// 横 2 画素の DIB（`rows` はファイルに置く順の画素の行）。
+    fn dib_with(bits: u16, compression: u32, height: i32, extra: &[u8], rows: &[&[u8]]) -> Vec<u8> {
+        let mut d = dib(2, height, bits, compression, 0);
+        d.extend_from_slice(extra);
+        for r in rows {
+            d.extend_from_slice(r);
+        }
+        d
+    }
+
+    #[test]
+    fn reads_24_bit_bottom_up() {
+        // 1 行 6 バイト + 埋め 2 バイト。下の行が先。
+        let bottom: &[u8] = &[1, 2, 3, 4, 5, 6, 0, 0];
+        let top: &[u8] = &[7, 8, 9, 10, 11, 12, 0, 0];
+        let p = dib_pixels(&dib_with(24, 0, 2, &[], &[bottom, top])).unwrap();
+        assert_eq!((p.width, p.height, p.has_alpha), (2, 2, false));
+        assert_eq!(p.rgba, vec![9, 8, 7, 255, 12, 11, 10, 255, 3, 2, 1, 255, 6, 5, 4, 255]);
+        assert_eq!(p.to_rgb(), vec![9, 8, 7, 12, 11, 10, 3, 2, 1, 6, 5, 4]);
+    }
+
+    #[test]
+    fn reads_32_bit_top_down_and_zero_alpha_is_opaque() {
+        let first: &[u8] = &[1, 2, 3, 0, 4, 5, 6, 0];
+        let second: &[u8] = &[7, 8, 9, 0, 10, 11, 12, 0];
+        let p = dib_pixels(&dib_with(32, 0, -2, &[], &[first, second])).unwrap();
+        assert!(!p.has_alpha);
+        assert_eq!(&p.rgba[..8], &[3, 2, 1, 255, 6, 5, 4, 255]);
+        // 不透明度を使っているときは、そのまま残す。
+        let first: &[u8] = &[1, 2, 3, 128, 4, 5, 6, 255];
+        let p = dib_pixels(&dib_with(32, 0, -2, &[], &[first, second])).unwrap();
+        assert!(p.has_alpha);
+        assert_eq!(&p.rgba[..8], &[3, 2, 1, 128, 6, 5, 4, 255]);
+        assert_eq!(p.rgba[11], 0);
+    }
+
+    #[test]
+    fn reads_32_bit_bitfields() {
+        let masks: Vec<u8> = [0x00FF_0000u32, 0x0000_FF00, 0x0000_00FF]
+            .iter()
+            .flat_map(|m| m.to_le_bytes())
+            .collect();
+        let row: &[u8] = &[1, 2, 3, 0, 4, 5, 6, 0];
+        let p = dib_pixels(&dib_with(32, 3, 2, &masks, &[row, row])).unwrap();
+        assert!(!p.has_alpha);
+        assert_eq!(&p.rgba[..8], &[3, 2, 1, 255, 6, 5, 4, 255]);
+        // 赤と青を入れ替えたマスク。
+        let swapped: Vec<u8> = [0x0000_00FFu32, 0x0000_FF00, 0x00FF_0000]
+            .iter()
+            .flat_map(|m| m.to_le_bytes())
+            .collect();
+        let p = dib_pixels(&dib_with(32, 3, 2, &swapped, &[row, row])).unwrap();
+        assert_eq!(&p.rgba[..4], &[1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn other_formats_need_gdi() {
+        let row: &[u8] = &[0, 0, 0, 0];
+        assert!(dib_pixels(&dib_with(16, 0, 2, &[], &[row, row])).is_none());
+        assert!(dib_pixels(&[0u8; 8]).is_none());
+        assert_eq!(mask_channel(0b11111, 0b11111), 255);
+        assert_eq!(mask_channel(0, 0), 0);
+        assert!(bgra_to_pixels(2, 2, &[0; 15], true).is_none());
     }
 
     #[test]

@@ -55,6 +55,7 @@ mod http;
 mod ime_indicator;
 mod ime_logic;
 mod keyboard;
+mod png;
 mod process_picker;
 mod remap_logic;
 mod sendinput;
