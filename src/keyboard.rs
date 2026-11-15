@@ -143,6 +143,12 @@ pub fn mark_released_by_us(ctrl: bool, shift: bool, alt: bool, win: bool) {
     }
 }
 
+/// アプリが Ctrl の「離した」を送ったが、利用者はまだ Ctrl を押したままか
+/// （[`mark_released_by_us`] の印が残っているか）。
+pub fn ctrl_released_by_us() -> bool {
+    RELEASED_BY_US.load(Ordering::SeqCst) & MOD_CTRL != 0
+}
+
 /// アプリが離した Ctrl・Shift を、利用者がまだ押しているなら押し直す（動作のあとで呼ぶ）。
 ///
 /// 押し直さないと、Ctrl を押したまま割り当てのキーを押し、続けて `S` を押したときに、
@@ -431,9 +437,13 @@ unsafe extern "system" fn low_level_keyboard_proc(
             }
             // 履歴の一覧を出している間のキーは、一覧に渡す（元のアプリには届けない）。一覧を出すキー
             // そのものは、下で「閉じる」として扱うので渡さない。
+            // キー割り当ての「履歴の一覧」のキーも同じ（もう一度押すと閉じる）。
             let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
-            let is_history_key =
-                history_hotkey().is_some_and(|h| kb.vkCode == h.vk && modifiers_match(&h));
+            let is_history_key = history_hotkey()
+                .is_some_and(|h| kb.vkCode == h.vk && modifiers_match(&h))
+                || (down
+                    && crate::history_window::is_open()
+                    && matches!(find_rule(kb.vkCode), Some((Action::ClipboardHistory, _))));
             if !is_history_key && crate::history_window::hook_key(kb.vkCode, down) {
                 return LRESULT(1);
             }

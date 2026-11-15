@@ -36,6 +36,7 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_SHIFT};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetAncestor,
@@ -573,9 +574,12 @@ fn history_items() -> Vec<clip_images::Item> {
 /// （空の目録で上書きして、残していた画像を失わないように）。
 fn load_image_index() -> bool {
     match clip_image_store::load_index() {
-        Ok(index) => {
-            // 目録に無いファイル（途中で終了して残ったもの）を消す。
-            clip_image_store::sweep(&index.ids());
+        Ok((index, set_aside)) => {
+            // 目録に無いファイル（途中で終了して残ったもの）を消す。目録を読めずに脇へ置いた
+            // ときは消さない（目録が空なので、ピン留めしたものも含めてすべて消えてしまう）。
+            if !set_aside {
+                clip_image_store::sweep(&index.ids());
+            }
             log::debug!("保存していた画像の履歴を読みました（{} 枚）", index.len());
             IMAGES.with(|i| *i.borrow_mut() = index);
             IMAGES_UNREADABLE.with(|u| u.set(false));
@@ -867,7 +871,9 @@ unsafe fn paste_from_history(held: &Hotkey) {
     }
     // 貼り付けている間（一覧を出し直すまでの間）も「出している」とみなし、その間に一覧を出す
     // 操作をされたら、閉じる頼みとして受け取る（新しい依頼として積まない）。
-    history_window::begin_session();
+    // 一覧を出したキーの Ctrl は、上で離したので Windows に聞いても分からない。利用者がまだ
+    // 押しているか（フックが「離した」を見ていないか）を渡す。
+    history_window::begin_session(held.ctrl && keyboard::ctrl_released_by_us());
     show_history_until_closed();
     history_window::end_session();
 }
@@ -893,12 +899,25 @@ unsafe fn show_history_until_closed() {
         // Ctrl を押しながら選んだときも、出したままにする（続けていくつも貼り付けられる）。
         let keep_open = outcome.keep_open.unwrap_or(config.view.keep_open) || outcome.ctrl_held;
         let place = outcome.resume;
+        // 出し直すかを、貼り付ける前に決める。出し直さないなら、ここで一覧を出し終えたことにする
+        // （貼り付けている間に押されたほかのキー割り当てを捨てず、一覧を出す操作も閉じる頼みに
+        // しない）。出し直すなら、その間に押されたキーは元のアプリに届けず、出し直した一覧に渡す。
+        let reopen = keep_open
+            && outcome.chosen.is_some()
+            && !outcome.left_for_other_window
+            && !target.is_invalid()
+            && !history_window::close_requested();
+        if reopen {
+            history_window::set_reopening();
+        } else {
+            history_window::end_session();
+        }
         let Some(moved_to) = apply_history_outcome(outcome, &config, target) else {
             return;
         };
         // 貼り付け先が前面でなくなっていたら（閉じられた など）、出し直さない。貼り付けている間に
         // 一覧を出す操作をされたときも、閉じる。
-        if !keep_open
+        if !reopen
             || history_window::close_requested()
             || target.is_invalid()
             || GetForegroundWindow() != target
@@ -955,14 +974,17 @@ unsafe fn apply_history_outcome(
         }
     }
     if !outcome.pin_changes.is_empty() {
+        // ピン留めを外したものは、いちばん新しいものとして戻す（文字と画像で通しの番号。画像より
+        // 下に並ばないように）。
+        let mut stamp = next_stamp();
         let changed = HISTORY.with(|h| {
             let mut h = h.borrow_mut();
             outcome.pin_changes.iter().fold(false, |changed, (text, pin)| {
                 let done = if *pin {
                     h.pin(text)
                 } else {
-                    let stamp = h.max_stamp() + 1;
-                    h.unpin_at(text, stamp)
+                    stamp += 1;
+                    h.unpin_at(text, stamp - 1)
                 };
                 done || changed
             })
@@ -1016,6 +1038,8 @@ unsafe fn apply_history_outcome(
             }
             pump_messages_until(MENU_REFOCUS_WAIT, || false);
             paste_image(id);
+            // 貼り付けのために離した Shift を、利用者がまだ押していれば押し直す。
+            keyboard::repress_released_modifiers();
             return Some(moved_to);
         }
         None => return None,
@@ -1023,8 +1047,33 @@ unsafe fn apply_history_outcome(
     // 元のウィンドウに入力が戻ってから貼り付ける。
     pump_messages_until(MENU_REFOCUS_WAIT, || false);
     log::debug!("クリップボードの履歴・定型文から貼り付けます（{} 文字）", text.chars().count());
-    paste_text(&Hotkey::unpack(0), &text);
+    paste_text_with(&Hotkey::unpack(0), &text, || send_history_paste());
+    keyboard::repress_released_modifiers();
     Some(moved_to)
+}
+
+/// 一覧から選んだものを貼り付ける Ctrl+V を送る。
+///
+/// - 利用者が Shift を押したままだと Ctrl+Shift+V（値の貼り付け など）になるので、先に離す
+///   （貼り付けのあとで [`keyboard::repress_released_modifiers`] が押し直す）。
+/// - 利用者が Ctrl を押したまま（続けて貼り付ける）なら、Ctrl の「離した」は送らない。送ると、
+///   押しているのに Windows からは離されているように見え、続けて押した Ctrl+Z が `z` になる。
+unsafe fn send_history_paste() {
+    if GetAsyncKeyState(VK_SHIFT.0 as i32) < 0 {
+        sendinput::release_modifiers(&Hotkey {
+            shift: true,
+            ..Hotkey::unpack(0)
+        });
+    }
+    if history_window::ctrl_held() {
+        sendinput::send_v_holding_ctrl();
+        // 送る間に利用者が Ctrl を離していたら、押したままにしない。
+        if !history_window::ctrl_held() {
+            sendinput::release_modifier(VK_CONTROL.0);
+        }
+    } else {
+        sendinput::send_key_sequence(&Hotkey::unpack(0), &[ctrl_v()]);
+    }
 }
 
 /// ピン留めしている件数（文字と画像の合計。一覧では、その次が「いちばん上」）。
@@ -1047,20 +1096,11 @@ unsafe fn paste_image(id: u64) {
         ime_indicator::notify("不可");
         return;
     }
-    sendinput::send_key_sequence(&Hotkey::unpack(0), &[ctrl_v()]);
+    send_history_paste();
     let (accepted, target_hung) = wait_for_paste();
-    if matches!(saved, Saved::Unavailable) {
-        // 元の内容を控えられなかった（とても大きい・写し取れない形式だけ）ときは、元に戻せない。
-        // 貼り付けた画像をクリップボードに残す（予約のままにしない）。元が画像なら履歴にある。
-        if GetClipboardOwner().ok() == Some(clip_window()) && OpenClipboard(clip_window()).is_ok() {
-            render_pending(CF_DIB);
-            let _ = CloseClipboard();
-        }
-        PENDING_IMAGE.with(|p| p.borrow_mut().take());
-    } else {
-        PENDING_IMAGE.with(|p| p.borrow_mut().take());
-        restore_after_paste(&saved);
-    }
+    // 元の内容を控えられなかった（とても大きい・写し取れない形式だけ）ときは、元に戻せない。
+    // 貼り付けた画像をクリップボードに残す（予約のままにしない）。元が画像なら履歴にある。
+    finish_offer(&saved, CF_DIB);
     if target_hung {
         log::warn!("画像の履歴: 貼り付け先が応答しないため、貼り付けをやめました");
         ime_indicator::notify("応答なし");
@@ -1167,6 +1207,11 @@ pub fn show_assignment_list() {
 ///
 /// 待っている間に利用者が別のものをコピーした場合は、それを消さないよう元に戻さない。
 unsafe fn paste_text(held: &Hotkey, text: &str) {
+    paste_text_with(held, text, || sendinput::send_key_sequence(held, &[ctrl_v()]));
+}
+
+/// [`paste_text`] の、Ctrl+V の送り方を選べるもの（履歴の一覧からは [`send_history_paste`]）。
+unsafe fn paste_text_with(held: &Hotkey, text: &str, send_paste: impl FnOnce()) {
     let saved = save_clipboard();
     if matches!(saved, Saved::Unavailable) {
         // 元の内容を控えられないときは、クリップボードを使うと元に戻せず失われるので、
@@ -1181,11 +1226,10 @@ unsafe fn paste_text(held: &Hotkey, text: &str) {
         sendinput::send_text(held, text);
         return;
     }
-    sendinput::send_key_sequence(held, &[ctrl_v()]);
+    send_paste();
 
     let (accepted, target_hung) = wait_for_paste();
-    PENDING_TEXT.with(|p| p.borrow_mut().take());
-    restore_after_paste(&saved);
+    finish_offer(&saved, CF_UNICODETEXT);
 
     if target_hung {
         // 最後まで応答が無い。入力しても届かず、あとでまとめて入ってしまうので、あきらめる。
@@ -1196,8 +1240,17 @@ unsafe fn paste_text(held: &Hotkey, text: &str) {
             "キー割り当て: 貼り付けを受け付けない入力欄のため、1 文字ずつ入力します（{}）",
             crate::excel_check::foreground_process_name().unwrap_or_else(|| "不明".into())
         );
-        // 修飾キーは Ctrl+V を送るときに離してある。
-        sendinput::send_text(&Hotkey::unpack(0), text);
+        // 修飾キーは Ctrl+V を送るときに離してある。ただし、利用者が Ctrl を押したまま履歴の
+        // 一覧から選んだときは Ctrl を押したままにしているので、入力の前に離す（押したままだと
+        // ショートカットになる。あとで押し直す）。
+        let ctrl = GetAsyncKeyState(VK_CONTROL.0 as i32) < 0;
+        sendinput::send_text(
+            &Hotkey {
+                ctrl,
+                ..Hotkey::unpack(0)
+            },
+            text,
+        );
     }
 }
 
@@ -1228,28 +1281,64 @@ unsafe fn wait_for_paste() -> (bool, bool) {
     (accepted, target_hung)
 }
 
-/// 貼り付けのために置いたものを、元の内容に戻す。
-unsafe fn restore_after_paste(saved: &Saved) {
+/// 貼り付けのために置いた予約を片付ける。元の内容に戻せたとき（または別のものがコピーされて
+/// いたとき）は、予約の中身を捨てる。戻せなかったとき（元の内容を控えられなかった・ほかの
+/// アプリがクリップボードを開いたままだった）は、予約を中身に置き換えて、空の予約を残さない
+/// （残すと、次の Ctrl+V で何も貼り付けられない）。置き換えもできなければ、中身を持ったままに
+/// して、あとで求められたら渡す。
+unsafe fn finish_offer(saved: &Saved, format: u32) {
+    if restore_after_paste(saved) || render_offer(format) {
+        match format {
+            CF_DIB => PENDING_IMAGE.with(|p| p.borrow_mut().take()),
+            _ => PENDING_TEXT.with(|p| p.borrow_mut().take()),
+        };
+    }
+}
+
+/// 予約しておいた中身を、クリップボードに渡しておく。渡せた（または、もう自分が持ち主でない）
+/// なら `true`。
+unsafe fn render_offer(format: u32) -> bool {
+    if GetClipboardOwner().ok() != Some(clip_window()) {
+        return true;
+    }
+    if !open_clipboard() {
+        log::warn!("キー割り当て: クリップボードを使えないため、貼り付けたものを渡せませんでした");
+        return false;
+    }
+    let done = GetClipboardOwner().ok() != Some(clip_window()) || render_pending(format);
+    let _ = CloseClipboard();
+    done
+}
+
+/// 貼り付けのために置いたものを、元の内容に戻す。戻せた（または別のものがコピーされていて、
+/// 戻さなくてよい）なら `true`。
+unsafe fn restore_after_paste(saved: &Saved) -> bool {
     // 自分が持ち主のままなら元に戻す（別のものがコピーされていたら戻さない）。
-    if GetClipboardOwner().ok() == Some(clip_window()) {
-        match saved {
-            Saved::Contents(Some(saved)) => {
-                if let Err(e) = restore_clipboard(saved) {
-                    log::warn!("キー割り当て: クリップボードを元に戻せませんでした: {e}");
-                }
+    if GetClipboardOwner().ok() != Some(clip_window()) {
+        log::debug!("キー割り当て: クリップボードが新しくなったため、元に戻しません");
+        return true;
+    }
+    match saved {
+        Saved::Contents(Some(saved)) => match restore_clipboard(saved) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("キー割り当て: クリップボードを元に戻せませんでした: {e}");
+                false
             }
-            // 控えられなかったときは、ここまで来ない（クリップボードを使わずに入力する）。
-            Saved::Unavailable => {}
-            Saved::Contents(None) => {
-                // もともと空（または控えられなかった）なら、空に戻す。
-                if open_clipboard() {
-                    let _ = EmptyClipboard();
-                    let _ = CloseClipboard();
-                }
+        },
+        // 控えられなかったときは、元に戻せない（文字はここまで来ない。クリップボードを使わずに
+        // 入力する）。
+        Saved::Unavailable => false,
+        // もともと空（または控えられなかった）なら、空に戻す。
+        Saved::Contents(None) => {
+            if open_clipboard() {
+                let _ = EmptyClipboard();
+                let _ = CloseClipboard();
+                true
+            } else {
+                false
             }
         }
-    } else {
-        log::debug!("キー割り当て: クリップボードが新しくなったため、元に戻しません");
     }
 }
 
@@ -1355,22 +1444,25 @@ unsafe fn pump_messages_until(timeout: Duration, done: impl Fn() -> bool) -> boo
 }
 
 /// 予約しておいた文字を、クリップボードに渡す（クリップボードは開かれている前提）。
-unsafe fn render_pending(format: u32) {
+/// 渡せなかった（渡すものはあったのに、クリップボードに置けなかった）ときだけ `false`。
+unsafe fn render_pending(format: u32) -> bool {
     let bytes = match format {
         CF_UNICODETEXT => PENDING_TEXT.with(|p| p.borrow().clone()),
         CF_DIB => PENDING_IMAGE.with(|p| p.borrow().clone()),
         _ => None,
     };
     let Some(bytes) = bytes else {
-        return;
+        return true;
     };
     if let Ok(memory) = global_copy(&bytes) {
         if SetClipboardData(format, HANDLE(memory.0)).is_err() {
             let _ = GlobalFree(memory);
         } else {
             RENDERED.with(|r| r.set(true));
+            return true;
         }
     }
+    false
 }
 
 /// クリップボード用の見えないウィンドウのプロシージャ。

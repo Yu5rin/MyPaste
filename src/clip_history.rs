@@ -693,6 +693,155 @@ impl DoubleTap {
     }
 }
 
+/// 履歴の一覧を出している間（と、その前後）のキーの行き先（[`KeyGate::on_key`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyRoute {
+    /// そのまま通す（元のアプリに届く）。
+    Pass,
+    /// 握りつぶす（どこにも渡さない）。
+    Swallow,
+    /// 握りつぶして、出している一覧に渡す。
+    Forward,
+    /// 握りつぶして、次に出す一覧に渡すために取っておく（出し直すまでの間）。
+    Queue,
+}
+
+/// キーが届いたときの一覧の様子。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GateState {
+    /// 一覧を出している。
+    pub shown: bool,
+    /// 貼り付けのあとで、一覧を出し直すところ（その間に押されたキーは、出し直した一覧に渡す）。
+    pub reopening: bool,
+    /// 右クリックのメニューを出している（その間は、キーをメニューに渡す）。
+    pub menu_open: bool,
+    /// Alt か Win を押している（Alt+Tab などは、そのまま通す）。
+    pub alt_or_win: bool,
+}
+
+/// 一覧に渡すキーと、握りつぶしたキーを覚えておく（キーボードフックで使う）。
+///
+/// 押したときに握りつぶしたキーは、離したときも握りつぶす（一覧が閉じたあとでも）。押したままの
+/// キー（オートリピート）は、受け取った一覧にだけ渡し、閉じたあと・出し直した一覧には渡さない
+/// （Enter を押したままにして、何度も貼り付けないように）。離したことを見逃したキーがいつまでも
+/// 効かなくならないよう、しばらく何も届かなかったキーは、新しく押されたものとして扱う。
+#[derive(Debug, Default)]
+pub struct KeyGate {
+    /// 握りつぶして、まだ離していないキー。
+    held: Vec<HeldKey>,
+    /// 一覧を出し直すまでの間に押されたキー。
+    queued: Vec<u32>,
+    /// 最後に出した一覧の番号（出すたびに増やす。0 はまだ出していない）。
+    generation: u32,
+}
+
+/// 握りつぶして、まだ離していないキー。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeldKey {
+    vk: u32,
+    /// 受け取った一覧の番号（[`KeyGate::QUEUED`] は、次に出す一覧に渡すもの）。
+    generation: u32,
+    /// 最後に届いた時刻（ミリ秒）。
+    time: u32,
+}
+
+impl KeyGate {
+    /// 覚えておく、握りつぶしたキーの数と、取っておくキーの数の上限。
+    pub const MAX_HELD: usize = 8;
+    pub const MAX_QUEUED: usize = 16;
+    /// これだけ何も届かなかったキーは、離したことを見逃したとみなす（押したままなら、
+    /// オートリピートが届き続ける）。
+    pub const STALE_MS: u32 = 1500;
+    /// 次に出す一覧に渡すキーの印。
+    const QUEUED: u32 = u32::MAX;
+
+    pub const fn new() -> Self {
+        Self {
+            held: Vec::new(),
+            queued: Vec::new(),
+            generation: 0,
+        }
+    }
+
+    /// キーが押された・離された（修飾キーそのものは呼ぶ側で除く。`now` はミリ秒の時刻）。
+    pub fn on_key(&mut self, vk: u32, down: bool, now: u32, state: GateState) -> KeyRoute {
+        let found = self.held.iter().position(|k| k.vk == vk);
+        if !down {
+            // 押したときに握りつぶしたキーなら、離したことも握りつぶす。
+            return match found {
+                Some(i) => {
+                    self.held.remove(i);
+                    KeyRoute::Swallow
+                }
+                None => KeyRoute::Pass,
+            };
+        }
+        if let Some(i) = found {
+            let key = &mut self.held[i];
+            if now.wrapping_sub(key.time) <= Self::STALE_MS {
+                // 押したまま（オートリピート）。受け取った一覧を出している間だけ、一覧に渡す。
+                key.time = now;
+                let same = state.shown && key.generation == self.generation;
+                return if same && !state.menu_open {
+                    KeyRoute::Forward
+                } else {
+                    KeyRoute::Swallow
+                };
+            }
+            // 離したことを見逃していた。新しく押されたものとして扱う。
+            self.held.remove(i);
+        }
+        if state.alt_or_win || (state.shown && state.menu_open) {
+            return KeyRoute::Pass;
+        }
+        if state.shown {
+            self.hold(vk, self.generation, now);
+            return KeyRoute::Forward;
+        }
+        if state.reopening {
+            self.hold(vk, Self::QUEUED, now);
+            if self.queued.len() < Self::MAX_QUEUED {
+                self.queued.push(vk);
+                return KeyRoute::Queue;
+            }
+            return KeyRoute::Swallow;
+        }
+        KeyRoute::Pass
+    }
+
+    fn hold(&mut self, vk: u32, generation: u32, time: u32) {
+        if self.held.len() < Self::MAX_HELD {
+            self.held.push(HeldKey { vk, generation, time });
+        }
+    }
+
+    /// 一覧を出した。取っておいたキー（この一覧に渡すもの）を返す。
+    pub fn shown(&mut self) -> Vec<u32> {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 || self.generation == Self::QUEUED {
+            self.generation = 1;
+        }
+        let generation = self.generation;
+        for key in self.held.iter_mut().filter(|k| k.generation == Self::QUEUED) {
+            key.generation = generation;
+        }
+        std::mem::take(&mut self.queued)
+    }
+
+    /// 一覧を出し終えた（出し直さない）。取っておいたキーは捨てる（離したときは握りつぶす）。
+    pub fn session_ended(&mut self) {
+        self.queued.clear();
+        for key in self.held.iter_mut().filter(|k| k.generation == Self::QUEUED) {
+            key.generation = 0;
+        }
+    }
+
+    /// しばらく何も届かなかったキーを忘れる（一覧を出し始めるとき）。
+    pub fn prune(&mut self, now: u32) {
+        self.held.retain(|k| now.wrapping_sub(k.time) <= Self::STALE_MS);
+    }
+}
+
 /// 一覧の 1 行に出す文字（最初の空でない行。タブは空白に）と、全体の行数。
 pub fn row_text(text: &str) -> (String, usize) {
     let first = text
@@ -1032,5 +1181,128 @@ mod tests {
         assert!(h.remove("a"));
         assert!(!h.remove("a"));
         assert_eq!(items(&h), ["b"]);
+    }
+
+    const SHOWN: GateState = GateState {
+        shown: true,
+        reopening: false,
+        menu_open: false,
+        alt_or_win: false,
+    };
+    const CLOSED: GateState = GateState {
+        shown: false,
+        reopening: false,
+        menu_open: false,
+        alt_or_win: false,
+    };
+    const REOPENING: GateState = GateState {
+        shown: false,
+        reopening: true,
+        menu_open: false,
+        alt_or_win: false,
+    };
+    const ENTER: u32 = 0x0D;
+    const DOWN: u32 = 0x28;
+
+    #[test]
+    fn gate_forwards_keys_and_swallows_their_release() {
+        let mut gate = KeyGate::new();
+        assert!(gate.shown().is_empty());
+        assert_eq!(gate.on_key(DOWN, true, 0, SHOWN), KeyRoute::Forward);
+        // 押したまま（オートリピート）は、同じ一覧には渡す。
+        assert_eq!(gate.on_key(DOWN, true, 30, SHOWN), KeyRoute::Forward);
+        assert_eq!(gate.on_key(DOWN, false, 60, SHOWN), KeyRoute::Swallow);
+        // 一覧を出す前から押していたキーを離したときは通す。
+        assert_eq!(gate.on_key(ENTER, false, 70, SHOWN), KeyRoute::Pass);
+        // 一覧を出していなければ通す。
+        assert_eq!(gate.on_key(ENTER, true, 80, CLOSED), KeyRoute::Pass);
+        // Alt+Tab などは通す。
+        let alt = GateState { alt_or_win: true, ..SHOWN };
+        assert_eq!(gate.on_key(0x09, true, 90, alt), KeyRoute::Pass);
+    }
+
+    #[test]
+    fn gate_swallows_held_key_after_close() {
+        let mut gate = KeyGate::new();
+        gate.shown();
+        assert_eq!(gate.on_key(ENTER, true, 0, SHOWN), KeyRoute::Forward);
+        // 一覧が閉じたあとのオートリピートと離したときは、元のアプリに届けない。
+        assert_eq!(gate.on_key(ENTER, true, 500, CLOSED), KeyRoute::Swallow);
+        gate.session_ended();
+        assert_eq!(gate.on_key(ENTER, true, 530, CLOSED), KeyRoute::Swallow);
+        assert_eq!(gate.on_key(ENTER, false, 560, CLOSED), KeyRoute::Swallow);
+        assert_eq!(gate.on_key(ENTER, true, 600, CLOSED), KeyRoute::Pass);
+    }
+
+    #[test]
+    fn gate_does_not_repeat_into_reopened_list() {
+        let mut gate = KeyGate::new();
+        gate.shown();
+        assert_eq!(gate.on_key(ENTER, true, 0, SHOWN), KeyRoute::Forward);
+        assert_eq!(gate.on_key(ENTER, true, 400, REOPENING), KeyRoute::Swallow);
+        assert!(gate.shown().is_empty());
+        // 出し直した一覧には、前の一覧で押した Enter のオートリピートを渡さない。
+        assert_eq!(gate.on_key(ENTER, true, 600, SHOWN), KeyRoute::Swallow);
+        assert_eq!(gate.on_key(ENTER, false, 650, SHOWN), KeyRoute::Swallow);
+        assert_eq!(gate.on_key(ENTER, true, 700, SHOWN), KeyRoute::Forward);
+    }
+
+    #[test]
+    fn gate_queues_keys_while_reopening() {
+        let mut gate = KeyGate::new();
+        gate.shown();
+        assert_eq!(gate.on_key(DOWN, true, 0, REOPENING), KeyRoute::Queue);
+        assert_eq!(gate.on_key(DOWN, false, 20, REOPENING), KeyRoute::Swallow);
+        assert_eq!(gate.on_key(ENTER, true, 40, REOPENING), KeyRoute::Queue);
+        assert_eq!(gate.shown(), vec![DOWN, ENTER]);
+        // 出し直す前に押して、まだ押している Enter は、出し直した一覧のものとして扱う。
+        assert_eq!(gate.on_key(ENTER, true, 70, SHOWN), KeyRoute::Forward);
+        assert_eq!(gate.on_key(ENTER, false, 90, SHOWN), KeyRoute::Swallow);
+        // 出し直さずに終わったら、取っておいたキーは捨てる。
+        assert_eq!(gate.on_key(DOWN, true, 100, REOPENING), KeyRoute::Queue);
+        gate.session_ended();
+        assert!(gate.shown().is_empty());
+        assert_eq!(gate.on_key(DOWN, true, 130, SHOWN), KeyRoute::Swallow);
+        assert_eq!(gate.on_key(DOWN, false, 140, SHOWN), KeyRoute::Swallow);
+        // 取っておける数には上限がある（超えた分は捨てる）。
+        for i in 0..(KeyGate::MAX_QUEUED as u32 + 4) {
+            gate.on_key(0x41 + i, true, 200, REOPENING);
+        }
+        assert_eq!(gate.shown().len(), KeyGate::MAX_QUEUED);
+    }
+
+    #[test]
+    fn gate_menu_gets_keys() {
+        let mut gate = KeyGate::new();
+        gate.shown();
+        let menu = GateState { menu_open: true, ..SHOWN };
+        assert_eq!(gate.on_key(0x5D, true, 0, SHOWN), KeyRoute::Forward);
+        // メニューを出している間は、新しいキーはメニューへ。メニューを出したキーの
+        // オートリピートと、離したときは握りつぶす。
+        assert_eq!(gate.on_key(DOWN, true, 10, menu), KeyRoute::Pass);
+        assert_eq!(gate.on_key(0x5D, true, 30, menu), KeyRoute::Swallow);
+        assert_eq!(gate.on_key(0x5D, false, 40, menu), KeyRoute::Swallow);
+        assert_eq!(gate.on_key(DOWN, false, 50, menu), KeyRoute::Pass);
+    }
+
+    #[test]
+    fn gate_forgets_missed_releases() {
+        let mut gate = KeyGate::new();
+        gate.shown();
+        assert_eq!(gate.on_key(ENTER, true, 0, SHOWN), KeyRoute::Forward);
+        // 離したことを見逃した（UAC の画面の上で離した など）。しばらくしたら、また使える。
+        let later = KeyGate::STALE_MS + 1;
+        assert_eq!(gate.on_key(ENTER, true, later, CLOSED), KeyRoute::Pass);
+        assert_eq!(gate.on_key(ENTER, false, later + 10, CLOSED), KeyRoute::Pass);
+        // 出し始めるときにも、古いものを忘れる。
+        gate.shown();
+        assert_eq!(gate.on_key(DOWN, true, 0, SHOWN), KeyRoute::Forward);
+        gate.prune(later);
+        assert_eq!(gate.on_key(DOWN, false, later, CLOSED), KeyRoute::Pass);
+        // 覚えておく数には上限がある（いつまでも増えない）。
+        for i in 0..(KeyGate::MAX_HELD as u32 + 4) {
+            assert_eq!(gate.on_key(0x41 + i, true, 0, SHOWN), KeyRoute::Forward);
+        }
+        assert_eq!(gate.on_key(0x41 + KeyGate::MAX_HELD as u32, false, 0, SHOWN), KeyRoute::Pass);
     }
 }

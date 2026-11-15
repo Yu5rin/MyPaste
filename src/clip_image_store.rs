@@ -36,29 +36,59 @@ fn thumb_path(id: u64) -> Option<PathBuf> {
     dir().map(|d| d.join(format!("{id}.thm")))
 }
 
+/// 目録を読み残したときに、目録と画像のファイルを移しておくフォルダー（`clip_images` の中）。
+const UNREADABLE_DIR: &str = "unreadable";
+
 /// 目録を読む。無ければ空。別のユーザー・別の PC で保存したもので元に戻せないときや、中身が
-/// 壊れているときは、`index.unreadable.dat` として残して空を返す。ファイルがあるのに読めない
+/// 壊れているときは、`index.unreadable.dat` として残し、画像のファイルも `unreadable` に移して
+/// （新しい画像で上書きしたり、目録に無いものとして消したりしないように）、空を返す。このときは
+/// `(空, true)`（呼び出し側は、目録に無いファイルを消さない）。ファイルがあるのに読めない
 /// （ほかのアプリが使っている など）ときは `Err`（呼び出し側は、その間は画像を覚えない。
 /// 空の目録で上書きすると、残していた画像を失うため）。
-pub fn load_index() -> Result<Index, String> {
-    let Some(path) = dir().map(|d| d.join(INDEX_FILE)) else {
-        return Ok(Index::default());
+pub fn load_index() -> Result<(Index, bool), String> {
+    let Some(dir) = dir() else {
+        return Ok((Index::default(), false));
     };
+    let path = dir.join(INDEX_FILE);
     let data = match std::fs::read(&path) {
         Ok(data) => data,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Index::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Index::default(), false)),
         Err(e) => return Err(e.to_string()),
     };
     let index = clip_store::unprotect(&data)
         .ok_or_else(|| "元に戻せません（別のユーザー・PC で保存したもの）".to_string())
         .and_then(|plain| Index::from_json(&String::from_utf8_lossy(&plain)));
     match index {
-        Ok(index) => Ok(index),
+        Ok(index) => Ok((index, false)),
         Err(e) => {
             let backup = path.with_extension("unreadable.dat");
             let _ = std::fs::rename(&path, &backup);
+            set_aside_images(&dir);
             log::warn!("画像の履歴の目録を読めなかったため、空から始めます: {e}");
-            Ok(Index::default())
+            Ok((Index::default(), true))
+        }
+    }
+}
+
+/// 画像のファイル（`.img` / `.thm`）を、`unreadable` のフォルダーに移す。
+fn set_aside_images(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let aside = dir.join(UNREADABLE_DIR);
+    if std::fs::create_dir_all(&aside).is_err() {
+        return;
+    }
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_ours = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e == "img" || e == "thm");
+        if let (true, Some(name)) = (is_ours, path.file_name()) {
+            if let Err(e) = std::fs::rename(&path, aside.join(name)) {
+                log::warn!("画像の履歴: 読めない目録の画像を移せませんでした: {e}");
+            }
         }
     }
 }

@@ -42,6 +42,7 @@ use windows::Win32::Graphics::Gdi::{
     PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
@@ -68,7 +69,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
-use crate::clip_history::{self, MenuPosition, Palette, Theme};
+use crate::clip_history::{self, GateState, KeyGate, KeyRoute, MenuPosition, Palette, Theme};
 use crate::config::Snippet;
 use crate::clip_images::{self, Item, Thumb};
 use crate::ui;
@@ -121,53 +122,62 @@ static TIP: AtomicIsize = AtomicIsize::new(0);
 static MENU_OPEN: AtomicBool = AtomicBool::new(false);
 /// 利用者が Ctrl を押しているか（押している間は、貼り付けても一覧を閉じない）。
 static CTRL_HELD: AtomicBool = AtomicBool::new(false);
-/// 一覧が受け取って握りつぶしたキー（離したときも握りつぶすため。8 個まで）。
-static HELD_KEYS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// 貼り付けのあとで一覧を出し直すところ（その間に押されたキーは、出し直した一覧に渡す）。
+static REOPENING: AtomicBool = AtomicBool::new(false);
+/// 一覧の外を押して閉じた（このときは、元のウィンドウに戻さない）。
+static CLICKED_OUTSIDE: AtomicBool = AtomicBool::new(false);
+/// 一覧に渡したキーと、握りつぶしたキー（離したときも握りつぶすため）。[`POPUP`] を変えるときも
+/// これを握り、キーボードフックが見る一覧と食い違わないようにする。
+static KEYS: Mutex<KeyGate> = Mutex::new(KeyGate::new());
+
+fn keys() -> std::sync::MutexGuard<'static, KeyGate> {
+    KEYS.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 /// キーボードフックから呼ぶ。一覧を出している間のキーを一覧に渡す。渡した（元のアプリには
 /// 届けない）なら `true`。Shift・Ctrl などの修飾キーそのものと、Alt・Win を押しながらのキー
 /// （Alt+Tab など）は、そのまま通す。
+///
+/// 一覧が握りつぶしたキーは、一覧が閉じたあとも、離すまで握りつぶす（押したままの Enter が
+/// 元のアプリに届かないように）。貼り付けて一覧を出し直すまでの間に押されたキーは、出し直した
+/// 一覧に渡す。
 pub fn hook_key(vk: u32, down: bool) -> bool {
     // Ctrl を押しているかは、ここで覚える（貼り付けのために Ctrl+V を送ると、Windows から見た
     // Ctrl の状態が変わるので、あとから調べても分からない）。0x11 = Ctrl、0xA2 / 0xA3 = 左右の Ctrl
-    if OPEN.load(Ordering::SeqCst) && matches!(vk, 0x11 | 0xA2 | 0xA3) {
+    if matches!(vk, 0x11 | 0xA2 | 0xA3) {
         CTRL_HELD.store(down, Ordering::SeqCst);
-    }
-    let popup = POPUP.load(Ordering::SeqCst);
-    if popup == 0 || MENU_OPEN.load(Ordering::SeqCst) {
-        return false;
     }
     const MODIFIERS: [u32; 11] = [0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5];
     if MODIFIERS.contains(&vk) {
         return false;
     }
-    let mut held = HELD_KEYS.lock().unwrap_or_else(|p| p.into_inner());
-    if !down {
-        // 一覧が受け取ったキーを離したときだけ握りつぶす（一覧を出す前から押していたキーは通す）。
-        return match held.iter().position(|k| *k == vk) {
-            Some(i) => {
-                held.remove(i);
-                true
-            }
-            None => false,
-        };
-    }
     // 0x12 = Alt、0x5B / 0x5C = Win
-    if [0x12, 0x5B, 0x5C].iter().any(|key| unsafe { GetAsyncKeyState(*key) } < 0) {
-        return false;
+    let alt_or_win =
+        down && [0x12, 0x5B, 0x5C].iter().any(|key| unsafe { GetAsyncKeyState(*key) } < 0);
+    let now = unsafe { GetTickCount() };
+    let mut gate = keys();
+    let popup = POPUP.load(Ordering::SeqCst);
+    let state = GateState {
+        shown: popup != 0,
+        reopening: REOPENING.load(Ordering::SeqCst) && OPEN.load(Ordering::SeqCst),
+        menu_open: MENU_OPEN.load(Ordering::SeqCst),
+        alt_or_win,
+    };
+    match gate.on_key(vk, down, now, state) {
+        KeyRoute::Pass => false,
+        KeyRoute::Swallow | KeyRoute::Queue => true,
+        KeyRoute::Forward => {
+            unsafe {
+                let _ = PostMessageW(
+                    HWND(popup as *mut core::ffi::c_void),
+                    WM_APP_KEY,
+                    WPARAM(vk as usize),
+                    LPARAM(0),
+                );
+            }
+            true
+        }
     }
-    if !held.contains(&vk) && held.len() < 8 {
-        held.push(vk);
-    }
-    unsafe {
-        let _ = PostMessageW(
-            HWND(popup as *mut core::ffi::c_void),
-            WM_APP_KEY,
-            WPARAM(vk as usize),
-            LPARAM(0),
-        );
-    }
-    true
 }
 
 /// マウスフックから呼ぶ（ボタンを押したとき）。一覧の外を押したら、一覧を閉じる。
@@ -179,6 +189,8 @@ pub fn hook_mouse_down(x: i32, y: i32) {
     if point_in_window(popup, x, y) || point_in_window(TIP.load(Ordering::SeqCst), x, y) {
         return;
     }
+    // 押したウィンドウを使いたいので、閉じたあとで元のウィンドウに戻さない。
+    CLICKED_OUTSIDE.store(true, Ordering::SeqCst);
     CLOSE_REQUESTED.store(true, Ordering::SeqCst);
     unsafe {
         let _ = PostMessageW(
@@ -354,16 +366,37 @@ pub fn is_open() -> bool {
 }
 
 /// 一覧を出し始める（貼り付けて出し直すまでの間も、出しているとみなす）。
-pub fn begin_session() {
-    CTRL_HELD.store(unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0, Ordering::SeqCst);
+///
+/// `ctrl_held` は、一覧を出したキーの Ctrl を、利用者がまだ押しているか（一覧を出す前に、
+/// アプリが Ctrl の「離した」を送っているので、Windows に聞いても分からない）。
+pub fn begin_session(ctrl_held: bool) {
+    keys().prune(unsafe { GetTickCount() });
+    let ctrl_down = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0;
+    CTRL_HELD.store(ctrl_down || ctrl_held, Ordering::SeqCst);
     CLOSE_REQUESTED.store(false, Ordering::SeqCst);
+    REOPENING.store(false, Ordering::SeqCst);
     OPEN.store(true, Ordering::SeqCst);
 }
 
-/// 一覧を出し終えた。
+/// 一覧を出し終えた（もう出し直さない）。貼り付ける前に呼んでよい（貼り付けている間に押された
+/// ほかのキー割り当てを、捨てずに実行するため）。
 pub fn end_session() {
+    let mut gate = keys();
+    gate.session_ended();
+    REOPENING.store(false, Ordering::SeqCst);
     OPEN.store(false, Ordering::SeqCst);
     CLOSE_REQUESTED.store(false, Ordering::SeqCst);
+}
+
+/// 貼り付けのあとで一覧を出し直す（その間に押されたキーは、元のアプリに届けず、出し直した
+/// 一覧に渡す）。
+pub fn set_reopening() {
+    REOPENING.store(true, Ordering::SeqCst);
+}
+
+/// 利用者が Ctrl を押しているか（キーボードフックが見た、実際のキーの状態）。
+pub fn ctrl_held() -> bool {
+    CTRL_HELD.load(Ordering::SeqCst)
 }
 
 /// 閉じるよう頼まれているか（貼り付けている間に、一覧を出す操作をされた）。
@@ -680,14 +713,26 @@ pub unsafe fn choose(
     show_page(hwnd);
     pump_for(SHOW_WAIT);
 
-    HELD_KEYS.lock().unwrap_or_else(|p| p.into_inner()).clear();
-    TIP.store(tip.0 as isize, Ordering::SeqCst);
-    POPUP.store(hwnd.0 as isize, Ordering::SeqCst);
+    {
+        let mut gate = keys();
+        // 出し直すまでの間に押されたキーを、この一覧に渡す。
+        let queued = gate.shown();
+        REOPENING.store(false, Ordering::SeqCst);
+        CLICKED_OUTSIDE.store(false, Ordering::SeqCst);
+        TIP.store(tip.0 as isize, Ordering::SeqCst);
+        POPUP.store(hwnd.0 as isize, Ordering::SeqCst);
+        for vk in queued {
+            let _ = PostMessageW(hwnd, WM_APP_KEY, WPARAM(vk as usize), LPARAM(0));
+        }
+    }
     SetTimer(hwnd, TIMER_WATCH, WATCH_INTERVAL_MS, None);
     run_loop(hwnd);
     let _ = KillTimer(hwnd, TIMER_WATCH);
-    POPUP.store(0, Ordering::SeqCst);
-    TIP.store(0, Ordering::SeqCst);
+    {
+        let _gate = keys();
+        POPUP.store(0, Ordering::SeqCst);
+        TIP.store(0, Ordering::SeqCst);
+    }
     let outcome = with_state(|st| {
         st.outcome.resume = Resume {
             tab: st.tab.index(),
@@ -770,6 +815,10 @@ unsafe fn run_loop(hwnd: HWND) {
     while !is_done() {
         let ret = GetMessageW(&mut msg, None, 0, 0);
         if CLOSE_REQUESTED.swap(false, Ordering::SeqCst) {
+            if CLICKED_OUTSIDE.swap(false, Ordering::SeqCst) {
+                // ほかのウィンドウを押して閉じた（そちらを使いたいので、元のウィンドウに戻さない）。
+                with_state(|st| st.outcome.left_for_other_window = true);
+            }
             finish(None);
         }
         if ret.0 <= 0 {
@@ -917,9 +966,10 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
         }
     };
     let range = clip_history::page_range(page, count, page_size);
-    // 一覧は前面ではないので、押されているかは、キーボードそのものの状態で調べる。
+    // 一覧は前面ではないので、押されているかは、キーボードそのものの状態で調べる。Ctrl は、
+    // アプリが「離した」を送っても利用者が押したままのことがあるので、フックが見た状態も使う。
     let shift = GetAsyncKeyState(VK_SHIFT.0 as i32) < 0;
-    let ctrl = GetAsyncKeyState(VK_CONTROL.0 as i32) < 0;
+    let ctrl = GetAsyncKeyState(VK_CONTROL.0 as i32) < 0 || CTRL_HELD.load(Ordering::SeqCst);
     let (tab, layout) = with_state(|st| (st.tab, st.layout)).unwrap_or((Tab::History, Layout::List));
     // 帯では左右で選び、上下でタブを切り替える（一覧・パネルではその逆）。
     let (vk_prev, vk_next, vk_tab_prev, vk_tab_next) = if layout == Layout::Band {
@@ -1146,7 +1196,9 @@ unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
     )
     .0 as usize;
     let _ = DestroyMenu(menu);
-    if !target.is_invalid() && chosen != MENU_EDIT_SNIPPETS {
+    // 一覧が前面のままのときだけ戻す（メニューの外のほかのウィンドウを押して閉じたときは、
+    // そちらを使いたいので取り返さない）。
+    if !target.is_invalid() && chosen != MENU_EDIT_SNIPPETS && GetForegroundWindow() == hwnd {
         let _ = SetForegroundWindow(target);
     }
     with_state(|st| st.away = 0);

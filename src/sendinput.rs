@@ -122,6 +122,22 @@ pub fn send_text(held: &Hotkey, text: &str) {
     send(&inputs);
 }
 
+/// 利用者が Ctrl を押したままのときの Ctrl+V: V だけを送り、Ctrl の「離した」は送らない
+/// （送ると、利用者は押しているのに Windows からは離されているように見え、続けて押した
+/// Ctrl+Z が `z` になる）。Windows から見て Ctrl が離されている（アプリが離した）ときは、
+/// 先に押す（利用者が離すまで、押したままにする）。
+pub fn send_v_holding_ctrl() {
+    let ctrl_down = unsafe { (GetAsyncKeyState(i32::from(VK_CONTROL.0)) as u16 & 0x8000) != 0 };
+    let mut inputs = if ctrl_down {
+        Vec::new()
+    } else {
+        side_inputs(VK_CONTROL.0, false)
+    };
+    inputs.push(key(VK_V, false));
+    inputs.push(key(VK_V, true));
+    send(&inputs);
+}
+
 /// Alt や Win を押したまま割り当てたキーを押したとき、キーを送らない動作（プログラムを開く・
 /// 何もしない など）のあとで Alt や Win を離すと、メニューやスタートが開いてしまう。
 /// それを防ぐため、何も割り当てられていないキーを 1 回打鍵する（修飾キーは離さない）。
