@@ -896,9 +896,73 @@ pub fn page_label(page: usize, len: usize, size: usize) -> String {
     format!("{}〜{} / {len}", range.start + 1, range.end)
 }
 
+/// 絞り込んでいるときの、一覧の上に出すページ（例 `1〜5 / 該当 5`）。
+pub fn filtered_page_label(page: usize, len: usize, size: usize) -> String {
+    let range = page_range(page, len, size);
+    if range.is_empty() {
+        return "該当なし".to_string();
+    }
+    format!("{}〜{} / 該当 {len}", range.start + 1, range.end)
+}
+
+/// 検索のために、大文字と小文字の違いをなくす。
+pub fn fold_case(text: &str) -> String {
+    text.to_lowercase()
+}
+
+/// 検索の言葉（空白で区切ったもの。全角の空白でも区切る）。大文字と小文字の違いはなくしておく。
+pub fn query_terms(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| c.is_whitespace() || c == '\u{3000}')
+        .filter(|t| !t.is_empty())
+        .map(fold_case)
+        .collect()
+}
+
+/// 文（[`fold_case`] したもの）が、検索の言葉をすべて含むか（言葉が無ければ、いつも `true`）。
+pub fn matches_terms(folded: &str, terms: &[String]) -> bool {
+    terms.iter().all(|t| folded.contains(t.as_str()))
+}
+
+/// 絞り込んだ一覧（元の位置の並び）で、元の位置 `wanted` のもの、無ければその次（後ろに無ければ
+/// 最後）を出している位置。空なら `None`。
+pub fn nearest_position(visible: &[usize], wanted: usize) -> Option<usize> {
+    if visible.is_empty() {
+        return None;
+    }
+    Some(visible.iter().position(|v| *v >= wanted).unwrap_or(visible.len() - 1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_terms_match_case_insensitively() {
+        let terms = query_terms("  Hello　ＷＯＲＬＤ ");
+        assert_eq!(terms, vec!["hello".to_string(), "ｗｏｒｌｄ".to_string()]);
+        assert!(matches_terms(&fold_case("say HELLO to the ＷＯＲＬＤ"), &terms));
+        assert!(!matches_terms(&fold_case("hello"), &terms));
+        assert!(matches_terms("anything", &query_terms("")));
+        assert!(matches_terms(&fold_case("請求書の件"), &query_terms("請求")));
+    }
+
+    #[test]
+    fn nearest_position_keeps_or_moves_forward() {
+        let visible = [1, 4, 7];
+        assert_eq!(nearest_position(&visible, 4), Some(1));
+        assert_eq!(nearest_position(&visible, 5), Some(2));
+        assert_eq!(nearest_position(&visible, 0), Some(0));
+        assert_eq!(nearest_position(&visible, 9), Some(2));
+        assert_eq!(nearest_position(&[], 0), None);
+    }
+
+    #[test]
+    fn filtered_label_shows_matches() {
+        assert_eq!(filtered_page_label(0, 5, 20), "1〜5 / 該当 5");
+        assert_eq!(filtered_page_label(1, 25, 20), "21〜25 / 該当 25");
+        assert_eq!(filtered_page_label(0, 0, 20), "該当なし");
+    }
 
     fn items(h: &History) -> Vec<String> {
         h.items().cloned().collect()

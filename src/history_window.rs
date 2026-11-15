@@ -2,8 +2,8 @@
 //!
 //! 一覧を出す操作をすると、入力位置（またはマウス）の近くに、1 ピクセルの枠だけの細長い画面を出す。
 //!
-//! - 上: タブ（「履歴」「定型文」）と、ページ（`1〜20 / 1000`）。左右の矢印キーかクリックで
-//!   タブを切り替える。
+//! - 上: タブ（「履歴」「定型文」）と、ページ（`1〜20 / 1000`。絞り込んでいるときは
+//!   `1〜5 / 該当 5`）。左右の矢印キーかクリックでタブを切り替える。その下の段に、検索の欄。
 //! - 一覧: 1 ページに決めた件数（既定 20 件）。1 行に 1 件、番号・最初の行（定型文は名前）・行数を
 //!   出し、1 行おきに色を変える。マウスを乗せた行・矢印キーで選んだ行が選ばれる。
 //! - 選んだものが 1 行に収まらないとき（定型文はいつも）、選んだ行の横に全文の吹き出しを出す。
@@ -14,9 +14,17 @@
 //! 履歴は Delete で 1 件を消せる。右クリック（またはアプリケーションキー）で、定型文への登録・
 //! 削除・定型文の編集のメニューを出す。
 //!
+//! 検索: Ctrl+F か `/`（または検索の欄をクリック）で、検索の欄に入力欄を出す。入力した言葉で、
+//! 今のタブを絞り込む（大文字と小文字は区別しない。空白で区切ると、すべてを含むもの。定型文は
+//! 名前と本文、画像は一覧に出す文で探す）。入力している間も、上下・PageUp / PageDown で選び、
+//! Enter で貼り付けられる。Esc の 1 回目で検索をやめ（言葉も消す）、2 回目で閉じる。
+//! 絞り込んだ一覧の位置は、元の一覧の位置に置き換えてから消す・ピン留め・貼り付けをする。
+//!
 //! 一覧は前面（アクティブ）にしない。前面にすると、元のアプリの入力欄からカーソルが外れて
 //! 貼り付けられなくなることがあるため。キー操作はキーボードフック（[`hook_key`]）から、一覧の外の
-//! クリックとホイールはマウスフックから受け取る。
+//! クリックとホイールはマウスフックから受け取る。ただし、右クリックのメニューを出している間と、
+//! 検索の欄に入力している間（日本語入力を使えるように）は前面にし、キーはそのまま一覧に届ける。
+//! 閉じるとき・検索をやめるときに、元のアプリに前面を戻す。
 //!
 //! 実行スレッド（[`crate::actions`]）で、閉じるまで専用のメッセージループを回す。
 //! ページ分けと表示する文の整え方は [`crate::clip_history`] / [`crate::snippets`] にあり、
@@ -34,7 +42,8 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, S
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, ClientToScreen, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
     GetDC, GetMonitorInfoW, GetSysColor, GetTextExtentPoint32W, InvalidateRect, MonitorFromPoint,
-    MonitorFromWindow, ReleaseDC, SelectObject, SetBkMode, SetTextColor, COLOR_BTNFACE,
+    MonitorFromWindow, ReleaseDC, SelectObject, SetBkColor, SetBkMode, SetTextColor, UpdateWindow,
+    COLOR_BTNFACE,
     COLOR_BTNSHADOW, COLOR_BTNTEXT, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT,
     COLOR_INFOBK, COLOR_INFOTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, DRAW_TEXT_FORMAT, DT_CALCRECT,
     DT_CENTER, DT_END_ELLIPSIS, DT_EXPANDTABS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE,
@@ -44,18 +53,20 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, EM_SETSEL, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::Ime::ImmAssociateContextEx;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_APPS, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F10, VK_HOME,
-    VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
+    GetAsyncKeyState, SetFocus, VK_APPS, VK_CONTROL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END,
+    VK_ESCAPE, VK_F10, VK_HOME, VK_LEFT, VK_NEXT, VK_OEM_2, VK_PRIOR, VK_RETURN, VK_RIGHT,
+    VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetClientRect, GetCursorPos, GetDlgItem, GetForegroundWindow,
-    GetGUIThreadInfo, GetMessageW, GetWindowRect, GetWindowThreadProcessId, IsChild, LoadCursorW,
-    IDC_ARROW, WM_RBUTTONDOWN,
+    GetGUIThreadInfo, GetMessageW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsChild, LoadCursorW, SetWindowTextW, EN_CHANGE, ES_AUTOHSCROLL,
+    HWND_TOP, IDC_ARROW, WM_COMMAND, WM_CTLCOLOREDIT, WM_RBUTTONDOWN, WS_CLIPCHILDREN,
     PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow, SetLayeredWindowAttributes,
     SetWindowPos, ShowWindow, TrackPopupMenuEx, TranslateMessage, GUITHREADINFO, HMENU,
     HWND_TOPMOST, LB_GETITEMRECT, LB_ITEMFROMPOINT, LB_SETCOUNT, LB_SETCURSEL, LB_SETITEMHEIGHT,
@@ -77,10 +88,14 @@ use crate::{clip_image_store, ime_indicator, snippets};
 
 const ID_HEADER: i32 = 1;
 const ID_LIST: i32 = 2;
+/// 検索の入力欄（見出しの子）。
+const ID_SEARCH: i32 = 3;
 
-/// 一覧の 1 行の高さと、見出しの高さ（96 DPI 基準）。
+/// 一覧の 1 行の高さと、見出しの高さ（96 DPI 基準）。見出しは 2 段で、上の段にタブとページ、
+/// 下の段に検索の欄を置く。
 const ROW_H: i32 = 18;
 const HEADER_H: i32 = 20;
+const FILTER_H: i32 = 20;
 /// 番号の欄と、行数の欄の幅（96 DPI 基準）。
 const NUMBER_W: i32 = 28;
 const LINES_W: i32 = 30;
@@ -120,6 +135,9 @@ static POPUP: AtomicIsize = AtomicIsize::new(0);
 static TIP: AtomicIsize = AtomicIsize::new(0);
 /// 右クリックのメニューを出している（その間は、キーをメニューに渡す）。
 static MENU_OPEN: AtomicBool = AtomicBool::new(false);
+/// 検索の入力欄に入力している（その間は一覧を前面にしているので、キーは握りつぶさずに
+/// 入力欄に届ける。日本語入力も使える）。
+static SEARCHING: AtomicBool = AtomicBool::new(false);
 /// 利用者が Ctrl を押しているか（押している間は、貼り付けても一覧を閉じない）。
 static CTRL_HELD: AtomicBool = AtomicBool::new(false);
 /// 貼り付けのあとで一覧を出し直すところ（その間に押されたキーは、出し直した一覧に渡す）。
@@ -160,7 +178,8 @@ pub fn hook_key(vk: u32, down: bool) -> bool {
     let state = GateState {
         shown: popup != 0,
         reopening: REOPENING.load(Ordering::SeqCst) && OPEN.load(Ordering::SeqCst),
-        menu_open: MENU_OPEN.load(Ordering::SeqCst),
+        // 検索の入力欄に入力している間も、メニューと同じく、キーは一覧（前面）にそのまま届ける。
+        menu_open: MENU_OPEN.load(Ordering::SeqCst) || SEARCHING.load(Ordering::SeqCst),
         alt_or_win,
     };
     match gate.on_key(vk, down, now, state) {
@@ -245,6 +264,7 @@ const MENU_EDIT_SNIPPETS: usize = 4;
 const MENU_CLOSE: usize = 5;
 const MENU_PIN: usize = 6;
 const MENU_KEEP: usize = 7;
+const MENU_SEARCH: usize = 8;
 /// ピン留めした行の左端に引く線の太さ（96 DPI 基準）。
 const PIN_BAR_W: i32 = 3;
 
@@ -311,15 +331,19 @@ pub enum Pick {
     Image(u64),
 }
 
-/// 一覧を閉じたときの、タブと選んでいた位置（出したままにするとき、同じ所から出し直す）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// 一覧を閉じたときの、タブと選んでいた位置と絞り込み（出したままにするとき、同じ所から
+/// 出し直す）。位置は、絞り込む前の一覧での位置。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Resume {
     tab: usize,
     places: [(Option<usize>, usize); 2],
+    /// 検索の言葉（出し直したときも、同じ言葉で絞り込んだまま出す）。
+    query: String,
 }
 
 impl Resume {
-    /// 出していたタブで選ぶ位置を変える（貼り付けたものが、いちばん上に移ったとき）。
+    /// 出していたタブで選ぶ位置（絞り込む前の一覧での位置）を変える（貼り付けたものが、
+    /// いちばん上に移ったとき）。
     pub fn with_selected(mut self, position: usize) -> Resume {
         self.places[self.tab % 2].0 = Some(position);
         self
@@ -456,8 +480,17 @@ struct State {
     target: HWND,
     away: u32,
     tab: Tab,
-    /// タブごとの (選んでいる位置, 出しているページ)。
+    /// タブごとの (選んでいる位置, 出しているページ)。位置は、絞り込んだ一覧（[`State::visible`]）
+    /// での位置。
     places: [(Option<usize>, usize); 2],
+    /// タブごとの、絞り込んだ一覧に出すものの、元の一覧での位置。
+    visible: [Vec<usize>; 2],
+    /// 検索の言葉。
+    query: String,
+    /// 検索の入力欄に入力している（一覧を前面にしている）。
+    searching: bool,
+    /// 検索で探す文（大文字と小文字の違いをなくしたもの。最初に検索するときに作る）。
+    folded: Option<[Vec<String>; 2]>,
     page_size: usize,
     opacity: u32,
     dpi: u32,
@@ -469,6 +502,9 @@ struct State {
     tab_rects: [RECT; 2],
     /// 見出しの中の「出したまま」の範囲。
     keep_rect: RECT,
+    /// 見出しの下の段の、検索の欄の範囲と、そこに置いた入力欄の範囲（置いていなければ空）。
+    search_rect: RECT,
+    edit_rect: RECT,
     /// 全文の吹き出しと、そこに出している文（画像のときは絵）。
     tip: HWND,
     tip_text: String,
@@ -484,16 +520,81 @@ struct State {
 }
 
 impl State {
+    /// 今のタブの、絞り込んだ一覧の件数。
     fn len(&self) -> usize {
-        match self.tab {
-            Tab::History => self.history.len(),
-            Tab::Snippets => self.snippets.len(),
+        self.visible[self.tab.index()].len()
+    }
+
+    /// 絞り込んだ一覧での位置 `pos` の、元の一覧（`history` / `snippets`）での位置。
+    fn actual(&self, pos: usize) -> Option<usize> {
+        self.visible[self.tab.index()].get(pos).copied()
+    }
+
+    /// 絞り込んでいるか（見出しに、該当の件数を出す）。
+    fn filtered(&self) -> bool {
+        !clip_history::query_terms(&self.query).is_empty()
+    }
+
+    /// 検索で探す文（大文字と小文字の違いをなくしたもの）。
+    fn fold_all(&self) -> [Vec<String>; 2] {
+        [
+            self.history
+                .iter()
+                .map(|item| clip_history::fold_case(&clip_images::search_text(item)))
+                .collect(),
+            self.snippets.iter().map(snippet_haystack).collect(),
+        ]
+    }
+
+    /// 絞り込んだ一覧を作り直す。
+    fn rebuild(&mut self) {
+        let terms = clip_history::query_terms(&self.query);
+        if !terms.is_empty() && self.folded.is_none() {
+            self.folded = Some(self.fold_all());
         }
+        let hit = |list: usize, i: usize| {
+            terms.is_empty()
+                || self
+                    .folded
+                    .as_ref()
+                    .and_then(|f| f[list].get(i))
+                    .is_some_and(|text| clip_history::matches_terms(text, &terms))
+        };
+        let history: Vec<usize> = (0..self.history.len()).filter(|i| hit(0, *i)).collect();
+        let snippets: Vec<usize> = (0..self.snippets.len()).filter(|i| hit(1, *i)).collect();
+        self.visible = [history, snippets];
+    }
+
+    /// 絞り込み直す。選んでいたものは、絞り込んだあとも残っていれば選んだままにする
+    /// （残っていなければ、その次のもの）。
+    fn refilter(&mut self) {
+        let wanted =
+            [0, 1].map(|i| self.places[i].0.and_then(|p| self.visible[i].get(p).copied()));
+        self.rebuild();
+        self.restore_places(wanted);
+    }
+
+    /// 元の一覧での位置 `wanted` を選ぶ（無ければ、その次のもの。`None` なら最初のもの）。
+    fn restore_places(&mut self, wanted: [Option<usize>; 2]) {
+        for (i, wanted) in wanted.into_iter().enumerate() {
+            let visible = &self.visible[i];
+            let selected = clip_history::nearest_position(visible, wanted.unwrap_or(0));
+            self.places[i] = (selected, selected.map_or(0, |s| s / self.page_size));
+        }
+    }
+
+    /// 閉じるときの位置（元の一覧での位置にする）。
+    fn actual_places(&self) -> [(Option<usize>, usize); 2] {
+        [0, 1].map(|i| {
+            let (selected, page) = self.places[i];
+            (selected.and_then(|p| self.visible[i].get(p).copied()), page)
+        })
     }
 
     /// 位置 `index` が履歴の画像なら、その番号。
     fn image_id(&self, index: usize) -> Option<u64> {
-        match (self.tab, self.history.get(index)?) {
+        let actual = self.actual(index)?;
+        match (self.tab, self.history.get(actual)?) {
             (Tab::History, Item::Image(entry)) => Some(entry.id),
             _ => None,
         }
@@ -528,36 +629,44 @@ impl State {
         self.places[self.tab.index()] = (selected, page);
     }
 
-    /// 位置 `index` の行に出すもの: (番号, 出す文, 行数, ピン留めしているか)。
+    /// 位置 `index` の行に出すもの: (番号, 出す文, 行数, ピン留めしているか)。番号は、絞り込む
+    /// 前の一覧での番号。
     fn row(&self, index: usize) -> Option<(usize, String, usize, bool)> {
+        let actual = self.actual(index)?;
         match self.tab {
-            Tab::History => match self.history.get(index)? {
+            Tab::History => match self.history.get(actual)? {
                 Item::Text { text, pinned } => {
                     let (shown, lines) = clip_history::row_text(text);
-                    Some((index + 1, shown, lines, *pinned))
+                    Some((actual + 1, shown, lines, *pinned))
                 }
                 Item::Image(entry) => {
-                    Some((index + 1, clip_images::row_label(entry), 1, entry.pinned))
+                    Some((actual + 1, clip_images::row_label(entry), 1, entry.pinned))
                 }
             },
             Tab::Snippets => {
-                let snippet = self.snippets.get(index)?;
+                let snippet = self.snippets.get(actual)?;
                 let lines = clip_history::row_text(&snippet.text).1;
-                Some((index + 1, snippets::display_name(snippet), lines, false))
+                Some((actual + 1, snippets::display_name(snippet), lines, false))
             }
         }
     }
 
     /// 位置 `index` の全文。
     fn full_text(&self, index: usize) -> Option<String> {
+        let actual = self.actual(index)?;
         match self.tab {
-            Tab::History => match self.history.get(index)? {
+            Tab::History => match self.history.get(actual)? {
                 Item::Text { text, .. } => Some(text.clone()),
                 Item::Image(_) => None,
             },
-            Tab::Snippets => self.snippets.get(index).map(|s| s.text.clone()),
+            Tab::Snippets => self.snippets.get(actual).map(|s| s.text.clone()),
         }
     }
+}
+
+/// 定型文の、検索で探す文（名前と本文。大文字と小文字の違いをなくしたもの）。
+fn snippet_haystack(snippet: &Snippet) -> String {
+    clip_history::fold_case(&format!("{}\n{}", snippet.name, snippet.text))
 }
 
 thread_local! {
@@ -587,7 +696,7 @@ pub unsafe fn choose(
     let layout = Layout::of(view.position);
     let work = work_area(monitor);
     let (work_w, work_h) = (work.right - work.left, work.bottom - work.top);
-    let header_h = ui::scale(HEADER_H, dpi);
+    let header_h = ui::scale(HEADER_H + FILTER_H, dpi);
 
     // 画面の形ごとに、1 ページの件数・1 件の大きさ・一覧の大きさを決める。
     let (page_size, item_w, item_h, list_w, list_h) = match layout {
@@ -619,18 +728,14 @@ pub unsafe fn choose(
     let font = ui::create_ui_font(dpi);
     let colors = view.theme.palette().unwrap_or_else(|| system_palette());
     let counts = [history.len(), snippets.len()];
-    // 前に閉じたときの場所があれば、そこから（件数が減っていれば収まる所へ）。無ければ、
-    // 中身のある最初のタブから始める。
-    let mut places = [(None, 0); 2];
-    for (i, count) in counts.iter().enumerate() {
-        let wanted = resume.and_then(|r| r.places[i].0).unwrap_or(0);
-        let selected = (*count > 0).then(|| wanted.min(count - 1));
-        places[i] = (selected, selected.map_or(0, |s| s / page_size));
-    }
-    let tab = match resume {
+    // 前に閉じたときの場所と絞り込みがあれば、そこから（件数が減っていれば収まる所へ）。
+    // 無ければ、中身のある最初のタブから始める。
+    let wanted = [0, 1].map(|i| resume.as_ref().and_then(|r| r.places[i].0));
+    let tab = match &resume {
         Some(resume) => Tab::from_index(resume.tab),
         None => Tab::from_index(counts.iter().position(|c| *c > 0).unwrap_or(0)),
     };
+    let query = resume.map(|r| r.query).unwrap_or_default();
     STATE.with(|s| {
         *s.borrow_mut() = Some(State {
             history,
@@ -641,7 +746,11 @@ pub unsafe fn choose(
             target,
             away: 0,
             tab,
-            places,
+            places: [(None, 0); 2],
+            visible: [Vec::new(), Vec::new()],
+            query,
+            searching: false,
+            folded: None,
             page_size,
             opacity: view.opacity,
             dpi,
@@ -650,6 +759,8 @@ pub unsafe fn choose(
             back_brush: CreateSolidBrush(COLORREF(colors.back)),
             tab_rects: [RECT::default(); 2],
             keep_rect: RECT::default(),
+            search_rect: RECT::default(),
+            edit_rect: RECT::default(),
             tip,
             tip_text: String::new(),
             tip_image: None,
@@ -660,8 +771,13 @@ pub unsafe fn choose(
             done: false,
         })
     });
+    with_state(|st| {
+        st.rebuild();
+        st.restore_places(wanted);
+    });
     set_opacity(hwnd, view.opacity);
     create_header(hwnd);
+    create_search_edit(control(hwnd, ID_HEADER), font);
     let list = create_list(hwnd, layout, font);
     let _ = SetWindowPos(
         control(hwnd, ID_HEADER),
@@ -736,11 +852,24 @@ pub unsafe fn choose(
         let _gate = keys();
         POPUP.store(0, Ordering::SeqCst);
         TIP.store(0, Ordering::SeqCst);
+        SEARCHING.store(false, Ordering::SeqCst);
+    }
+    // 検索やメニューのために一覧を前面にしたまま閉じるときは、貼り付け先に前面を戻してから閉じる
+    // （閉じたあとで、ほかのウィンドウが前面にならないように）。ほかのウィンドウを押して閉じた
+    // ときと、定型文の編集を開くときは戻さない。
+    let give_back = with_state(|st| {
+        !st.target.is_invalid() && !st.outcome.left_for_other_window && !st.outcome.edit_snippets
+    })
+    .unwrap_or(false);
+    if give_back && GetForegroundWindow() == hwnd {
+        let target = with_state(|st| st.target).unwrap_or_default();
+        let _ = SetForegroundWindow(target);
     }
     let outcome = with_state(|st| {
         st.outcome.resume = Resume {
             tab: st.tab.index(),
-            places: st.places,
+            places: st.actual_places(),
+            query: st.query.clone(),
         };
         std::mem::take(&mut st.outcome)
     });
@@ -974,7 +1103,32 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
     // アプリが「離した」を送っても利用者が押したままのことがあるので、フックが見た状態も使う。
     let shift = GetAsyncKeyState(VK_SHIFT.0 as i32) < 0;
     let ctrl = GetAsyncKeyState(VK_CONTROL.0 as i32) < 0 || CTRL_HELD.load(Ordering::SeqCst);
-    let (tab, layout) = with_state(|st| (st.tab, st.layout)).unwrap_or((Tab::History, Layout::List));
+    let (tab, layout, searching, has_query) =
+        with_state(|st| (st.tab, st.layout, st.searching, !st.query.is_empty()))
+            .unwrap_or((Tab::History, Layout::List, false, false));
+    if searching {
+        // 検索の入力欄に入力している間は、選ぶ・貼り付ける・閉じるキーだけをここで受け取り、
+        // ほかのキー（文字・左右・Home / End・Delete など）は入力欄に渡す。上下は、帯でも選ぶ
+        // のに使う（左右は入力欄の中で動くのに使う）。
+        match vk {
+            v if v == VK_ESCAPE.0 => {
+                // 1 回目の Esc は、検索をやめて言葉を消す（2 回目で閉じる）。
+                clear_query(hwnd);
+                leave_search(hwnd, true);
+            }
+            v if v == VK_RETURN.0 => choose_current(),
+            v if v == VK_UP.0 => move_to(current - 1),
+            v if v == VK_DOWN.0 => move_to(current + 1),
+            v if v == VK_PRIOR.0 => turn_page(hwnd, -1),
+            v if v == VK_NEXT.0 => turn_page(hwnd, 1),
+            v if v == VK_TAB.0 => switch_tab(hwnd, tab.step(if shift { -1 } else { 1 })),
+            v if v == VK_APPS.0 || (v == VK_F10.0 && shift) => {
+                context_menu(hwnd, selected_row_point(hwnd), true);
+            }
+            _ => return false,
+        }
+        return true;
+    }
     // 帯では左右で選び、上下でタブを切り替える（一覧・パネルではその逆）。
     let (vk_prev, vk_next, vk_tab_prev, vk_tab_next) = if layout == Layout::Band {
         (VK_LEFT.0, VK_RIGHT.0, VK_UP.0, VK_DOWN.0)
@@ -982,7 +1136,12 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
         (VK_UP.0, VK_DOWN.0, VK_LEFT.0, VK_RIGHT.0)
     };
     match vk {
+        // 検索の言葉で絞り込んだまま出し直したときは、1 回目の Esc で絞り込みをやめる。
+        v if v == VK_ESCAPE.0 && has_query => clear_query(hwnd),
         v if v == VK_ESCAPE.0 => finish(None),
+        // Ctrl+F か / で検索を始める。
+        v if v == u16::from(b'F') && ctrl => enter_search(hwnd),
+        v if (v == VK_OEM_2.0 || v == VK_DIVIDE.0) && !ctrl => enter_search(hwnd),
         v if v == VK_RETURN.0 => choose_current(),
         v if v == vk_prev => move_to(current - 1),
         v if v == vk_next => move_to(current + 1),
@@ -1059,14 +1218,19 @@ fn choose_current() {
 unsafe fn remove_current(hwnd: HWND) {
     let removed = with_state(|st| {
         let pos = st.selected()?;
-        if st.tab != Tab::History || pos >= st.history.len() {
+        let actual = st.actual(pos)?;
+        if st.tab != Tab::History || actual >= st.history.len() {
             return None;
         }
-        match st.history.remove(pos) {
+        match st.history.remove(actual) {
             Item::Text { text, .. } => st.outcome.removed.push(text),
             Item::Image(entry) => st.outcome.removed_images.push(entry.id),
         }
-        let count = st.history.len();
+        if let Some(folded) = st.folded.as_mut() {
+            folded[0].remove(actual);
+        }
+        st.rebuild();
+        let count = st.len();
         let selected = (count > 0).then(|| pos.min(count - 1));
         st.set_place(selected, selected.map_or(0, |s| s / st.page_size));
         Some(())
@@ -1098,10 +1262,11 @@ unsafe fn register_current(hwnd: HWND) {
             return Some(Err("上限"));
         }
         st.outcome.registered.push(snippet.text.clone());
-        st.snippets.push(snippet);
-        if st.places[1].0.is_none() {
-            st.places[1].0 = Some(0);
+        if let Some(folded) = st.folded.as_mut() {
+            folded[1].push(snippet_haystack(&snippet));
         }
+        st.snippets.push(snippet);
+        st.refilter();
         Some(Ok(()))
     })
     .flatten();
@@ -1124,7 +1289,8 @@ unsafe fn toggle_pin_current(hwnd: HWND) {
         if st.tab != Tab::History {
             return None;
         }
-        match st.history.get_mut(pos)? {
+        let actual = st.actual(pos)?;
+        match st.history.get_mut(actual)? {
             Item::Text { text, pinned } => {
                 *pinned = !*pinned;
                 let change = (text.clone(), *pinned);
@@ -1153,10 +1319,133 @@ unsafe fn toggle_keep_open(hwnd: HWND) {
     let _ = InvalidateRect(control(hwnd, ID_HEADER), None, true);
 }
 
+/// 検索の入力欄。
+unsafe fn search_edit(hwnd: HWND) -> HWND {
+    GetDlgItem(control(hwnd, ID_HEADER), ID_SEARCH).unwrap_or_default()
+}
+
+/// 検索を始める: 見出しの下の段に入力欄を出し、一覧を前面にして入力欄に入力できるようにする
+/// （日本語入力を使うには、前面にする必要がある）。前面にできなければ、検索をやめる。
+unsafe fn enter_search(hwnd: HWND) {
+    let edit = search_edit(hwnd);
+    let Some((target, already, query)) =
+        with_state(|st| (st.target, st.searching, st.query.clone()))
+    else {
+        return;
+    };
+    if edit.is_invalid() {
+        return;
+    }
+    if !already {
+        // 前面にする前に知らせておく（前面になってすぐ押されたキーも、入力欄に届くように）。
+        with_state(|st| st.searching = true);
+        SEARCHING.store(true, Ordering::SeqCst);
+        let header = control(hwnd, ID_HEADER);
+        let _ = InvalidateRect(header, None, true);
+        // 描き直して、入力欄を置く範囲を決める。
+        let _ = UpdateWindow(header);
+        place_search_edit(hwnd);
+        let _ = SetWindowTextW(edit, &HSTRING::from(query.as_str()));
+        if !bring_to_front(hwnd, target) {
+            log::debug!("クリップボードの履歴: 検索のために一覧を前面にできませんでした");
+            leave_search(hwnd, false);
+            ime_indicator::notify("不可");
+            return;
+        }
+    }
+    let _ = SetFocus(edit);
+    let end = GetWindowTextLengthW(edit).max(0) as usize;
+    SendMessageW(edit, EM_SETSEL, WPARAM(end), LPARAM(end as isize));
+}
+
+/// 検索の入力欄を、見出しの下の段の検索の欄に置く（置く範囲が変わったときだけ動かす）。
+unsafe fn place_search_edit(hwnd: HWND) {
+    let Some(Some(rect)) = with_state(|st| {
+        if !st.searching {
+            return None;
+        }
+        let inset = ui::scale(2, st.dpi);
+        let rect = RECT {
+            left: st.search_rect.left + inset * 2,
+            top: st.search_rect.top + inset,
+            right: st.search_rect.right - inset,
+            bottom: st.search_rect.bottom - inset,
+        };
+        if rect == st.edit_rect {
+            return None;
+        }
+        st.edit_rect = rect;
+        Some(rect)
+    }) else {
+        return;
+    };
+    let _ = SetWindowPos(
+        search_edit(hwnd),
+        HWND_TOP,
+        rect.left,
+        rect.top,
+        (rect.right - rect.left).max(1),
+        (rect.bottom - rect.top).max(1),
+        SWP_SHOWWINDOW | SWP_NOACTIVATE,
+    );
+}
+
+/// 検索の入力欄を隠し、入力をやめる。`give_back` なら、貼り付け先に前面を戻す。
+unsafe fn leave_search(hwnd: HWND, give_back: bool) {
+    let Some(target) = with_state(|st| {
+        st.searching = false;
+        st.edit_rect = RECT::default();
+        st.away = 0;
+        st.target
+    }) else {
+        return;
+    };
+    SEARCHING.store(false, Ordering::SeqCst);
+    let _ = ShowWindow(search_edit(hwnd), SW_HIDE);
+    if give_back && !target.is_invalid() && GetForegroundWindow() == hwnd {
+        let _ = SetForegroundWindow(target);
+    }
+    let _ = InvalidateRect(control(hwnd, ID_HEADER), None, true);
+}
+
+/// 検索の言葉を消して、絞り込みをやめる。
+unsafe fn clear_query(hwnd: HWND) {
+    with_state(|st| {
+        st.query.clear();
+        st.refilter();
+    });
+    // 入力欄の文字も消す（消したことの知らせでは、もう言葉が空なので何もしない）。
+    let _ = SetWindowTextW(search_edit(hwnd), w!(""));
+    show_page(hwnd);
+}
+
+/// 検索の入力欄の文字が変わった。その言葉で絞り込み直す。
+unsafe fn on_search_changed(hwnd: HWND) {
+    let edit = search_edit(hwnd);
+    let mut buffer = vec![0u16; GetWindowTextLengthW(edit).max(0) as usize + 1];
+    let len = GetWindowTextW(edit, &mut buffer).max(0) as usize;
+    let text = String::from_utf16_lossy(&buffer[..len.min(buffer.len())]);
+    let changed = with_state(|st| {
+        if st.query == text {
+            return false;
+        }
+        st.query = text;
+        st.refilter();
+        true
+    });
+    if changed == Some(true) {
+        show_page(hwnd);
+    }
+}
+
 /// 右クリックのメニューを出す。
 unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
     let Some((tab, has_row, pinned, is_image, keep_open)) = with_state(|st| {
-        let item = st.selected().filter(|_| st.tab == Tab::History).and_then(|p| st.history.get(p));
+        let item = st
+            .selected()
+            .filter(|_| st.tab == Tab::History)
+            .and_then(|p| st.actual(p))
+            .and_then(|a| st.history.get(a));
         let pinned = item.is_some_and(Item::pinned);
         let is_image = matches!(item, Some(Item::Image(_)));
         (st.tab, on_row && st.selected().is_some(), pinned, is_image, st.keep_open)
@@ -1181,6 +1470,7 @@ unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
         let _ = AppendMenuW(menu, row_flag, MENU_DELETE, w!("この履歴を削除(&D)\tDelete"));
     }
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let _ = AppendMenuW(menu, MF_STRING, MENU_SEARCH, w!("検索(&Q)\tCtrl+F"));
     let keep_flag = if keep_open { MF_STRING | MF_CHECKED } else { MF_STRING };
     let _ = AppendMenuW(menu, keep_flag, MENU_KEEP, w!("貼り付けても出したままにする(&K)\tK"));
     let _ = AppendMenuW(menu, MF_STRING, MENU_EDIT_SNIPPETS, w!("定型文の編集...(&E)"));
@@ -1200,14 +1490,23 @@ unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
     )
     .0 as usize;
     let _ = DestroyMenu(menu);
-    // 一覧が前面のままのときだけ戻す（メニューの外のほかのウィンドウを押して閉じたときは、
-    // そちらを使いたいので取り返さない）。
-    if !target.is_invalid() && chosen != MENU_EDIT_SNIPPETS && GetForegroundWindow() == hwnd {
+    let searching = with_state(|st| st.searching).unwrap_or(false);
+    if searching {
+        // 検索の入力欄に入力している間は、一覧を前面のままにし、入力欄に戻る。
+        let _ = SetFocus(search_edit(hwnd));
+    } else if !target.is_invalid()
+        && chosen != MENU_EDIT_SNIPPETS
+        && chosen != MENU_SEARCH
+        && GetForegroundWindow() == hwnd
+    {
+        // 一覧が前面のままのときだけ戻す（メニューの外のほかのウィンドウを押して閉じたときは、
+        // そちらを使いたいので取り返さない）。
         let _ = SetForegroundWindow(target);
     }
     with_state(|st| st.away = 0);
     MENU_OPEN.store(false, Ordering::SeqCst);
     match chosen {
+        MENU_SEARCH => enter_search(hwnd),
         MENU_PASTE => choose_current(),
         MENU_REGISTER => register_current(hwnd),
         MENU_PIN => toggle_pin_current(hwnd),
@@ -1493,13 +1792,27 @@ fn blend(a: u32, b: u32, percent: u32) -> u32 {
 unsafe fn paint_header(hwnd: HWND) {
     let mut ps = PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
-    let mut rect = RECT::default();
-    let _ = GetClientRect(hwnd, &mut rect);
+    let mut whole = RECT::default();
+    let _ = GetClientRect(hwnd, &mut whole);
+    let mut placed_edit = false;
     if let Some((colors, font, dpi, tab, label, keep_open)) = with_state(|st| {
-        let label = clip_history::page_label(st.page(), st.len(), st.page_size);
+        let label = if st.filtered() {
+            clip_history::filtered_page_label(st.page(), st.len(), st.page_size)
+        } else {
+            clip_history::page_label(st.page(), st.len(), st.page_size)
+        };
         (st.colors, st.font, st.dpi, st.tab, label, st.keep_open)
     }) {
-        fill(hdc, &rect, colors.header_back);
+        // 上の段（タブ・出したまま・ページ）と、下の段（検索の欄）。
+        let rect = RECT {
+            bottom: (whole.top + ui::scale(HEADER_H, dpi)).min(whole.bottom),
+            ..whole
+        };
+        let lower = RECT {
+            top: rect.bottom,
+            ..whole
+        };
+        fill(hdc, &whole, colors.header_back);
         let old = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT);
         // タブ: 選んでいるタブは一覧と同じ色にして、つながって見えるようにする。
@@ -1567,9 +1880,56 @@ unsafe fn paint_header(hwnd: HWND) {
             ..rect
         };
         draw_line(hdc, &label, &mut page_rect, DT_RIGHT | DT_END_ELLIPSIS);
+        placed_edit = paint_filter_row(hdc, lower, colors, dpi);
         SelectObject(hdc, old);
     }
     let _ = EndPaint(hwnd, &ps);
+    if placed_edit {
+        // 検索の欄の範囲が変わったら、入力欄を動かす（描き終えてから）。
+        if let Ok(parent) = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd) {
+            place_search_edit(parent);
+        }
+    }
+}
+
+/// 見出しの下の段（検索の欄）を描く。入力欄に入力しているなら `true`（入力欄を置き直す）。
+unsafe fn paint_filter_row(hdc: HDC, row: RECT, colors: Palette, dpi: u32) -> bool {
+    let Some((query, searching)) = with_state(|st| (st.query.clone(), st.searching)) else {
+        return false;
+    };
+    let pad = ui::scale(PAD, dpi);
+    let inset = ui::scale(2, dpi);
+    let search = RECT {
+        left: row.left + pad,
+        top: row.top + inset / 2,
+        right: (row.right - pad).max(row.left + pad),
+        bottom: row.bottom - inset,
+    };
+    // 入力欄のような枠（入力しているときは、選んだ行と同じ色の枠にする）。
+    fill(hdc, &search, if searching { colors.sel_back } else { colors.border });
+    let inner = RECT {
+        left: search.left + 1,
+        top: search.top + 1,
+        right: search.right - 1,
+        bottom: search.bottom - 1,
+    };
+    fill(hdc, &inner, colors.back);
+    if !searching {
+        // 言葉が無ければ使い方を薄く、あれば絞り込んでいる言葉を出す。
+        let (text, color) = if query.is_empty() {
+            ("検索（Ctrl+F）".to_string(), colors.sub)
+        } else {
+            (format!("検索: {query}"), colors.text)
+        };
+        SetTextColor(hdc, COLORREF(color));
+        let mut text_rect = RECT {
+            left: inner.left + inset * 2,
+            ..inner
+        };
+        draw_line(hdc, &text, &mut text_rect, DT_LEFT | DT_END_ELLIPSIS);
+    }
+    with_state(|st| st.search_rect = search);
+    searching
 }
 
 /// 選んでいるものが 1 行に収まらない（複数行か、途中で切れている）とき、または定型文のときは、
@@ -1765,14 +2125,40 @@ unsafe extern "system" fn header_proc(
         WM_ERASEBKGND => LRESULT(1),
         WM_LBUTTONDOWN => {
             let x = (lparam.0 & 0xFFFF) as u16 as i16 as i32;
-            let (rects, keep) = with_state(|st| (st.tab_rects, st.keep_rect)).unwrap_or_default();
+            let y = ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+            let hit = |r: &RECT| x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+            let (rects, keep, search) =
+                with_state(|st| (st.tab_rects, st.keep_rect, st.search_rect)).unwrap_or_default();
             let parent = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd).unwrap_or_default();
-            if let Some(i) = rects.iter().position(|r| x >= r.left && x < r.right) {
+            if let Some(i) = rects.iter().position(hit) {
                 switch_tab(parent, Tab::from_index(i));
-            } else if x >= keep.left && x < keep.right {
+            } else if hit(&keep) {
                 toggle_keep_open(parent);
+            } else if hit(&search) {
+                enter_search(parent);
             }
             LRESULT(0)
+        }
+        // 検索の入力欄の文字が変わった。
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as i32;
+            let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
+            if id == ID_SEARCH && code == EN_CHANGE {
+                let parent =
+                    windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd).unwrap_or_default();
+                on_search_changed(parent);
+            }
+            LRESULT(0)
+        }
+        // 検索の入力欄の色（一覧と同じ配色にする）。
+        WM_CTLCOLOREDIT => {
+            let Some((colors, brush)) = with_state(|st| (st.colors, st.back_brush)) else {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            };
+            let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+            SetTextColor(hdc, COLORREF(colors.text));
+            SetBkColor(hdc, COLORREF(colors.back));
+            LRESULT(brush.0 as isize)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
@@ -1880,7 +2266,8 @@ unsafe fn create_header(parent: HWND) {
         WINDOW_EX_STYLE::default(),
         class_name,
         w!(""),
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+        // 検索の入力欄（子）の上には描かない。
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_CLIPCHILDREN.0),
         0,
         0,
         0,
@@ -1890,6 +2277,30 @@ unsafe fn create_header(parent: HWND) {
         instance,
         None,
     );
+}
+
+/// 検索の入力欄（見出しの子。検索を始めるまで隠しておく）を作る。
+unsafe fn create_search_edit(header: HWND, font: HFONT) {
+    let Ok(instance) = GetModuleHandleW(None) else {
+        return;
+    };
+    let Ok(edit) = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        w!("EDIT"),
+        w!(""),
+        WINDOW_STYLE(WS_CHILD.0 | ES_AUTOHSCROLL as u32),
+        0,
+        0,
+        0,
+        0,
+        header,
+        HMENU(ID_SEARCH as isize as *mut core::ffi::c_void),
+        instance,
+        None,
+    ) else {
+        return;
+    };
+    SendMessageW(edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
 }
 
 /// 全文の吹き出しを作る（まだ表示しない）。作れなければ無効なハンドル（吹き出しなしで動く）。

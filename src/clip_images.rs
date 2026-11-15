@@ -232,6 +232,14 @@ pub fn row_label(entry: &Entry) -> String {
     }
 }
 
+/// 検索で探す文（文字は全文、画像は一覧に出す文）。
+pub fn search_text(item: &Item) -> String {
+    match item {
+        Item::Text { text, .. } => text.clone(),
+        Item::Image(entry) => row_label(entry),
+    }
+}
+
 /// クリップボードの DIB（`CF_DIB`）の見出しから読み取ったもの。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DibInfo {
@@ -572,5 +580,11 @@ mod tests {
         assert_eq!(row_label(&e), "画像 1920×1080");
         e.time = "11/14 15:02".into();
         assert_eq!(row_label(&e), "画像 1920×1080  11/14 15:02");
+        assert_eq!(search_text(&Item::Image(e)), "画像 1920×1080  11/14 15:02");
+        let text = Item::Text {
+            text: "abc".into(),
+            pinned: false,
+        };
+        assert_eq!(search_text(&text), "abc");
     }
 }

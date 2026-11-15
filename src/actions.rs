@@ -906,7 +906,7 @@ unsafe fn show_history_until_closed() {
         };
         // Ctrl を押しながら選んだときも、出したままにする（続けていくつも貼り付けられる）。
         let keep_open = outcome.keep_open.unwrap_or(config.view.keep_open) || outcome.ctrl_held;
-        let place = outcome.resume;
+        let place = outcome.resume.clone();
         // 出し直すかを、貼り付ける前に決める。出し直さないなら、ここで一覧を出し終えたことにする
         // （貼り付けている間に押されたほかのキー割り当てを捨てず、一覧を出す操作も閉じる頼みに
         // しない）。出し直すなら、その間に押されたキーは元のアプリに届けず、出し直した一覧に渡す。
