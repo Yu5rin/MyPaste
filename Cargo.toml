@@ -16,6 +16,10 @@ codegen-units = 1
 panic = "abort"     # パニック時のアンワインドコードを省く
 strip = true        # シンボル情報を除去
 
+# 画像の圧縮だけは速さを優先する（全体はサイズ優先のまま）
+[profile.release.package.miniz_oxide]
+opt-level = 3
+
 [dependencies]
 # 動作の記録（トラブル調査用。書き込みは src/log.rs で自前で行う）
 log = "0.4"
@@ -24,6 +28,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # 更新ファイルの SHA256 検証
 sha2 = "0.11.0"
+# 履歴に入れる画像の圧縮（DEFLATE。Rust だけで書かれていて、C のビルドを伴わない）
+miniz_oxide = "0.9"
 # HTTPS 通信には Windows 標準の WinHTTP を使う（下記 windows crate の feature）。
 # rustls / OpenSSL 系のクレートは C・アセンブリのビルドを伴い、
 # 環境によってはビルドに失敗するため採用しない。証明書の検証は OS に任せる。
