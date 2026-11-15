@@ -124,6 +124,7 @@ const ID_BADGE_WHEN: i32 = 185;
 const ID_BADGE_HOLD: i32 = 186;
 const ID_BADGE_OPACITY: i32 = 187;
 const ID_BADGE_IBEAM: i32 = 188;
+const ID_BADGE_ENABLED: i32 = 189;
 
 /// 画面の中身の大きさ（96 DPI 基準）。ノート PC（1366x768、表示 125%）でも収まる大きさにする。
 const CLIENT_W: i32 = 500;
@@ -178,6 +179,12 @@ const PAGE_REMAP: &[Item] = &[
     item(ID_APPS, Kind::MultiEdit, "", 24, 216, 452, 142),
 ];
 
+/// 小さな印を出す場所の選択肢（出すかどうかは、チェックボックスで決める）。
+const BADGE_PLACES: [(Badge, &str); 2] = [
+    (Badge::Caret, "入力位置の横（分からないときはマウスの横）"),
+    (Badge::Mouse, "マウスカーソルの横"),
+];
+
 /// 「入力モード」のページ。
 const PAGE_IME: &[Item] = &[
     item(ID_IME_ENABLED, Kind::Check, "入力モード（あ / A）を表示する（メニューの「入力モードの表示」と同じ）", 16, 48, 468, 22),
@@ -200,21 +207,22 @@ const PAGE_IME: &[Item] = &[
     item(ID_OPACITY, Kind::NumberEdit, "", 140, 248, 70, 24),
     item(230, Kind::Label, "%（30〜100）", 216, 248, 150, 24),
     item(ID_PREVIEW, Kind::Button, "プレビュー(&P)", 366, 246, 110, 28),
-    item(231, Kind::Group, "いまの入力モードを、小さな印で出す", 12, 282, 476, 110),
-    item(232, Kind::Label, "出す場所", 24, 302, 66, 24),
-    item(ID_BADGE, Kind::Combo, "", 92, 302, 262, 200),
-    item(233, Kind::Label, "大きさ", 364, 302, 44, 24),
-    item(ID_BADGE_SIZE, Kind::NumberEdit, "", 410, 302, 40, 24),
-    item(234, Kind::Label, "px", 454, 302, 24, 24),
-    item(235, Kind::Label, "出すとき", 24, 332, 66, 24),
-    item(ID_BADGE_WHEN, Kind::Combo, "", 92, 332, 210, 200),
-    item(ID_BADGE_HOLD, Kind::Edit, "", 308, 332, 32, 24),
-    item(236, Kind::Label, "秒", 344, 332, 16, 24),
-    item(237, Kind::Label, "不透明度", 366, 332, 56, 24),
-    item(ID_BADGE_OPACITY, Kind::NumberEdit, "", 424, 332, 34, 24),
-    item(238, Kind::Label, "%", 462, 332, 16, 24),
-    item(ID_BADGE_IBEAM, Kind::Check, "マウスカーソルが文字入力の形（I）になったら出す（おまかせのとき）", 24, 362, 452, 22),
-    item(ID_FULLSCREEN, Kind::Check, "全画面のアプリ（ゲーム・動画・発表など）では表示しない", 16, 398, 468, 22),
+    item(231, Kind::Group, "小さな印", 12, 280, 476, 122),
+    item(ID_BADGE_ENABLED, Kind::Check, "いまの入力モードを、小さな印で出す", 24, 298, 440, 22),
+    item(232, Kind::Label, "出す場所", 24, 322, 66, 24),
+    item(ID_BADGE, Kind::Combo, "", 92, 322, 262, 200),
+    item(233, Kind::Label, "大きさ", 364, 322, 44, 24),
+    item(ID_BADGE_SIZE, Kind::NumberEdit, "", 410, 322, 40, 24),
+    item(234, Kind::Label, "px", 454, 322, 24, 24),
+    item(235, Kind::Label, "出すとき", 24, 348, 66, 24),
+    item(ID_BADGE_WHEN, Kind::Combo, "", 92, 348, 210, 200),
+    item(ID_BADGE_HOLD, Kind::Edit, "", 308, 348, 32, 24),
+    item(236, Kind::Label, "秒", 344, 348, 16, 24),
+    item(237, Kind::Label, "不透明度", 366, 348, 56, 24),
+    item(ID_BADGE_OPACITY, Kind::NumberEdit, "", 424, 348, 34, 24),
+    item(238, Kind::Label, "%", 462, 348, 16, 24),
+    item(ID_BADGE_IBEAM, Kind::Check, "マウスカーソルが文字入力の形（I）になったら出す（おまかせのとき）", 24, 374, 452, 22),
+    item(ID_FULLSCREEN, Kind::Check, "全画面のアプリ（ゲーム・動画・発表など）では表示しない", 16, 404, 468, 22),
 ];
 
 /// 「クリップボードの履歴」のページ。
@@ -387,7 +395,7 @@ unsafe fn thread_main(tx: Sender<TrayMessage>, settings: Settings, startup: bool
     ui::add_combo_items(hwnd, ID_KEY, KEYS.iter().map(|(name, _)| *name));
     ui::add_combo_items(hwnd, ID_POSITION, Position::ALL.iter().map(|(_, _, name)| *name));
     ui::add_combo_items(hwnd, ID_THEME, Theme::ALL.iter().map(|(_, _, name)| *name));
-    ui::add_combo_items(hwnd, ID_BADGE, Badge::ALL.iter().map(|(_, _, name)| *name));
+    ui::add_combo_items(hwnd, ID_BADGE, BADGE_PLACES.iter().map(|(_, name)| *name));
     ui::add_combo_items(hwnd, ID_BADGE_WHEN, BadgeWhen::ALL.iter().map(|(_, _, name)| *name));
     ui::add_combo_items(hwnd, ID_UPDATE_MODE, UpdateMode::ALL.iter().map(|(_, _, name)| *name));
     ui::add_combo_items(hwnd, ID_CH_TRIGGER, Trigger::ALL.iter().map(|(_, _, name)| *name));
@@ -434,8 +442,10 @@ unsafe fn fill_form(hwnd: HWND, form: &Form) {
     set_text(hwnd, ID_OPACITY, &ime.opacity.to_string());
     set_checked(hwnd, ID_FULLSCREEN, ime.hide_in_fullscreen);
     set_checked(hwnd, ID_FLASH, ime.flash);
-    let badge_index = Badge::ALL.iter().position(|(b, _, _)| *b == ime.badge).unwrap_or(0);
-    set_combo_index(hwnd, ID_BADGE, badge_index);
+    // 「出さない」が書かれていたら、出さないことにして、場所は最初のものを出しておく。
+    let badge_index = BADGE_PLACES.iter().position(|(b, _)| *b == ime.badge);
+    set_checked(hwnd, ID_BADGE_ENABLED, ime.badge_enabled && badge_index.is_some());
+    set_combo_index(hwnd, ID_BADGE, badge_index.unwrap_or(0));
     set_text(hwnd, ID_BADGE_SIZE, &ime.badge_size.to_string());
     let when_index = BadgeWhen::ALL.iter().position(|(w, _, _)| *w == ime.badge_when).unwrap_or(0);
     set_combo_index(hwnd, ID_BADGE_WHEN, when_index);
@@ -464,7 +474,12 @@ unsafe fn update_ime_fields(hwnd: HWND) {
     for id in [ID_POSITION, ID_THEME, ID_HOLD, ID_FADE, ID_SIZE, ID_OPACITY, ID_PREVIEW] {
         ui::set_enabled(hwnd, id, flash);
     }
-    for id in [ID_FLASH, ID_FULLSCREEN, ID_BADGE, ID_BADGE_SIZE, ID_BADGE_WHEN, ID_BADGE_OPACITY] {
+    for id in [ID_FLASH, ID_FULLSCREEN, ID_BADGE_ENABLED] {
+        ui::set_enabled(hwnd, id, on);
+    }
+    // 小さな印の出し方は、小さな印を出すときだけ使う。
+    let on = on && is_checked(hwnd, ID_BADGE_ENABLED);
+    for id in [ID_BADGE, ID_BADGE_SIZE, ID_BADGE_WHEN, ID_BADGE_OPACITY] {
         ui::set_enabled(hwnd, id, on);
     }
     // 出しておく時間は「出し続ける」以外で、マウスカーソルの形は「おまかせ」のときに使う。
@@ -769,9 +784,10 @@ unsafe fn read_ime_params(hwnd: HWND) -> Result<Params, (i32, String)> {
         opacity,
         hide_in_fullscreen: is_checked(hwnd, ID_FULLSCREEN),
         flash: is_checked(hwnd, ID_FLASH),
+        badge_enabled: is_checked(hwnd, ID_BADGE_ENABLED),
         badge: combo_index(hwnd, ID_BADGE)
-            .and_then(|i| Badge::ALL.get(i))
-            .map_or(Badge::Off, |(b, _, _)| *b),
+            .and_then(|i| BADGE_PLACES.get(i))
+            .map_or(Badge::Caret, |(b, _)| *b),
         badge_size: parse_in_range(
             &get_text(hwnd, ID_BADGE_SIZE),
             u64::from(ime_logic::BADGE_SIZE_MIN),
@@ -876,7 +892,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             if id == ID_BADGE_WHEN && code == CBN_SELCHANGE {
                 update_ime_fields(hwnd);
             }
-            if (id == ID_IME_ENABLED || id == ID_FLASH) && code == BN_CLICKED {
+            if (id == ID_IME_ENABLED || id == ID_FLASH || id == ID_BADGE_ENABLED)
+                && code == BN_CLICKED
+            {
                 update_ime_fields(hwnd);
             }
             if code == BN_CLICKED {
@@ -1017,6 +1035,7 @@ unsafe fn on_save(hwnd: HWND, close: bool) {
     settings.ime_indicator.opacity = ime.opacity;
     settings.ime_indicator.hide_in_fullscreen = ime.hide_in_fullscreen;
     settings.ime_indicator.flash = ime.flash;
+    settings.ime_indicator.badge_enabled = ime.badge_enabled;
     settings.ime_indicator.badge = ime.badge.as_setting().to_string();
     settings.ime_indicator.badge_size = ime.badge_size;
     settings.ime_indicator.badge_when = ime.badge_when.as_setting().to_string();

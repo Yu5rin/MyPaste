@@ -227,7 +227,9 @@ pub struct ImeIndicatorSettings {
     pub hide_in_fullscreen: bool,
     /// 切り替えたときに、画面に大きく表示するか。
     pub flash: bool,
-    /// いまの入力モードを小さな印で出し続ける場所（`"off"` / `"caret"` / `"mouse"`）。
+    /// いまの入力モードを、小さな印で出すか。
+    pub badge_enabled: bool,
+    /// 小さな印を出す場所（`"caret"` / `"mouse"`。`"off"` は出さない）。
     pub badge: String,
     /// 小さな印の一辺（96 DPI 基準のピクセル。12〜48）。
     pub badge_size: u32,
@@ -253,6 +255,7 @@ impl Default for ImeIndicatorSettings {
             opacity: crate::ime_logic::DEFAULT_OPACITY,
             hide_in_fullscreen: false,
             flash: true,
+            badge_enabled: false,
             badge: "caret".to_string(),
             badge_size: crate::ime_logic::DEFAULT_BADGE_SIZE,
             badge_when: "auto".to_string(),
@@ -503,6 +506,7 @@ pub fn save_from_settings_window(settings: &Settings) -> Result<(), String> {
             "opacity": settings.ime_indicator.opacity,
             "hide_in_fullscreen": settings.ime_indicator.hide_in_fullscreen,
             "flash": settings.ime_indicator.flash,
+            "badge_enabled": settings.ime_indicator.badge_enabled,
             "badge": settings.ime_indicator.badge,
             "badge_size": settings.ime_indicator.badge_size,
             "badge_when": settings.ime_indicator.badge_when,

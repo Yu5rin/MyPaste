@@ -138,7 +138,9 @@ pub struct Params {
     pub hide_in_fullscreen: bool,
     /// 切り替えたときに、画面に大きく表示する。
     pub flash: bool,
-    /// いまの入力モードを小さな印で出し続ける場所。
+    /// いまの入力モードを、小さな印で出すか。
+    pub badge_enabled: bool,
+    /// 小さな印を出す場所。
     pub badge: Badge,
     /// 小さな印の一辺（96 DPI 基準のピクセル）。
     pub badge_size: u32,
@@ -177,7 +179,8 @@ impl Params {
         opacity: ime_logic::DEFAULT_OPACITY,
         hide_in_fullscreen: false,
         flash: true,
-        badge: Badge::Off,
+        badge_enabled: false,
+        badge: Badge::Caret,
         badge_size: ime_logic::DEFAULT_BADGE_SIZE,
         badge_when: BadgeWhen::Auto,
         badge_hold_ms: ime_logic::DEFAULT_BADGE_HOLD_MS,
@@ -198,6 +201,7 @@ impl Params {
             opacity: settings.opacity,
             hide_in_fullscreen: settings.hide_in_fullscreen,
             flash: settings.flash,
+            badge_enabled: settings.badge_enabled,
             badge: Badge::from_setting(&settings.badge),
             badge_size: settings.badge_size,
             badge_when: BadgeWhen::from_setting(&settings.badge_when),
@@ -705,7 +709,8 @@ unsafe fn update_badge(observed: Option<&Observed>) {
         hide_badge();
         return;
     }
-    let target = match (params.badge, observed) {
+    let place = if params.badge_enabled { params.badge } else { Badge::Off };
+    let target = match (place, observed) {
         (Badge::Off, _) | (_, None) => None,
         (_, Some(_)) if params.hide_in_fullscreen && is_fullscreen_app_running() => None,
         (badge, Some(observed)) => {
