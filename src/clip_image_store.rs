@@ -36,7 +36,10 @@ fn thumb_path(id: u64) -> Option<PathBuf> {
     dir().map(|d| d.join(format!("{id}.thm")))
 }
 
-/// 目録を読む。無ければ空。読めない・元に戻せないときは `Err`。
+/// 目録を読む。無ければ空。別のユーザー・別の PC で保存したもので元に戻せないときや、中身が
+/// 壊れているときは、`index.unreadable.dat` として残して空を返す。ファイルがあるのに読めない
+/// （ほかのアプリが使っている など）ときは `Err`（呼び出し側は、その間は画像を覚えない。
+/// 空の目録で上書きすると、残していた画像を失うため）。
 pub fn load_index() -> Result<Index, String> {
     let Some(path) = dir().map(|d| d.join(INDEX_FILE)) else {
         return Ok(Index::default());
@@ -46,9 +49,18 @@ pub fn load_index() -> Result<Index, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Index::default()),
         Err(e) => return Err(e.to_string()),
     };
-    let plain = clip_store::unprotect(&data)
-        .ok_or("元に戻せません（別のユーザー・PC で保存したもの）")?;
-    Index::from_json(&String::from_utf8_lossy(&plain))
+    let index = clip_store::unprotect(&data)
+        .ok_or_else(|| "元に戻せません（別のユーザー・PC で保存したもの）".to_string())
+        .and_then(|plain| Index::from_json(&String::from_utf8_lossy(&plain)));
+    match index {
+        Ok(index) => Ok(index),
+        Err(e) => {
+            let backup = path.with_extension("unreadable.dat");
+            let _ = std::fs::rename(&path, &backup);
+            log::warn!("画像の履歴の目録を読めなかったため、空から始めます: {e}");
+            Ok(Index::default())
+        }
+    }
 }
 
 /// 目録を保存する。

@@ -86,6 +86,8 @@ thread_local! {
     static PENDING_IMAGE: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
     /// コピーされた画像の目録（中身はファイルにある）。
     static IMAGES: RefCell<Index> = RefCell::new(Index::default());
+    /// 画像の目録を読めなかった（ほかのアプリが使っていた など）。この間は画像を覚えない。
+    static IMAGES_UNREADABLE: Cell<bool> = const { Cell::new(false) };
     /// 貼り付け先が文字を読みに来たか。
     static RENDERED: Cell<bool> = const { Cell::new(false) };
     /// 動作を実行している途中か（履歴の一覧を出している間も、届いた依頼を割り込ませない）。
@@ -358,18 +360,11 @@ unsafe fn apply_history_setting(window: HWND) {
                     HISTORY_STORE_UNREADABLE.with(|u| u.set(true));
                 }
             }
-            match clip_image_store::load_index() {
-                Ok(index) => {
-                    // 目録に無いファイル（途中で終了して残ったもの）を消す。
-                    clip_image_store::sweep(&index.ids());
-                    log::debug!("保存していた画像の履歴を読みました（{} 枚）", index.len());
-                    IMAGES.with(|i| *i.borrow_mut() = index);
-                }
-                Err(e) => log::warn!("保存していた画像の履歴を読めません（空から始めます）: {e}"),
-            }
+            load_image_index();
         } else {
             // 終了後は残さない設定。前の回のものが残っていれば消す。
             clip_image_store::delete_all();
+            IMAGES_UNREADABLE.with(|u| u.set(false));
         }
     }
     let trimmed = IMAGES.with(|i| i.borrow_mut().trim(config.max_items));
@@ -552,8 +547,31 @@ unsafe fn record_clipboard() {
     }
 }
 
+/// 保存していた画像の目録を読む。読めたら `true`。読めない間は画像を覚えず、目録も保存しない
+/// （空の目録で上書きして、残していた画像を失わないように）。
+fn load_image_index() -> bool {
+    match clip_image_store::load_index() {
+        Ok(index) => {
+            // 目録に無いファイル（途中で終了して残ったもの）を消す。
+            clip_image_store::sweep(&index.ids());
+            log::debug!("保存していた画像の履歴を読みました（{} 枚）", index.len());
+            IMAGES.with(|i| *i.borrow_mut() = index);
+            IMAGES_UNREADABLE.with(|u| u.set(false));
+            true
+        }
+        Err(e) => {
+            log::warn!("保存していた画像の履歴を読めないため、この間は画像を覚えません: {e}");
+            IMAGES_UNREADABLE.with(|u| u.set(true));
+            false
+        }
+    }
+}
+
 /// クリップボードの画像を履歴に加える。同じ画像がすでにあれば、いちばん新しい位置へ移す。
 unsafe fn record_image() {
+    if IMAGES_UNREADABLE.with(Cell::get) && !load_image_index() {
+        return;
+    }
     let Some(dib) = read_clipboard_bytes(CF_DIB, clip_images::MAX_IMAGE_BYTES) else {
         return;
     };
@@ -602,6 +620,9 @@ unsafe fn record_image() {
 
 /// 画像の目録を保存する。
 fn save_image_index() {
+    if IMAGES_UNREADABLE.with(Cell::get) {
+        return;
+    }
     let result = IMAGES.with(|i| clip_image_store::save_index(&i.borrow()));
     if let Err(e) = result {
         log::warn!("画像の履歴: 目録を保存できませんでした: {e}");
@@ -820,9 +841,17 @@ unsafe fn paste_from_history(held: &Hotkey) {
     if !history_config().record {
         return;
     }
+    // 貼り付けている間（一覧を出し直すまでの間）も「出している」とみなし、その間に一覧を出す
+    // 操作をされたら、閉じる頼みとして受け取る（新しい依頼として積まない）。
+    history_window::begin_session();
+    show_history_until_closed();
+    history_window::end_session();
+}
+
+/// 一覧を出し、選ばれたものを貼り付ける。「出したままにする」のときは、閉じられるまで繰り返す。
+unsafe fn show_history_until_closed() {
     let target = GetForegroundWindow();
     let mut resume = None;
-    // 「出したままにする」のときは、貼り付けたあとにもう一度一覧を出す。
     loop {
         let config = history_config();
         let items = HISTORY.with(|h| h.borrow().entries());
@@ -840,23 +869,33 @@ unsafe fn paste_from_history(held: &Hotkey) {
         };
         let keep_open = outcome.keep_open.unwrap_or(config.view.keep_open);
         let place = outcome.resume;
-        if !apply_history_outcome(outcome, &config, target) || !keep_open {
+        let Some(moved_to) = apply_history_outcome(outcome, &config, target) else {
+            return;
+        };
+        // 貼り付け先が前面でなくなっていたら（閉じられた など）、出し直さない。貼り付けている間に
+        // 一覧を出す操作をされたときも、閉じる。
+        if !keep_open
+            || history_window::close_requested()
+            || target.is_invalid()
+            || GetForegroundWindow() != target
+        {
             return;
         }
-        // 貼り付け先が前面でなくなっていたら（閉じられた など）、出し直さない。
-        if target.is_invalid() || GetForegroundWindow() != target {
-            return;
-        }
-        resume = Some(place);
+        // 貼り付けたものがいちばん上に移ったら、選ぶ位置もそれに合わせる。
+        resume = Some(match moved_to {
+            Some(position) => place.with_selected(position),
+            None => place,
+        });
     }
 }
 
-/// 一覧の結果を反映する（消す・ピン留め・登録・貼り付け）。貼り付けたら `true`。
+/// 一覧の結果を反映する（消す・ピン留め・登録・貼り付け）。貼り付けたら `Some`（貼り付けたものを
+/// いちばん上に移したときは、その位置を添える）。
 unsafe fn apply_history_outcome(
     outcome: history_window::Outcome,
     config: &HistoryConfig,
     target: HWND,
-) -> bool {
+) -> Option<Option<usize>> {
     // ほかのウィンドウをクリックして閉じたときは、そちらを使いたいので元のウィンドウに戻さない。
     // 定型文の編集を開くときも戻さない（戻すと、開いた画面が元のウィンドウの後ろに隠れる）。
     if !target.is_invalid() && !outcome.left_for_other_window && !outcome.edit_snippets {
@@ -918,11 +957,16 @@ unsafe fn apply_history_outcome(
     if outcome.edit_snippets {
         snippet_window::open();
     }
+    let mut moved_to = None;
     let text = match outcome.chosen {
         Some(history_window::Pick::History(text)) => {
             // 貼り付けたものを、いちばん上に移す（設定で選べる。ピン留めしたものは動かさない）。
             if config.move_to_top && HISTORY.with(|h| h.borrow_mut().move_to_top(&text)) {
                 mark_history_changed();
+                // ピン留めしたものの次が、いちばん上。
+                moved_to = Some(HISTORY.with(|h| {
+                    h.borrow().entries().iter().filter(|(_, pinned)| *pinned).count()
+                }));
             }
             text
         }
@@ -933,18 +977,21 @@ unsafe fn apply_history_outcome(
         Some(history_window::Pick::Image(id)) => {
             if config.move_to_top && IMAGES.with(|i| i.borrow_mut().touch(id)) {
                 save_image_index();
+                moved_to = Some(IMAGES.with(|i| {
+                    i.borrow().entries().iter().filter(|e| e.pinned).count()
+                }));
             }
             pump_messages_until(MENU_REFOCUS_WAIT, || false);
             paste_image(id);
-            return true;
+            return Some(moved_to);
         }
-        None => return false,
+        None => return None,
     };
     // 元のウィンドウに入力が戻ってから貼り付ける。
     pump_messages_until(MENU_REFOCUS_WAIT, || false);
     log::debug!("クリップボードの履歴・定型文から貼り付けます（{} 文字）", text.chars().count());
     paste_text(&Hotkey::unpack(0), &text);
-    true
+    Some(moved_to)
 }
 
 /// 履歴の画像を貼り付ける。クリップボードに画像を一時的に置いて Ctrl+V を送り、
@@ -965,7 +1012,8 @@ unsafe fn paste_image(id: u64) {
     sendinput::send_key_sequence(&Hotkey::unpack(0), &[ctrl_v()]);
     let (accepted, target_hung) = wait_for_paste();
     if matches!(saved, Saved::Unavailable) {
-        // 元の内容を控えられなかったときは、画像をクリップボードに残す（予約のままにしない）。
+        // 元の内容を控えられなかった（とても大きい・写し取れない形式だけ）ときは、元に戻せない。
+        // 貼り付けた画像をクリップボードに残す（予約のままにしない）。元が画像なら履歴にある。
         if GetClipboardOwner().ok() == Some(clip_window()) && OpenClipboard(clip_window()).is_ok() {
             render_pending(CF_DIB);
             let _ = CloseClipboard();
@@ -1424,7 +1472,7 @@ fn copyable_format(format: u32) -> bool {
 }
 
 /// 控える内容の大きさの上限（大きすぎるものは控えず、クリップボードを使わずに入力する）。
-const SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
+const SNAPSHOT_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 /// 控えた結果。
 enum Saved {

@@ -213,13 +213,17 @@ pub fn dib_info(dib: &[u8]) -> Option<DibInfo> {
         16 | 24 | 32 => colors_used.min(256),
         _ => return None,
     };
-    let masks = if header == 40 && (compression == 3 || compression == 6) {
-        if compression == 3 { 12 } else { 16 }
-    } else {
-        0
-    };
+    // 圧縮していないもの（BI_RGB）と、色の取り出し方を添えたもの（BI_BITFIELDS）だけを扱う。
+    // RLE や JPEG・PNG を入れたものは、画素の大きさを見出しから確かめられないので扱わない。
+    if compression != 0 && compression != 3 {
+        return None;
+    }
+    let masks = if header == 40 && compression == 3 { 12 } else { 0 };
     let bits_offset = header + masks + palette * 4;
-    if bits_offset >= dib.len() {
+    // 画素が、見出しの言う大きさの分だけ本当にあるか（足りないものを描くと、範囲の外を読む）。
+    let stride = (width as usize * bit_count as usize).div_ceil(32) * 4;
+    let needed = stride.checked_mul(height.unsigned_abs() as usize)?;
+    if bits_offset.checked_add(needed)? > dib.len() {
         return None;
     }
     Some(DibInfo {
@@ -426,6 +430,10 @@ mod tests {
 
     #[test]
     fn reads_dib_header() {
+        // 画素が足りないもの・圧縮したものは扱わない。
+        assert!(dib_info(&dib(4, 2, 32, 0, 31)).is_none());
+        assert!(dib_info(&dib(4000, 3000, 32, 0, 1024)).is_none());
+        assert!(dib_info(&dib(4, 2, 8, 1, 1024 + 8)).is_none());
         let info = dib_info(&dib(4, -2, 32, 0, 32)).unwrap();
         assert_eq!((info.width, info.height, info.bits_offset), (4, 2, 40));
         // BI_BITFIELDS は、見出しのあとに色の取り出し方が 12 バイト続く。

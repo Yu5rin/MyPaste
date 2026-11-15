@@ -178,6 +178,14 @@ pub struct Resume {
     places: [(Option<usize>, usize); 3],
 }
 
+impl Resume {
+    /// 出していたタブで選ぶ位置を変える（貼り付けたものが、いちばん上に移ったとき）。
+    pub fn with_selected(mut self, position: usize) -> Resume {
+        self.places[self.tab % 3].0 = Some(position);
+        self
+    }
+}
+
 /// 一覧の画面の結果。
 #[derive(Debug, Default)]
 pub struct Outcome {
@@ -213,6 +221,23 @@ static CLOSE_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// 一覧を出しているか（キーボードフックから呼ぶ）。
 pub fn is_open() -> bool {
     OPEN.load(Ordering::SeqCst)
+}
+
+/// 一覧を出し始める（貼り付けて出し直すまでの間も、出しているとみなす）。
+pub fn begin_session() {
+    CLOSE_REQUESTED.store(false, Ordering::SeqCst);
+    OPEN.store(true, Ordering::SeqCst);
+}
+
+/// 一覧を出し終えた。
+pub fn end_session() {
+    OPEN.store(false, Ordering::SeqCst);
+    CLOSE_REQUESTED.store(false, Ordering::SeqCst);
+}
+
+/// 閉じるよう頼まれているか（貼り付けている間に、一覧を出す操作をされた）。
+pub fn close_requested() -> bool {
+    CLOSE_REQUESTED.load(Ordering::SeqCst)
 }
 
 /// 出している一覧を閉じるよう頼む（一覧を出す操作をもう一度したとき。Clibor と同じく、
@@ -509,10 +534,7 @@ pub unsafe fn choose(
     let _ = SetFocus(list);
     show_page(hwnd);
 
-    CLOSE_REQUESTED.store(false, Ordering::SeqCst);
-    OPEN.store(true, Ordering::SeqCst);
     run_loop(hwnd);
-    OPEN.store(false, Ordering::SeqCst);
     let outcome = with_state(|st| {
         st.outcome.resume = Resume {
             tab: st.tab.index(),
