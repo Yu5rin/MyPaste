@@ -694,6 +694,12 @@ pub fn replace_settings(root: &serde_json::Value) -> Result<(), String> {
     let _lock = SETTINGS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let path = settings_path().ok_or("設定ファイルの場所を決められません")?;
     let text = serde_json::to_string_pretty(root).map_err(|e| e.to_string())?;
+    // 読み込みで置き換える前の内容を残す（JSON として読めるものだけ。壊れたものは残さない）。
+    if let Ok(current) = std::fs::read_to_string(&path) {
+        if serde_json::from_str::<serde_json::Value>(strip_bom(&current)).is_ok() && current != text {
+            back_up_settings(&path, current.as_bytes());
+        }
+    }
     write_replacing(&path, text.as_bytes())
         .map_err(|e| format!("settings.json に書き込めませんでした: {e}"))
 }
@@ -752,14 +758,20 @@ fn save_patch(patch: &serde_json::Value) -> Result<(), String> {
     // （同時に書くと、片方の変更が失われることがある）。
     let _lock = SETTINGS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let path = settings_path().ok_or("設定ファイルの場所を決められません")?;
+    // 書き換える前の内容（バックアップに使う。ファイルが無いときは None）。
+    let mut previous: Option<String> = None;
     let mut root: serde_json::Value = match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(strip_bom(&text)).map_err(|e| {
-            format!(
-                "settings.json を解釈できないため保存しませんでした。\n\
-                 ファイルを直すか、削除してからもう一度保存してください。\n\n{}\n{e}",
-                path.display()
-            )
-        })?,
+        Ok(text) => {
+            let root = serde_json::from_str(strip_bom(&text)).map_err(|e| {
+                format!(
+                    "settings.json を解釈できないため保存しませんでした。\n\
+                     ファイルを直すか、削除してからもう一度保存してください。\n\n{}\n{e}",
+                    path.display()
+                )
+            })?;
+            previous = Some(text);
+            root
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             serde_json::to_value(Settings::default()).map_err(|e| e.to_string())?
         }
@@ -770,6 +782,10 @@ fn save_patch(patch: &serde_json::Value) -> Result<(), String> {
     }
     merge_json(&mut root, patch);
     let text = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    // 中身が変わるときだけ、書き換える前の内容を残す（失敗しても保存は続ける）。
+    if let Some(previous) = previous.filter(|p| *p != text) {
+        back_up_settings(&path, previous.as_bytes());
+    }
     write_replacing(&path, text.as_bytes())
         .map_err(|e| format!("settings.json に書き込めませんでした: {e}"))
 }
@@ -791,6 +807,305 @@ fn write_replacing(path: &Path, data: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&temp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&temp);
     })
+}
+
+/// 設定のバックアップを置くフォルダーの名前（`settings.json` と同じフォルダーの中に作る）。
+const BACKUP_FOLDER: &str = "backup";
+/// 残しておくバックアップの数（これより古いものは消す）。
+const BACKUP_KEEP: usize = 10;
+/// 前のバックアップからこれだけ経っていなければ、新しく作らない（続けて変えたときに、
+/// 変更のたびに作って古い世代を押し出してしまわないように）。
+const BACKUP_MIN_INTERVAL_SECS: i64 = 10 * 60;
+/// バックアップのファイル名の前後（間に日時 `YYYYMMDD-HHMMSS` を入れる）。
+const BACKUP_PREFIX: &str = "settings-";
+const BACKUP_SUFFIX: &str = ".json";
+
+/// 日時（秒まで）。バックアップの名前に使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Stamp {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+}
+
+impl Stamp {
+    /// UNIX 時刻（秒）を、協定世界時の日時にする。
+    pub fn from_unix(secs: u64) -> Self {
+        let days = (secs / 86_400) as i64;
+        let rest = secs % 86_400;
+        // 1970-01-01 からの日数を年月日にする（H. Hinnant の civil_from_days）。
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = yoe + era * 400 + i64::from(month <= 2);
+        Self {
+            year: year.clamp(0, 9999) as u16,
+            month: month as u8,
+            day: day as u8,
+            hour: (rest / 3600) as u8,
+            minute: (rest / 60 % 60) as u8,
+            second: (rest % 60) as u8,
+        }
+    }
+
+    /// 1970-01-01 00:00:00 からの秒数（時差は考えない。2 つの日時の差を出すのに使う）。
+    fn to_secs(self) -> i64 {
+        let (y, m, d) = (i64::from(self.year), i64::from(self.month), i64::from(self.day));
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y.rem_euclid(400);
+        let mp = if m > 2 { m - 3 } else { m + 9 };
+        let doy = (153 * mp + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 719_468;
+        days * 86_400 + i64::from(self.hour) * 3600 + i64::from(self.minute) * 60 + i64::from(self.second)
+    }
+}
+
+/// 今の日時を返す関数（Windows の現地時刻。[`set_local_clock`] で起動時に決める）。
+static LOCAL_CLOCK: OnceLock<fn() -> Stamp> = OnceLock::new();
+
+/// バックアップの名前に使う現地時刻の取り方を決める（起動時に 1 回）。決めていないときは
+/// 協定世界時を使う（このファイルは Windows に頼らない作りにしているため）。
+pub fn set_local_clock(clock: fn() -> Stamp) {
+    let _ = LOCAL_CLOCK.set(clock);
+}
+
+fn now_stamp() -> Stamp {
+    match LOCAL_CLOCK.get() {
+        Some(clock) => clock(),
+        None => Stamp::from_unix(now_unix()),
+    }
+}
+
+/// バックアップのファイル名（`settings-YYYYMMDD-HHMMSS.json`）。名前の順が日時の順になる。
+fn backup_name(at: Stamp) -> String {
+    format!(
+        "{BACKUP_PREFIX}{:04}{:02}{:02}-{:02}{:02}{:02}{BACKUP_SUFFIX}",
+        at.year, at.month, at.day, at.hour, at.minute, at.second
+    )
+}
+
+/// バックアップのファイル名から日時を読む。この形でない名前（利用者が置いたファイルなど）は
+/// `None`（消したり、比べたりしない）。
+fn parse_backup_name(name: &str) -> Option<Stamp> {
+    let body = name.strip_prefix(BACKUP_PREFIX)?.strip_suffix(BACKUP_SUFFIX)?;
+    if body.len() != 15 || !body.is_char_boundary(8) || &body[8..9] != "-" {
+        return None;
+    }
+    let digits = |range: std::ops::Range<usize>| -> Option<u16> {
+        let part = body.get(range)?;
+        if !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        part.parse().ok()
+    };
+    let stamp = Stamp {
+        year: digits(0..4)?,
+        month: digits(4..6)? as u8,
+        day: digits(6..8)? as u8,
+        hour: digits(9..11)? as u8,
+        minute: digits(11..13)? as u8,
+        second: digits(13..15)? as u8,
+    };
+    let valid = (1..=12).contains(&stamp.month)
+        && (1..=31).contains(&stamp.day)
+        && stamp.hour < 24
+        && stamp.minute < 60
+        && stamp.second < 60;
+    valid.then_some(stamp)
+}
+
+/// いちばん新しいバックアップの名前と日時。
+fn newest_backup(names: &[String]) -> Option<(&str, Stamp)> {
+    names
+        .iter()
+        .filter_map(|n| parse_backup_name(n).map(|s| (n.as_str(), s)))
+        .max_by_key(|(_, s)| *s)
+}
+
+/// `now` に新しいバックアップを作るか。いちばん新しいものから 10 分経っていなければ作らない。
+/// 時計が戻った（いちばん新しいものが `now` より先の日時）ときは作る。
+fn backup_due(names: &[String], now: Stamp) -> bool {
+    match newest_backup(names) {
+        None => true,
+        Some((_, newest)) => {
+            let elapsed = now.to_secs() - newest.to_secs();
+            !(0..BACKUP_MIN_INTERVAL_SECS).contains(&elapsed)
+        }
+    }
+}
+
+/// 新しい方から `keep` 個を残すとき、消すバックアップの名前（古い順）。
+fn backups_to_remove(names: &[String], keep: usize) -> Vec<String> {
+    let mut backups: Vec<&String> = names.iter().filter(|n| parse_backup_name(n).is_some()).collect();
+    backups.sort();
+    backups.dedup();
+    let excess = backups.len().saturating_sub(keep);
+    backups.into_iter().take(excess).cloned().collect()
+}
+
+/// settings.json（`path`）を書き換える前の内容 `current` を、`backup` フォルダーに残す。
+/// 失敗しても保存は止めず、記録に残すだけにする。
+fn back_up_settings(path: &Path, current: &[u8]) {
+    if let Err(e) = try_back_up_settings(path, current, now_stamp()) {
+        log::warn!("設定のバックアップを作れませんでした（保存は続けます）: {e}");
+    }
+}
+
+fn try_back_up_settings(path: &Path, current: &[u8], now: Stamp) -> std::io::Result<()> {
+    let Some(dir) = path.parent().map(|p| p.join(BACKUP_FOLDER)) else {
+        return Ok(());
+    };
+    let mut names: Vec<String> = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    if !backup_due(&names, now) {
+        return Ok(());
+    }
+    // いちばん新しいバックアップと同じ内容なら、作らない。
+    if let Some((newest, _)) = newest_backup(&names) {
+        if std::fs::read(dir.join(newest)).is_ok_and(|saved| saved == current) {
+            return Ok(());
+        }
+    }
+    std::fs::create_dir_all(&dir)?;
+    let name = backup_name(now);
+    let target = dir.join(&name);
+    if target.exists() {
+        return Ok(());
+    }
+    write_replacing(&target, current)?;
+    log::info!("設定のバックアップを作りました: {name}");
+    names.push(name);
+    for old in backups_to_remove(&names, BACKUP_KEEP) {
+        if let Err(e) = std::fs::remove_file(dir.join(&old)) {
+            log::warn!("古い設定のバックアップ {old} を消せませんでした: {e}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod backup_tests {
+    use super::{backup_due, backup_name, backups_to_remove, parse_backup_name, try_back_up_settings, Stamp};
+
+    fn stamp(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> Stamp {
+        Stamp { year, month, day, hour, minute, second }
+    }
+
+    #[test]
+    fn name_round_trips_and_sorts_by_time() {
+        let a = stamp(2026, 1, 2, 3, 4, 5);
+        assert_eq!(backup_name(a), "settings-20260102-030405.json");
+        assert_eq!(parse_backup_name(&backup_name(a)), Some(a));
+        let b = stamp(2026, 11, 15, 23, 59, 59);
+        assert!(backup_name(a) < backup_name(b));
+    }
+
+    #[test]
+    fn other_names_are_ignored() {
+        for name in [
+            "settings.json",
+            "settings-2026010-030405.json",
+            "settings-20260102_030405.json",
+            "settings-20261302-030405.json",
+            "settings-20260102-246000.json",
+            "settings-2026O102-030405.json",
+            "settings-2026010あ-0304.json",
+            "settings-20260102-030405.json.bak",
+            "memo.txt",
+        ] {
+            assert_eq!(parse_backup_name(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn unix_time_to_stamp() {
+        assert_eq!(Stamp::from_unix(0), stamp(1970, 1, 1, 0, 0, 0));
+        // 2024-02-29 12:34:56 UTC（うるう日）
+        assert_eq!(Stamp::from_unix(1_709_210_096), stamp(2024, 2, 29, 12, 34, 56));
+        let s = stamp(2026, 11, 15, 8, 9, 10);
+        assert_eq!(Stamp::from_unix(s.to_secs() as u64), s);
+    }
+
+    #[test]
+    fn first_backup_is_due() {
+        assert!(backup_due(&[], stamp(2026, 1, 1, 0, 0, 0)));
+        assert!(backup_due(&["memo.txt".to_string()], stamp(2026, 1, 1, 0, 0, 0)));
+    }
+
+    #[test]
+    fn no_new_backup_within_ten_minutes() {
+        let names = vec![
+            "settings-20260101-090000.json".to_string(),
+            "settings-20260101-235500.json".to_string(),
+        ];
+        assert!(!backup_due(&names, stamp(2026, 1, 1, 23, 55, 0)));
+        assert!(!backup_due(&names, stamp(2026, 1, 2, 0, 4, 59)));
+        // 日をまたいでも、経った時間で数える。
+        assert!(backup_due(&names, stamp(2026, 1, 2, 0, 5, 0)));
+    }
+
+    #[test]
+    fn clock_going_backwards_makes_a_backup() {
+        let names = vec!["settings-20260101-120000.json".to_string()];
+        assert!(backup_due(&names, stamp(2026, 1, 1, 11, 59, 0)));
+    }
+
+    #[test]
+    fn keeps_newest_backups() {
+        let mut names: Vec<String> = (0..12).map(|i| backup_name(stamp(2026, 1, 1 + i, 0, 0, 0))).collect();
+        names.reverse();
+        names.push("memo.txt".to_string());
+        assert_eq!(
+            backups_to_remove(&names, 10),
+            vec!["settings-20260101-000000.json".to_string(), "settings-20260102-000000.json".to_string()]
+        );
+        assert!(backups_to_remove(&names[..5], 10).is_empty());
+    }
+
+    #[test]
+    fn backs_up_into_folder() {
+        let dir = std::env::temp_dir().join(format!("atai-backup-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let settings = dir.join("settings.json");
+        let backups = dir.join("backup");
+        let count = || std::fs::read_dir(&backups).map(|d| d.count()).unwrap_or(0);
+        // フォルダーが無ければ作る。
+        std::fs::create_dir_all(&dir).unwrap();
+        try_back_up_settings(&settings, b"{}", stamp(2026, 1, 1, 0, 0, 0)).unwrap();
+        assert_eq!(count(), 1);
+        // 10 分経っていても、いちばん新しいものと同じ内容なら作らない。
+        try_back_up_settings(&settings, b"{}", stamp(2026, 1, 1, 1, 0, 0)).unwrap();
+        assert_eq!(count(), 1);
+        // 10 分経っていなければ作らない。
+        try_back_up_settings(&settings, b"{\"a\":1}", stamp(2026, 1, 1, 0, 9, 0)).unwrap();
+        assert_eq!(count(), 1);
+        // 内容が違い、10 分経っていれば作る。数が上限を超えたら古いものから消す。
+        for i in 0..12u8 {
+            let data = format!("{{\"a\":{i}}}");
+            try_back_up_settings(&settings, data.as_bytes(), stamp(2026, 1, 2, i, 0, 0)).unwrap();
+        }
+        assert_eq!(count(), 10);
+        assert!(!backups.join("settings-20260101-000000.json").exists());
+        assert_eq!(std::fs::read(backups.join("settings-20260102-110000.json")).unwrap(), b"{\"a\":11}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// `patch` を `base` に重ねる。オブジェクト同士は項目ごとに再帰的に重ね、

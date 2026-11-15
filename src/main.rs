@@ -139,6 +139,8 @@ pub enum TrayMessage {
 
 fn main() {
     logging::init();
+    // 設定のバックアップの名前は、現地時刻で付ける。
+    config::set_local_clock(local_stamp);
     // 二重起動は、何も表示せずに終わる（すでに動いている方をそのまま使ってもらう）。
     let Some(_instance) = single_instance::acquire() else {
         return;
@@ -423,6 +425,19 @@ fn main() {
     action_worker.stop();
     log::info!("アタイの貼り付け 終了");
     log::logger().flush();
+}
+
+/// 今の現地時刻（設定のバックアップの名前に使う）。
+fn local_stamp() -> config::Stamp {
+    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    config::Stamp {
+        year: t.wYear,
+        month: t.wMonth as u8,
+        day: t.wDay as u8,
+        hour: t.wHour as u8,
+        minute: t.wMinute as u8,
+        second: t.wSecond as u8,
+    }
 }
 
 /// 動作の記録の最初に、調査に要る情報（版・場所・設定）を残す。
