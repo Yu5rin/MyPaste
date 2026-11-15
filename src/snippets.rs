@@ -49,7 +49,6 @@ pub fn display_name(snippet: &Snippet) -> String {
 /// （グループがあれば `[グループ] 名前`）がそのまま合うものを先に探し、無ければ、グループを
 /// 除いた名前が合うものが 1 つだけのときにそれを返す（同じ名前が別のグループにもあるときは、
 /// どれか決められないので返さない）。
-#[allow(dead_code)] // actions.rs の paste_snippet から使うまでの間
 pub fn find_by_name<'a>(list: &'a [Snippet], name: &str) -> Option<&'a Snippet> {
     let name = name.trim();
     if name.is_empty() {

@@ -1120,9 +1120,7 @@ unsafe fn paste_image(id: u64) {
 
 /// 名前で選んだ定型文を貼り付ける（キー割り当て「定型文を貼り付け」）。
 unsafe fn paste_snippet(held: &Hotkey, name: &str) {
-    let found = snippets()
-        .into_iter()
-        .find(|s| crate::snippets::display_name(s) == name.trim());
+    let found = crate::snippets::find_by_name(&snippets(), name).cloned();
     let Some(snippet) = found else {
         log::warn!("キー割り当て: 定型文「{name}」が見つかりません");
         sendinput::release_modifiers(held);
