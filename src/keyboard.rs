@@ -28,7 +28,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
-    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, MSLLHOOKSTRUCT, WM_MOUSEWHEEL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
     WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
 };
 
@@ -312,6 +312,17 @@ unsafe extern "system" fn low_level_mouse_proc(code: i32, wparam: WPARAM, lparam
     {
         DOUBLE_TAP.with(|d| d.borrow_mut().reset());
         crate::ime_indicator::note_click();
+        // 履歴の一覧を出している間に、その外を押したら閉じる。
+        let mouse = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+        crate::history_window::hook_mouse_down(mouse.pt.x, mouse.pt.y);
+    }
+    if code >= 0 && wparam.0 as u32 == WM_MOUSEWHEEL {
+        // 履歴の一覧の上でのホイールは、一覧に渡す（一覧は前面ではないので、届かないことがある）。
+        let mouse = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+        let delta = i32::from((mouse.mouseData >> 16) as u16 as i16);
+        if crate::history_window::hook_mouse_wheel(mouse.pt.x, mouse.pt.y, delta) {
+            return LRESULT(1);
+        }
     }
     CallNextHookEx(None, code, wparam, lparam)
 }
@@ -417,6 +428,14 @@ unsafe extern "system" fn low_level_keyboard_proc(
                     log::debug!("クリップボードの履歴: 2 回押しを捕まえました");
                     actions::dispatch(Action::ClipboardHistory, Hotkey::unpack(0));
                 }
+            }
+            // 履歴の一覧を出している間のキーは、一覧に渡す（元のアプリには届けない）。一覧を出すキー
+            // そのものは、下で「閉じる」として扱うので渡さない。
+            let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
+            let is_history_key =
+                history_hotkey().is_some_and(|h| kb.vkCode == h.vk && modifiers_match(&h));
+            if !is_history_key && crate::history_window::hook_key(kb.vkCode, down) {
+                return LRESULT(1);
             }
             let hotkey = hotkey();
             match message {

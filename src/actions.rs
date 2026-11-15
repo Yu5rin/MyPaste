@@ -898,7 +898,13 @@ unsafe fn apply_history_outcome(
 ) -> Option<Option<usize>> {
     // ほかのウィンドウをクリックして閉じたときは、そちらを使いたいので元のウィンドウに戻さない。
     // 定型文の編集を開くときも戻さない（戻すと、開いた画面が元のウィンドウの後ろに隠れる）。
-    if !target.is_invalid() && !outcome.left_for_other_window && !outcome.edit_snippets {
+    // 一覧は前面にしないので、ふつうは元のウィンドウが前面のまま（右クリックのメニューを使った
+    // あとなど、前面でなくなっていたときだけ戻す）。
+    if !target.is_invalid()
+        && !outcome.left_for_other_window
+        && !outcome.edit_snippets
+        && GetForegroundWindow() != target
+    {
         let _ = SetForegroundWindow(target);
     }
     if let Some(opacity) = outcome.opacity {

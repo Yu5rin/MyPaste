@@ -21,7 +21,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use windows::core::{w, HSTRING, PCWSTR};
@@ -42,7 +43,7 @@ use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::Ime::ImmAssociateContextEx;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, VK_APPS, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F10, VK_HOME,
+    GetAsyncKeyState, VK_APPS, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F10, VK_HOME,
     VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -55,7 +56,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HWND_TOPMOST, LB_GETITEMRECT, LB_ITEMFROMPOINT, LB_SETCOUNT, LB_SETCURSEL, LB_SETITEMHEIGHT,
     LWA_ALPHA, MA_NOACTIVATE, MF_CHECKED, MF_GRAYED, WM_SETFONT, MF_SEPARATOR, MF_STRING, MSG, SWP_NOACTIVATE,
     SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN,
-    PostMessageW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_CTLCOLORLISTBOX,
+    PostMessageW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_LBUTTONDBLCLK, WM_TIMER, IsWindowVisible,
+    SetTimer, KillTimer, WM_CLOSE, WM_CTLCOLORLISTBOX,
     WM_DRAWITEM, WM_NULL,
     WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_PAINT, WM_QUIT, WM_RBUTTONUP, WM_SYSKEYDOWN, WNDCLASSW, WS_BORDER, WS_CHILD,
@@ -82,8 +84,6 @@ const PAD: i32 = 4;
 const TAB_PAD: i32 = 10;
 /// 外枠の太さ（実際のピクセル。拡大率にかかわらず 1 ピクセル）。
 const BORDER: i32 = 1;
-/// ホイールのとき Shift が押されていたか（WM_MOUSEWHEEL の MK_SHIFT）。
-const MK_SHIFT: usize = 0x0004;
 /// Shift+ホイール 1 目盛りで変える不透明度（%）。
 const OPACITY_STEP: u32 = 5;
 /// 全文の吹き出しの幅の上限と高さの上限（96 DPI 基準）。
@@ -92,10 +92,127 @@ const TIP_MAX_H: i32 = 340;
 const TIP_PAD: i32 = 6;
 /// 画面の形（タイトルバーも枠も無い。1 ピクセルの枠は自分で描く）。
 const WINDOW_FRAME: WINDOW_STYLE = WS_POPUP;
-const WINDOW_EX: WINDOW_EX_STYLE =
-    WINDOW_EX_STYLE(WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0 | WS_EX_LAYERED.0);
-/// 前面にするまで待つ時間。
+/// 一覧は前面（アクティブ）にしない。前面にすると、元のアプリの入力欄からカーソルが外れて
+/// 貼り付けられなくなることや、元のアプリが前面を取り返して一覧がすぐ閉じることがあるため。
+/// キー操作は、キーボードフックから受け取る（[`hook_key`]）。
+const WINDOW_EX: WINDOW_EX_STYLE = WINDOW_EX_STYLE(
+    WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0 | WS_EX_LAYERED.0 | WS_EX_NOACTIVATE.0,
+);
+/// 表示が追いつくまで待つ時間。
 const SHOW_WAIT: Duration = Duration::from_millis(30);
+/// キーボードフックが知らせるキー（wParam = 仮想キーコード）と、マウスフックが知らせるホイール
+/// （wParam = 回した量。奥が正）。
+const WM_APP_KEY: u32 = WM_APP + 21;
+const WM_APP_WHEEL: u32 = WM_APP + 22;
+/// 元のアプリが前面でなくなったかを調べるタイマーと、その間隔。
+const TIMER_WATCH: usize = 1;
+const WATCH_INTERVAL_MS: u32 = 100;
+/// 前面が別のウィンドウに移ったとみなすまでの回数（一瞬だけ別のものが前面になっても閉じない）。
+const WATCH_STRIKES: u32 = 3;
+
+/// 出している一覧と吹き出しのウィンドウ（フックから見る。出していなければ 0）。
+static POPUP: AtomicIsize = AtomicIsize::new(0);
+static TIP: AtomicIsize = AtomicIsize::new(0);
+/// 右クリックのメニューを出している（その間は、キーをメニューに渡す）。
+static MENU_OPEN: AtomicBool = AtomicBool::new(false);
+/// 一覧が受け取って握りつぶしたキー（離したときも握りつぶすため。8 個まで）。
+static HELD_KEYS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// キーボードフックから呼ぶ。一覧を出している間のキーを一覧に渡す。渡した（元のアプリには
+/// 届けない）なら `true`。Shift・Ctrl などの修飾キーそのものと、Alt・Win を押しながらのキー
+/// （Alt+Tab など）は、そのまま通す。
+pub fn hook_key(vk: u32, down: bool) -> bool {
+    let popup = POPUP.load(Ordering::SeqCst);
+    if popup == 0 || MENU_OPEN.load(Ordering::SeqCst) {
+        return false;
+    }
+    const MODIFIERS: [u32; 11] = [0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5];
+    if MODIFIERS.contains(&vk) {
+        return false;
+    }
+    let mut held = HELD_KEYS.lock().unwrap_or_else(|p| p.into_inner());
+    if !down {
+        // 一覧が受け取ったキーを離したときだけ握りつぶす（一覧を出す前から押していたキーは通す）。
+        return match held.iter().position(|k| *k == vk) {
+            Some(i) => {
+                held.remove(i);
+                true
+            }
+            None => false,
+        };
+    }
+    // 0x12 = Alt、0x5B / 0x5C = Win
+    if [0x12, 0x5B, 0x5C].iter().any(|key| unsafe { GetAsyncKeyState(*key) } < 0) {
+        return false;
+    }
+    if !held.contains(&vk) && held.len() < 8 {
+        held.push(vk);
+    }
+    unsafe {
+        let _ = PostMessageW(
+            HWND(popup as *mut core::ffi::c_void),
+            WM_APP_KEY,
+            WPARAM(vk as usize),
+            LPARAM(0),
+        );
+    }
+    true
+}
+
+/// マウスフックから呼ぶ（ボタンを押したとき）。一覧の外を押したら、一覧を閉じる。
+pub fn hook_mouse_down(x: i32, y: i32) {
+    let popup = POPUP.load(Ordering::SeqCst);
+    if popup == 0 || MENU_OPEN.load(Ordering::SeqCst) {
+        return;
+    }
+    if point_in_window(popup, x, y) || point_in_window(TIP.load(Ordering::SeqCst), x, y) {
+        return;
+    }
+    CLOSE_REQUESTED.store(true, Ordering::SeqCst);
+    unsafe {
+        let _ = PostMessageW(
+            HWND(popup as *mut core::ffi::c_void),
+            WM_NULL,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
+}
+
+/// マウスフックから呼ぶ（ホイールを回したとき）。一覧の上なら一覧に渡す。渡したら `true`。
+/// 前面でないウィンドウには、設定によってはホイールが届かないため、ここで受け取る。
+pub fn hook_mouse_wheel(x: i32, y: i32, delta: i32) -> bool {
+    let popup = POPUP.load(Ordering::SeqCst);
+    if popup == 0 || MENU_OPEN.load(Ordering::SeqCst) || !point_in_window(popup, x, y) {
+        return false;
+    }
+    unsafe {
+        let _ = PostMessageW(
+            HWND(popup as *mut core::ffi::c_void),
+            WM_APP_WHEEL,
+            WPARAM(delta as isize as usize),
+            LPARAM(0),
+        );
+    }
+    true
+}
+
+/// 画面の座標が、そのウィンドウ（見えているとき）の中か。
+fn point_in_window(window: isize, x: i32, y: i32) -> bool {
+    if window == 0 {
+        return false;
+    }
+    let hwnd = HWND(window as *mut core::ffi::c_void);
+    let mut rect = RECT::default();
+    unsafe {
+        IsWindowVisible(hwnd).as_bool()
+            && GetWindowRect(hwnd, &mut rect).is_ok()
+            && x >= rect.left
+            && x < rect.right
+            && y >= rect.top
+            && y < rect.bottom
+    }
+}
 
 /// 右クリックのメニューの項目。
 const MENU_PASTE: usize = 1;
@@ -290,6 +407,9 @@ struct State {
     thumbs: HashMap<u64, Option<Rc<Thumb>>>,
     layout: Layout,
     keep_open: bool,
+    /// 一覧を出したときに前面だったウィンドウ（貼り付け先）と、それが前面でなかった回数。
+    target: HWND,
+    away: u32,
     tab: Tab,
     /// タブごとの (選んでいる位置, 出しているページ)。
     places: [(Option<usize>, usize); 3],
@@ -460,6 +580,8 @@ pub unsafe fn choose(
             thumbs: HashMap::new(),
             layout,
             keep_open: view.keep_open,
+            target,
+            away: 0,
             tab,
             places,
             page_size,
@@ -506,7 +628,7 @@ pub unsafe fn choose(
         SendMessageW(list, LB_SETCOLUMNWIDTH, WPARAM(item_w as usize), LPARAM(0));
     }
 
-    // 一覧では日本語入力を使わない（文字を打つと変換が始まり、Esc や Enter が効かなくなるため）。
+    // 一覧では日本語入力を使わない（右クリックのメニューを出す間だけ前面になるため）。
     let _ = ImmAssociateContextEx(list, None, 0);
 
     // 置く場所。モニターの作業領域に収める。
@@ -524,17 +646,27 @@ pub unsafe fn choose(
     };
     let x = x.clamp(work.left, (work.right - width).max(work.left));
     let y = y.clamp(work.top, (work.bottom - height).max(work.top));
-    let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height, SWP_SHOWWINDOW);
-    pump_for(SHOW_WAIT);
-    if !bring_to_front(hwnd, target) {
-        log::warn!("クリップボードの履歴: 一覧を前面にできませんでした");
-        close(hwnd);
-        return None;
-    }
-    let _ = SetFocus(list);
+    // 前面にはしない（元のアプリの入力欄に、カーソルを残したままにする）。
+    let _ = SetWindowPos(
+        hwnd,
+        HWND_TOPMOST,
+        x,
+        y,
+        width,
+        height,
+        SWP_SHOWWINDOW | SWP_NOACTIVATE,
+    );
     show_page(hwnd);
+    pump_for(SHOW_WAIT);
 
+    HELD_KEYS.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    TIP.store(tip.0 as isize, Ordering::SeqCst);
+    POPUP.store(hwnd.0 as isize, Ordering::SeqCst);
+    SetTimer(hwnd, TIMER_WATCH, WATCH_INTERVAL_MS, None);
     run_loop(hwnd);
+    let _ = KillTimer(hwnd, TIMER_WATCH);
+    POPUP.store(0, Ordering::SeqCst);
+    TIP.store(0, Ordering::SeqCst);
     let outcome = with_state(|st| {
         st.outcome.resume = Resume {
             tab: st.tab.index(),
@@ -626,14 +758,26 @@ unsafe fn run_loop(hwnd: HWND) {
             break;
         }
         let ours = msg.hwnd == hwnd || IsChild(hwnd, msg.hwnd).as_bool();
+        // キーボードフックが知らせたキー。
+        if msg.hwnd == hwnd && msg.message == WM_APP_KEY {
+            on_key(hwnd, msg.wParam.0 as u16);
+            continue;
+        }
         if ours
             && (msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN)
             && on_key(hwnd, msg.wParam.0 as u16)
         {
             continue;
         }
-        if ours && msg.message == WM_MOUSEWHEEL {
-            let delta = i32::from(((msg.wParam.0 >> 16) & 0xFFFF) as u16 as i16);
+        let wheel = if msg.hwnd == hwnd && msg.message == WM_APP_WHEEL {
+            // マウスフックが知らせたホイール。
+            Some(msg.wParam.0 as isize as i32)
+        } else if ours && msg.message == WM_MOUSEWHEEL {
+            Some(i32::from(((msg.wParam.0 >> 16) & 0xFFFF) as u16 as i16))
+        } else {
+            None
+        };
+        if let Some(delta) = wheel {
             // 回した量を貯めて、1 目盛り（WHEEL_DELTA = 120）ごとに 1 回動かす。
             let steps = with_state(|st| {
                 st.wheel += delta;
@@ -642,8 +786,9 @@ unsafe fn run_loop(hwnd: HWND) {
                 steps
             })
             .unwrap_or(0);
+            let shift = GetAsyncKeyState(VK_SHIFT.0 as i32) < 0;
             for _ in 0..steps.unsigned_abs() {
-                if msg.wParam.0 & MK_SHIFT != 0 {
+                if shift {
                     // Shift+ホイールで不透明度を変える（奥に回すと濃く）。
                     change_opacity(hwnd, steps > 0);
                 } else {
@@ -667,12 +812,25 @@ unsafe fn run_loop(hwnd: HWND) {
                 select_row_at(hwnd, list, msg.lParam);
             }
         }
-        if msg.hwnd == list && (msg.message == WM_LBUTTONDOWN || msg.message == WM_RBUTTONDOWN) {
+        if msg.hwnd == list
+            && matches!(msg.message, WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN)
+        {
             // 押した行を選ぶ（キーで選んだあと、マウスを動かさずに押したときも、押した行にする）。
             select_row_at(hwnd, list, msg.lParam);
-            if msg.message == WM_LBUTTONDOWN {
+            if msg.message != WM_RBUTTONDOWN {
                 with_state(|st| st.pressed_on_list = true);
             }
+            // 一覧（リストボックス）には渡さない。渡すと、押された一覧が自分を入力先にしようとして、
+            // 一覧の画面がアクティブになってしまう。
+            continue;
+        }
+        if msg.hwnd == list && msg.message == WM_LBUTTONUP {
+            let pressed = with_state(|st| std::mem::take(&mut st.pressed_on_list)).unwrap_or(false);
+            if pressed && row_at(list, msg.lParam).is_some() {
+                select_row_at(hwnd, list, msg.lParam);
+                choose_current();
+            }
+            continue;
         }
         if ours && msg.message == WM_RBUTTONUP {
             let mut point = POINT::default();
@@ -685,13 +843,6 @@ unsafe fn run_loop(hwnd: HWND) {
         }
         let _ = TranslateMessage(&msg);
         DispatchMessageW(&msg);
-        if msg.message == WM_LBUTTONUP {
-            let pressed = with_state(|st| std::mem::take(&mut st.pressed_on_list)).unwrap_or(false);
-            if pressed && msg.hwnd == list && row_at(list, msg.lParam).is_some() {
-                select_row_at(hwnd, list, msg.lParam);
-                choose_current();
-            }
-        }
     }
 }
 
@@ -745,8 +896,9 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
         }
     };
     let range = clip_history::page_range(page, count, page_size);
-    let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
-    let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+    // 一覧は前面ではないので、押されているかは、キーボードそのものの状態で調べる。
+    let shift = GetAsyncKeyState(VK_SHIFT.0 as i32) < 0;
+    let ctrl = GetAsyncKeyState(VK_CONTROL.0 as i32) < 0;
     let (tab, layout) = with_state(|st| (st.tab, st.layout)).unwrap_or((Tab::History, Layout::List));
     // 帯では左右で選び、上下でタブを切り替える（一覧・パネルではその逆）。
     let (vk_prev, vk_next, vk_tab_prev, vk_tab_next) = if layout == Layout::Band {
@@ -964,6 +1116,11 @@ unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
     let _ = AppendMenuW(menu, keep_flag, MENU_KEEP, w!("貼り付けても出したままにする(&K)\tK"));
     let _ = AppendMenuW(menu, MF_STRING, MENU_EDIT_SNIPPETS, w!("定型文の編集...(&E)"));
     let _ = AppendMenuW(menu, MF_STRING, MENU_CLOSE, w!("閉じる(&C)\tEsc"));
+    // メニューは、出したウィンドウが前面でないと、キーで選べず、外を押しても閉じない。メニューを
+    // 出している間だけ一覧を前面にし、閉じたら元のウィンドウに戻す。
+    let target = with_state(|st| st.target).unwrap_or_default();
+    MENU_OPEN.store(true, Ordering::SeqCst);
+    bring_to_front(hwnd, target);
     let chosen = TrackPopupMenuEx(
         menu,
         (TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN).0,
@@ -974,6 +1131,11 @@ unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
     )
     .0 as usize;
     let _ = DestroyMenu(menu);
+    if !target.is_invalid() && chosen != MENU_EDIT_SNIPPETS {
+        let _ = SetForegroundWindow(target);
+    }
+    with_state(|st| st.away = 0);
+    MENU_OPEN.store(false, Ordering::SeqCst);
     match chosen {
         MENU_PASTE => choose_current(),
         MENU_REGISTER => register_current(hwnd),
@@ -1490,14 +1652,27 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let brush = with_state(|st| st.back_brush).unwrap_or_default();
             LRESULT(brush.0 as isize)
         }
-        // ほかのウィンドウに移ったら（ほかの場所をクリックしたら）、何もせずに閉じる。
-        WM_ACTIVATE if wparam.0 & 0xFFFF == 0 => {
-            if !is_done() {
-                with_state(|st| st.outcome.left_for_other_window = true);
-                finish(None);
+        // 押されても前面にならない。
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        // 元のアプリが前面でなくなったら（Alt+Tab などでほかのウィンドウに移ったら）、何もせずに
+        // 閉じる。一瞬だけ別のものが前面になっても閉じないよう、続けて何回か見てから決める。
+        WM_TIMER if wparam.0 == TIMER_WATCH => {
+            if !MENU_OPEN.load(Ordering::SeqCst) && !is_done() {
+                let foreground = GetForegroundWindow();
+                let left = with_state(|st| {
+                    let elsewhere = !st.target.is_invalid()
+                        && !foreground.is_invalid()
+                        && foreground != st.target
+                        && foreground != hwnd;
+                    st.away = if elsewhere { st.away + 1 } else { 0 };
+                    st.away >= WATCH_STRIKES
+                })
+                .unwrap_or(false);
+                if left {
+                    with_state(|st| st.outcome.left_for_other_window = true);
+                    finish(None);
+                }
             }
-            // これは「送られた」メッセージなので、待っているループは起きない。起こして閉じさせる。
-            let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
             LRESULT(0)
         }
         WM_CLOSE => {
