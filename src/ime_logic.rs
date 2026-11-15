@@ -215,7 +215,7 @@ impl BadgeWhen {
 /// 「打ち始めたときだけ」のときに、小さな印を出しておく時間の範囲と既定（ミリ秒）。
 pub const BADGE_HOLD_MS_MIN: u64 = 1000;
 pub const BADGE_HOLD_MS_MAX: u64 = 10_000;
-pub const DEFAULT_BADGE_HOLD_MS: u64 = 3000;
+pub const DEFAULT_BADGE_HOLD_MS: u64 = 2000;
 /// 小さな印の不透明度の範囲と既定（%）。
 pub const BADGE_OPACITY_MIN: u32 = 20;
 pub const BADGE_OPACITY_MAX: u32 = 100;
