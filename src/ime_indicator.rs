@@ -54,7 +54,8 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorInfo, GetCursorPos,
+    LoadCursorW, CURSORINFO, IDC_IBEAM,
     GetForegroundWindow, GetGUIThreadInfo, GetMessageW, GetWindowThreadProcessId, KillTimer,
     PostMessageW, PostThreadMessageW, RegisterClassW, SendMessageTimeoutW,
     SetLayeredWindowAttributes, SetTimer, SetWindowPos, ShowWindow, TranslateMessage,
@@ -65,7 +66,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::ImeIndicatorSettings;
-use crate::ime_logic::{self, Badge, BadgeWhen, ImeMode, ModeTracker, Position, ReadabilityLog, Theme};
+use crate::ime_logic::{self, Badge, BadgeEvents, BadgeWhen, ImeMode, ModeTracker, Position, ReadabilityLog, Theme};
 
 /// IME の状態を調べる間隔（ミリ秒）。
 const POLL_INTERVAL_MS: u32 = 100;
@@ -145,6 +146,8 @@ pub struct Params {
     pub badge_when: BadgeWhen,
     pub badge_hold_ms: u64,
     pub badge_opacity: u32,
+    /// 「おまかせ」のとき、マウスカーソルが文字入力の形になったら小さな印を出す。
+    pub badge_on_ibeam: bool,
 }
 
 /// キーを打った・マウスのボタンを押した時刻（`GetTickCount`。0 は「まだ見ていないものは無い」）。
@@ -176,9 +179,10 @@ impl Params {
         flash: true,
         badge: Badge::Off,
         badge_size: ime_logic::DEFAULT_BADGE_SIZE,
-        badge_when: BadgeWhen::Typing,
+        badge_when: BadgeWhen::Auto,
         badge_hold_ms: ime_logic::DEFAULT_BADGE_HOLD_MS,
         badge_opacity: ime_logic::DEFAULT_BADGE_OPACITY,
+        badge_on_ibeam: true,
     };
 
     /// 設定ファイルの値から作る（範囲外は丸め、知らない値は既定にする）。
@@ -199,6 +203,7 @@ impl Params {
             badge_when: BadgeWhen::from_setting(&settings.badge_when),
             badge_hold_ms: settings.badge_hold_ms,
             badge_opacity: settings.badge_opacity,
+            badge_on_ibeam: settings.badge_on_ibeam,
         }
         .clamped()
     }
@@ -374,7 +379,11 @@ struct BadgeState {
     font: Option<(HFONT, i32)>,
     /// 最後に読み取ったモード（切り替わったことを知るため。読み取れなかったら `None`）。
     seen: Option<ImeMode>,
-    /// 最後のきっかけ（キーを打った・入力欄をクリックした・モードが切り替わった）の時刻。
+    /// 最後に見た入力先のウィンドウ（入力先が変わったことを知るため）。
+    seen_focus: isize,
+    /// マウスカーソルが文字入力の形（I の形）だったか（変わった瞬間を知るため）。
+    ibeam: bool,
+    /// 最後のきっかけ（キーを打った・クリックした・モードが切り替わった など）の時刻。
     trigger: Option<u32>,
     /// いまの不透明度（0〜255。変わったときだけ当て直す）。
     alpha: u8,
@@ -430,6 +439,8 @@ fn thread_main(ready: mpsc::Sender<u32>) {
                     follows_mouse: false,
                     font: None,
                     seen: None,
+                    seen_focus: 0,
+                    ibeam: false,
                     trigger: None,
                     alpha: 0,
                 },
@@ -644,29 +655,53 @@ unsafe extern "system" fn badge_wnd_proc(
     }
 }
 
-/// いまの入力モードを、小さな印で出し続ける（設定で選んだ場所に）。読み取れないとき・
+/// マウスカーソルが、Windows 標準の文字入力の形（I の形）か。独自の形を使うアプリでは分からない。
+unsafe fn cursor_is_ibeam() -> bool {
+    let mut info = CURSORINFO {
+        cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+        ..Default::default()
+    };
+    if GetCursorInfo(&mut info).is_err() || info.hCursor.is_invalid() {
+        return false;
+    }
+    LoadCursorW(None, IDC_IBEAM).is_ok_and(|ibeam| ibeam == info.hCursor)
+}
+
+/// いまの入力モードを、小さな印で出す（設定で選んだ場所・ときに）。読み取れないとき・
 /// 出さない設定のとき・全画面のアプリの間（その設定のとき）は消す。
 unsafe fn update_badge(observed: Option<&Observed>) {
     let params = current_params();
-    // きっかけ（キーを打った・入力欄をクリックした・モードが切り替わった）を調べる。
-    // 出さないときも毎回見て、古いきっかけを残さない。
+    // きっかけ（キーを打った・クリックした・モードや入力先が変わった・マウスカーソルが文字入力の
+    // 形になった）を調べる。出さないときも毎回見て、古いきっかけを残さない。
     let now = GetTickCount();
     let key = KEY_TICK.swap(0, Ordering::Relaxed) != 0;
     let click = CLICK_TICK.swap(0, Ordering::Relaxed) != 0;
+    let ibeam = cursor_is_ibeam();
+    let caret_known = observed.is_some_and(|o| o.caret.is_some());
     let trigger = STATE.with(|s| {
         let mut s = s.borrow_mut();
         let badge = &mut s.as_mut()?.badge;
         let mode = observed.map(|o| o.mode);
-        // クリックは、入力位置が分かるとき（入力欄をクリックしたとき）だけ、きっかけにする。
-        let clicked_input = click && observed.is_some_and(|o| o.caret.is_some());
-        let switched = badge.seen.is_some() && mode.is_some() && badge.seen != mode;
+        let focus = observed.map_or(0, |o| o.focus.0 as isize);
+        let events = BadgeEvents {
+            key,
+            click,
+            mode_switched: badge.seen.is_some() && mode.is_some() && badge.seen != mode,
+            focus_changed: focus != 0 && focus != badge.seen_focus,
+            ibeam_entered: ibeam && !badge.ibeam,
+            caret_known,
+        };
         badge.seen = mode;
-        if key || clicked_input || switched {
+        badge.seen_focus = focus;
+        badge.ibeam = ibeam;
+        if ime_logic::badge_triggered(params.badge_when, params.badge_on_ibeam, events) {
             badge.trigger = Some(now);
         }
         badge.trigger
     });
-    if !ime_logic::badge_visible(params.badge_when, trigger, now, params.badge_hold_ms) {
+    // 入力位置の横に出せるとき（入力位置が分かり、そこに出す設定のとき）。
+    let at_caret = params.badge == Badge::Caret && caret_known;
+    if !ime_logic::badge_visible(params.badge_when, at_caret, trigger, now, params.badge_hold_ms) {
         hide_badge();
         return;
     }

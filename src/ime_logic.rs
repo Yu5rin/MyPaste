@@ -179,6 +179,10 @@ impl Badge {
 /// 小さな印を出すとき。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BadgeWhen {
+    /// 入力位置が分かるアプリでは、入力位置の横に出し続ける。分からないアプリでは、打ちそうな
+    /// とき（クリック・ウィンドウの切り替え・マウスカーソルが文字入力の形になった・キーを打った・
+    /// モードを切り替えた）に出し、少しして消す。
+    Auto,
     /// キーを打ったとき・入力欄をクリックしたとき・モードを切り替えたときに出し、少しして消す。
     Typing,
     /// 出し続ける。
@@ -187,23 +191,24 @@ pub enum BadgeWhen {
 
 impl BadgeWhen {
     /// 設定ファイルの値・画面の表示名との対応（画面の並び順）。
-    pub const ALL: [(BadgeWhen, &'static str, &'static str); 2] = [
+    pub const ALL: [(BadgeWhen, &'static str, &'static str); 3] = [
+        (BadgeWhen::Auto, "auto", "おまかせ（入力位置では出し続ける）"),
         (BadgeWhen::Typing, "typing", "打ち始めたときだけ"),
         (BadgeWhen::Always, "always", "出し続ける"),
     ];
 
-    /// settings.json の値から読む。知らない値は「打ち始めたときだけ」。
+    /// settings.json の値から読む。知らない値は「おまかせ」。
     pub fn from_setting(text: &str) -> BadgeWhen {
         let text = text.trim();
         Self::ALL
             .iter()
             .find(|(_, name, _)| name.eq_ignore_ascii_case(text))
-            .map_or(BadgeWhen::Typing, |(when, _, _)| *when)
+            .map_or(BadgeWhen::Auto, |(when, _, _)| *when)
     }
 
     /// settings.json に書く値。
     pub fn as_setting(self) -> &'static str {
-        Self::ALL.iter().find(|(w, _, _)| *w == self).map_or("typing", |(_, n, _)| *n)
+        Self::ALL.iter().find(|(w, _, _)| *w == self).map_or("auto", |(_, n, _)| *n)
     }
 }
 
@@ -216,13 +221,51 @@ pub const BADGE_OPACITY_MIN: u32 = 20;
 pub const BADGE_OPACITY_MAX: u32 = 100;
 pub const DEFAULT_BADGE_OPACITY: u32 = 90;
 
-/// 小さな印を出しておくか。`trigger` は最後のきっかけ（キーを打った など）の時刻、`now` は今の
-/// 時刻（どちらも `GetTickCount` のミリ秒。約 49 日で 0 に戻るので、差で比べる）。
-pub fn badge_visible(when: BadgeWhen, trigger: Option<u32>, now: u32, hold_ms: u64) -> bool {
+/// 小さな印を出しておくか。`at_caret` は入力位置の横に出せるか（入力位置が分かり、そこに出す
+/// 設定か）、`trigger` は最後のきっかけ（キーを打った など）の時刻、`now` は今の時刻（どちらも
+/// `GetTickCount` のミリ秒。約 49 日で 0 に戻るので、差で比べる）。
+pub fn badge_visible(
+    when: BadgeWhen,
+    at_caret: bool,
+    trigger: Option<u32>,
+    now: u32,
+    hold_ms: u64,
+) -> bool {
+    let recent = trigger.is_some_and(|at| u64::from(now.wrapping_sub(at)) < hold_ms);
     match when {
         BadgeWhen::Always => true,
-        BadgeWhen::Typing => {
-            trigger.is_some_and(|at| u64::from(now.wrapping_sub(at)) < hold_ms)
+        BadgeWhen::Auto => at_caret || recent,
+        BadgeWhen::Typing => recent,
+    }
+}
+
+/// 小さな印を出すきっかけになった出来事。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BadgeEvents {
+    /// 文字のキーを打った。
+    pub key: bool,
+    /// マウスのボタンを押した。
+    pub click: bool,
+    /// 入力モードが切り替わった。
+    pub mode_switched: bool,
+    /// 入力先のウィンドウが変わった。
+    pub focus_changed: bool,
+    /// マウスカーソルが文字入力の形（I の形）に変わった。
+    pub ibeam_entered: bool,
+    /// 入力位置（キャレット）が分かる。
+    pub caret_known: bool,
+}
+
+/// きっかけとして数えるか。「打ち始めたときだけ」は、打った・切り替えた・入力欄をクリックした
+/// （入力位置が分かるときのクリック）だけ。「おまかせ」は、入力欄かどうか分からないクリックや、
+/// ウィンドウの切り替え、マウスカーソルの形（`on_ibeam` が真のとき）も数える。
+pub fn badge_triggered(when: BadgeWhen, on_ibeam: bool, events: BadgeEvents) -> bool {
+    let typing = events.key || events.mode_switched;
+    match when {
+        BadgeWhen::Always => false,
+        BadgeWhen::Typing => typing || (events.click && events.caret_known),
+        BadgeWhen::Auto => {
+            typing || events.click || events.focus_changed || (on_ibeam && events.ibeam_entered)
         }
     }
 }
@@ -665,20 +708,54 @@ mod tests {
             assert_eq!(BadgeWhen::from_setting(name), when);
             assert_eq!(when.as_setting(), name);
         }
-        assert_eq!(BadgeWhen::from_setting("?"), BadgeWhen::Typing);
+        assert_eq!(BadgeWhen::from_setting("?"), BadgeWhen::Auto);
     }
 
     #[test]
     fn badge_shows_for_a_while_after_trigger() {
-        use BadgeWhen::{Always, Typing};
-        assert!(badge_visible(Always, None, 0, 3000));
-        assert!(!badge_visible(Typing, None, 5000, 3000));
-        assert!(badge_visible(Typing, Some(5000), 5000, 3000));
-        assert!(badge_visible(Typing, Some(5000), 7999, 3000));
-        assert!(!badge_visible(Typing, Some(5000), 8000, 3000));
+        use BadgeWhen::{Always, Auto, Typing};
+        assert!(badge_visible(Always, false, None, 0, 3000));
+        assert!(!badge_visible(Typing, false, None, 5000, 3000));
+        assert!(badge_visible(Typing, false, Some(5000), 5000, 3000));
+        assert!(badge_visible(Typing, false, Some(5000), 7999, 3000));
+        assert!(!badge_visible(Typing, false, Some(5000), 8000, 3000));
+        // 「打ち始めたときだけ」は、入力位置が分かっても出し続けない。
+        assert!(!badge_visible(Typing, true, None, 5000, 3000));
         // 時刻が 0 に戻っても、差で比べるので続けて数えられる。
-        assert!(badge_visible(Typing, Some(u32::MAX - 10), 100, 3000));
-        assert!(!badge_visible(Typing, Some(u32::MAX - 10), 5000, 3000));
+        assert!(badge_visible(Typing, false, Some(u32::MAX - 10), 100, 3000));
+        assert!(!badge_visible(Typing, false, Some(u32::MAX - 10), 5000, 3000));
+        // 「おまかせ」は、入力位置の横なら出し続け、そうでなければ、きっかけのあとだけ。
+        assert!(badge_visible(Auto, true, None, 5000, 3000));
+        assert!(!badge_visible(Auto, false, None, 5000, 3000));
+        assert!(badge_visible(Auto, false, Some(4000), 5000, 3000));
+        assert!(!badge_visible(Auto, false, Some(1000), 5000, 3000));
+    }
+
+    #[test]
+    fn badge_triggers_depend_on_when() {
+        use BadgeWhen::{Always, Auto, Typing};
+        let none = BadgeEvents::default();
+        let key = BadgeEvents { key: true, ..none };
+        let click = BadgeEvents { click: true, ..none };
+        let click_in_input = BadgeEvents { click: true, caret_known: true, ..none };
+        let focus = BadgeEvents { focus_changed: true, ..none };
+        let ibeam = BadgeEvents { ibeam_entered: true, ..none };
+        let switched = BadgeEvents { mode_switched: true, ..none };
+        for when in [Auto, Typing] {
+            assert!(!badge_triggered(when, true, none));
+            assert!(badge_triggered(when, true, key));
+            assert!(badge_triggered(when, true, switched));
+            assert!(badge_triggered(when, true, click_in_input));
+        }
+        // 入力欄かどうか分からないクリック・ウィンドウの切り替え・マウスの形は「おまかせ」だけ。
+        assert!(badge_triggered(Auto, true, click));
+        assert!(badge_triggered(Auto, true, focus));
+        assert!(badge_triggered(Auto, true, ibeam));
+        assert!(!badge_triggered(Auto, false, ibeam));
+        assert!(!badge_triggered(Typing, true, click));
+        assert!(!badge_triggered(Typing, true, focus));
+        assert!(!badge_triggered(Typing, true, ibeam));
+        assert!(!badge_triggered(Always, true, key));
         // 日本語を入力するモードと半角英数で、色が違う。
         assert_ne!(badge_colors(ImeMode::Hiragana).0, badge_colors(ImeMode::AlnumHalf).0);
         assert_eq!(badge_colors(ImeMode::Hiragana), badge_colors(ImeMode::KatakanaHalf));

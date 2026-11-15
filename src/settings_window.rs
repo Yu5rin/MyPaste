@@ -123,6 +123,7 @@ const ID_CH_KEEP_OPEN: i32 = 184;
 const ID_BADGE_WHEN: i32 = 185;
 const ID_BADGE_HOLD: i32 = 186;
 const ID_BADGE_OPACITY: i32 = 187;
+const ID_BADGE_IBEAM: i32 = 188;
 
 /// 画面の中身の大きさ（96 DPI 基準）。ノート PC（1366x768、表示 125%）でも収まる大きさにする。
 const CLIENT_W: i32 = 500;
@@ -180,39 +181,40 @@ const PAGE_REMAP: &[Item] = &[
 /// 「入力モード」のページ。
 const PAGE_IME: &[Item] = &[
     item(ID_IME_ENABLED, Kind::Check, "入力モード（あ / A）を表示する（メニューの「入力モードの表示」と同じ）", 16, 48, 468, 22),
-    item(220, Kind::Group, "切り替えたとき", 12, 74, 476, 222),
-    item(ID_FLASH, Kind::Check, "切り替えたときに、画面に大きく表示する", 24, 94, 440, 22),
-    item(221, Kind::Label, "表示する位置", 24, 122, 112, 24),
-    item(ID_POSITION, Kind::Combo, "", 140, 122, 170, 200),
-    item(222, Kind::Label, "配色", 24, 150, 112, 24),
-    item(ID_THEME, Kind::Combo, "", 140, 150, 170, 200),
-    item(223, Kind::Label, "表示時間", 24, 178, 112, 24),
-    item(ID_HOLD, Kind::Edit, "", 140, 178, 70, 24),
-    item(224, Kind::Label, "秒（0.1〜5）", 216, 178, 200, 24),
-    item(225, Kind::Label, "フェードアウト", 24, 206, 112, 24),
-    item(ID_FADE, Kind::Edit, "", 140, 206, 70, 24),
-    item(226, Kind::Label, "秒（0〜2。0 ですぐに消す）", 216, 206, 220, 24),
-    item(227, Kind::Label, "大きさ", 24, 234, 112, 24),
-    item(ID_SIZE, Kind::NumberEdit, "", 140, 234, 70, 24),
-    item(228, Kind::Label, "px（40〜600）", 216, 234, 150, 24),
-    item(229, Kind::Label, "不透明度", 24, 262, 112, 24),
-    item(ID_OPACITY, Kind::NumberEdit, "", 140, 262, 70, 24),
-    item(230, Kind::Label, "%（30〜100）", 216, 262, 150, 24),
-    item(ID_PREVIEW, Kind::Button, "プレビュー(&P)", 366, 260, 110, 28),
-    item(231, Kind::Group, "いまの入力モードを、小さな印で出す", 12, 302, 476, 86),
-    item(232, Kind::Label, "出す場所", 24, 324, 66, 24),
-    item(ID_BADGE, Kind::Combo, "", 92, 324, 262, 200),
-    item(233, Kind::Label, "大きさ", 364, 324, 44, 24),
-    item(ID_BADGE_SIZE, Kind::NumberEdit, "", 410, 324, 40, 24),
-    item(234, Kind::Label, "px", 454, 324, 24, 24),
-    item(235, Kind::Label, "出すとき", 24, 354, 66, 24),
-    item(ID_BADGE_WHEN, Kind::Combo, "", 92, 354, 150, 200),
-    item(ID_BADGE_HOLD, Kind::Edit, "", 250, 354, 36, 24),
-    item(236, Kind::Label, "秒", 290, 354, 20, 24),
-    item(237, Kind::Label, "不透明度", 322, 354, 58, 24),
-    item(ID_BADGE_OPACITY, Kind::NumberEdit, "", 382, 354, 40, 24),
-    item(238, Kind::Label, "%", 426, 354, 20, 24),
-    item(ID_FULLSCREEN, Kind::Check, "全画面のアプリ（ゲーム・動画・発表など）では表示しない", 16, 396, 468, 22),
+    item(220, Kind::Group, "切り替えたとき", 12, 72, 476, 206),
+    item(ID_FLASH, Kind::Check, "切り替えたときに、画面に大きく表示する", 24, 92, 440, 22),
+    item(221, Kind::Label, "表示する位置", 24, 118, 112, 24),
+    item(ID_POSITION, Kind::Combo, "", 140, 118, 170, 200),
+    item(222, Kind::Label, "配色", 24, 144, 112, 24),
+    item(ID_THEME, Kind::Combo, "", 140, 144, 170, 200),
+    item(223, Kind::Label, "表示時間", 24, 170, 112, 24),
+    item(ID_HOLD, Kind::Edit, "", 140, 170, 70, 24),
+    item(224, Kind::Label, "秒（0.1〜5）", 216, 170, 200, 24),
+    item(225, Kind::Label, "フェードアウト", 24, 196, 112, 24),
+    item(ID_FADE, Kind::Edit, "", 140, 196, 70, 24),
+    item(226, Kind::Label, "秒（0〜2。0 ですぐに消す）", 216, 196, 220, 24),
+    item(227, Kind::Label, "大きさ", 24, 222, 112, 24),
+    item(ID_SIZE, Kind::NumberEdit, "", 140, 222, 70, 24),
+    item(228, Kind::Label, "px（40〜600）", 216, 222, 150, 24),
+    item(229, Kind::Label, "不透明度", 24, 248, 112, 24),
+    item(ID_OPACITY, Kind::NumberEdit, "", 140, 248, 70, 24),
+    item(230, Kind::Label, "%（30〜100）", 216, 248, 150, 24),
+    item(ID_PREVIEW, Kind::Button, "プレビュー(&P)", 366, 246, 110, 28),
+    item(231, Kind::Group, "いまの入力モードを、小さな印で出す", 12, 282, 476, 110),
+    item(232, Kind::Label, "出す場所", 24, 302, 66, 24),
+    item(ID_BADGE, Kind::Combo, "", 92, 302, 262, 200),
+    item(233, Kind::Label, "大きさ", 364, 302, 44, 24),
+    item(ID_BADGE_SIZE, Kind::NumberEdit, "", 410, 302, 40, 24),
+    item(234, Kind::Label, "px", 454, 302, 24, 24),
+    item(235, Kind::Label, "出すとき", 24, 332, 66, 24),
+    item(ID_BADGE_WHEN, Kind::Combo, "", 92, 332, 210, 200),
+    item(ID_BADGE_HOLD, Kind::Edit, "", 308, 332, 32, 24),
+    item(236, Kind::Label, "秒", 344, 332, 16, 24),
+    item(237, Kind::Label, "不透明度", 366, 332, 56, 24),
+    item(ID_BADGE_OPACITY, Kind::NumberEdit, "", 424, 332, 34, 24),
+    item(238, Kind::Label, "%", 462, 332, 16, 24),
+    item(ID_BADGE_IBEAM, Kind::Check, "マウスカーソルが文字入力の形（I）になったら出す（おまかせのとき）", 24, 362, 452, 22),
+    item(ID_FULLSCREEN, Kind::Check, "全画面のアプリ（ゲーム・動画・発表など）では表示しない", 16, 398, 468, 22),
 ];
 
 /// 「クリップボードの履歴」のページ。
@@ -439,6 +441,7 @@ unsafe fn fill_form(hwnd: HWND, form: &Form) {
     set_combo_index(hwnd, ID_BADGE_WHEN, when_index);
     set_text(hwnd, ID_BADGE_HOLD, &ime_logic::format_seconds(ime.badge_hold_ms));
     set_text(hwnd, ID_BADGE_OPACITY, &ime.badge_opacity.to_string());
+    set_checked(hwnd, ID_BADGE_IBEAM, ime.badge_on_ibeam);
     set_checked(hwnd, ID_STARTUP, form.startup);
     set_checked(hwnd, ID_UPDATE, form.check_update);
     set_checked(hwnd, ID_UPDATE_PERIODIC, form.update_every_hours > 0);
@@ -464,11 +467,12 @@ unsafe fn update_ime_fields(hwnd: HWND) {
     for id in [ID_FLASH, ID_FULLSCREEN, ID_BADGE, ID_BADGE_SIZE, ID_BADGE_WHEN, ID_BADGE_OPACITY] {
         ui::set_enabled(hwnd, id, on);
     }
-    // 出しておく時間は、「打ち始めたときだけ」のときに使う。
-    let typing = combo_index(hwnd, ID_BADGE_WHEN)
+    // 出しておく時間は「出し続ける」以外で、マウスカーソルの形は「おまかせ」のときに使う。
+    let when = combo_index(hwnd, ID_BADGE_WHEN)
         .and_then(|i| BadgeWhen::ALL.get(i))
-        .is_none_or(|(w, _, _)| *w == BadgeWhen::Typing);
-    ui::set_enabled(hwnd, ID_BADGE_HOLD, on && typing);
+        .map_or(BadgeWhen::Auto, |(w, _, _)| *w);
+    ui::set_enabled(hwnd, ID_BADGE_HOLD, on && when != BadgeWhen::Always);
+    ui::set_enabled(hwnd, ID_BADGE_IBEAM, on && when == BadgeWhen::Auto);
 }
 
 /// 今の欄の中身を「保存済みの状態」として覚える。
@@ -785,7 +789,8 @@ unsafe fn read_ime_params(hwnd: HWND) -> Result<Params, (i32, String)> {
         })? as u32,
         badge_when: combo_index(hwnd, ID_BADGE_WHEN)
             .and_then(|i| BadgeWhen::ALL.get(i))
-            .map_or(BadgeWhen::Typing, |(w, _, _)| *w),
+            .map_or(BadgeWhen::Auto, |(w, _, _)| *w),
+        badge_on_ibeam: is_checked(hwnd, ID_BADGE_IBEAM),
         badge_hold_ms: ime_logic::parse_seconds(
             &get_text(hwnd, ID_BADGE_HOLD),
             ime_logic::BADGE_HOLD_MS_MIN,
@@ -1017,6 +1022,7 @@ unsafe fn on_save(hwnd: HWND, close: bool) {
     settings.ime_indicator.badge_when = ime.badge_when.as_setting().to_string();
     settings.ime_indicator.badge_hold_ms = ime.badge_hold_ms;
     settings.ime_indicator.badge_opacity = ime.badge_opacity;
+    settings.ime_indicator.badge_on_ibeam = ime.badge_on_ibeam;
     settings.log.enabled = form.log;
     settings.update.check_on_startup = form.check_update;
     settings.update.check_every_hours = form.update_every_hours;
