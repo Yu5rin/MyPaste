@@ -1080,6 +1080,22 @@ unsafe fn resolve_pick(
             }
             Some(Part::Image(id))
         }
+        // 整えて貼り付ける。履歴そのものは変えず、並びも動かさない。
+        history_window::Pick::Formatted(inner, format) => {
+            let text = match *inner {
+                history_window::Pick::History(text) => text,
+                history_window::Pick::Snippet(text) => {
+                    hotkey_rules::expand_placeholders(&text, &local_time())
+                }
+                _ => return None,
+            };
+            let text = text_transform::quick_format(&text, format);
+            if text.is_empty() {
+                ime_indicator::notify("空");
+                return None;
+            }
+            Some(Part::Text(text))
+        }
         // まとめたものの中に、まとめたものは入れない。
         history_window::Pick::Many(_) => None,
     }

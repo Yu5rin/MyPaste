@@ -12,7 +12,9 @@
 //! 変えられる）。クリックか Enter で、選んだものを貼り付ける（[`crate::actions`] が行う）。
 //! PageUp / PageDown・ホイールでページを移る。Esc か、ほかの場所をクリックすると何もせずに閉じる。
 //! 履歴は Delete で 1 件を消せる。右クリック（またはアプリケーションキー）で、定型文への登録・
-//! 削除・定型文の編集のメニューを出す。
+//! 削除・定型文の編集のメニューを出す。メニューの「整えて貼り付け」では、文字（履歴の文字と
+//! 定型文）を整えてから貼り付ける（前後の空白を除く・1 行にまとめる・大文字・小文字・全角英数を
+//! 半角に。履歴そのものは変えない）。
 //!
 //! 検索: Ctrl+F か `/`（または検索の欄をクリック）で、検索の欄に入力欄を出す。入力した言葉で、
 //! 今のタブを絞り込む（大文字と小文字は区別しない。空白で区切ると、すべてを含むもの。定型文は
@@ -76,7 +78,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow, SetLayeredWindowAttributes,
     SetWindowPos, ShowWindow, TrackPopupMenuEx, TranslateMessage, GUITHREADINFO, HMENU,
     HWND_TOPMOST, LB_GETITEMRECT, LB_ITEMFROMPOINT, LB_SETCOUNT, LB_SETCURSEL, LB_SETITEMHEIGHT,
-    LWA_ALPHA, MA_NOACTIVATE, MF_CHECKED, MF_GRAYED, WM_SETFONT, MF_SEPARATOR, MF_STRING, MSG, SWP_NOACTIVATE,
+    LWA_ALPHA, MA_NOACTIVATE, MF_CHECKED, MF_GRAYED, MF_POPUP, WM_SETFONT, MF_SEPARATOR, MF_STRING, MSG, SWP_NOACTIVATE,
     SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN,
     PostMessageW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_LBUTTONDBLCLK, WM_TIMER, IsWindowVisible,
     SetTimer, KillTimer, WM_CLOSE, WM_CTLCOLORLISTBOX,
@@ -90,6 +92,7 @@ use crate::clip_history::{self, GateState, KeyGate, KeyRoute, Marks, MenuPositio
 use crate::config::Snippet;
 use crate::clip_images::{self, Item, KindFilter, Thumb};
 use crate::ui;
+use crate::text_transform::{self, QuickFormat};
 use crate::{clip_image_store, ime_indicator, snippets};
 
 const ID_HEADER: i32 = 1;
@@ -274,6 +277,8 @@ const MENU_SEARCH: usize = 8;
 const MENU_MARK: usize = 9;
 const MENU_PASTE_MARKED: usize = 10;
 const MENU_CLEAR_MARKS: usize = 11;
+/// 「整えて貼り付け」の項目（この番号に、[`text_transform::QUICK_FORMATS`] の位置を足す）。
+const MENU_FORMAT_BASE: usize = 20;
 /// ピン留めした行の左端に引く線の太さ（96 DPI 基準）。
 const PIN_BAR_W: i32 = 3;
 
@@ -341,6 +346,8 @@ pub enum Pick {
     /// 印を付けたもの（付けた順。中身は `History` / `Snippet` / `Image` だけ）。続く文字は改行で
     /// つないで 1 回で、画像はその位置で 1 枚ずつ貼り付ける。
     Many(Vec<Pick>),
+    /// 整えて貼り付ける（中身は `History` か `Snippet`）。履歴そのものは変えない。
+    Formatted(Box<Pick>, QuickFormat),
 }
 
 /// 一覧を閉じたときの、タブと選んでいた位置と絞り込み（出したままにするとき、同じ所から
@@ -1290,6 +1297,24 @@ fn choose_selected() {
     }
 }
 
+/// 選んでいる文字（履歴の文字か定型文）を、整えて貼り付けるために閉じる。
+fn choose_formatted(format: QuickFormat) {
+    let chosen = with_state(|st| {
+        let pos = st.selected()?;
+        let text = st.full_text(pos)?;
+        let pick = match st.tab {
+            Tab::History => Pick::History(text),
+            Tab::Snippets => Pick::Snippet(text),
+        };
+        Some(Pick::Formatted(Box::new(pick), format))
+    })
+    .flatten();
+    if chosen.is_some() {
+        with_state(|st| st.outcome.ctrl_held = CTRL_HELD.load(Ordering::SeqCst));
+        finish(chosen);
+    }
+}
+
 /// 選んでいる履歴を 1 件消す（定型文は定型文の画面で消す）。
 unsafe fn remove_current(hwnd: HWND) {
     let removed = with_state(|st| {
@@ -1553,7 +1578,7 @@ unsafe fn on_search_changed(hwnd: HWND) {
 
 /// 右クリックのメニューを出す。
 unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
-    let Some(((tab, has_row, pinned, is_image, keep_open), (marked, any_marks))) = with_state(|st| {
+    let Some(((tab, has_row, pinned, is_image, keep_open), (marked, any_marks, is_text))) = with_state(|st| {
         let item = st
             .selected()
             .filter(|_| st.tab == Tab::History)
@@ -1567,7 +1592,7 @@ unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
             .is_some_and(|a| st.marks.order(st.tab.index(), a).is_some());
         (
             (st.tab, on_row && st.selected().is_some(), pinned, is_image, st.keep_open),
-            (marked, !st.marks.is_empty()),
+            (marked, !st.marks.is_empty(), st.selected().and_then(|p| st.full_text(p)).is_some()),
         )
     }) else {
         return;
@@ -1583,6 +1608,14 @@ unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
         w!("貼り付け(&V)\tEnter")
     };
     let _ = AppendMenuW(menu, row_flag, MENU_PASTE, paste_label);
+    // 整えて貼り付け（文字の行だけ。履歴そのものは変えない）。
+    if let Ok(formats) = CreatePopupMenu() {
+        for (i, (_, name)) in text_transform::QUICK_FORMATS.iter().enumerate() {
+            let _ = AppendMenuW(formats, MF_STRING, MENU_FORMAT_BASE + i, &HSTRING::from(*name));
+        }
+        let format_flag = if has_row && is_text { MF_POPUP } else { MF_POPUP | MF_GRAYED };
+        let _ = AppendMenuW(menu, format_flag, formats.0 as usize, w!("整えて貼り付け(&F)"));
+    }
     let marks_flag = if any_marks { MF_STRING } else { MF_STRING | MF_GRAYED };
     let _ = AppendMenuW(
         menu,
@@ -1652,6 +1685,11 @@ unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
         MENU_PASTE_MARKED => choose_current(),
         MENU_MARK => toggle_mark_current(hwnd),
         MENU_CLEAR_MARKS => clear_marks(hwnd),
+        n if (MENU_FORMAT_BASE..MENU_FORMAT_BASE + text_transform::QUICK_FORMATS.len())
+            .contains(&n) =>
+        {
+            choose_formatted(text_transform::QUICK_FORMATS[n - MENU_FORMAT_BASE].0);
+        }
         MENU_REGISTER => register_current(hwnd),
         MENU_PIN => toggle_pin_current(hwnd),
         MENU_KEEP => toggle_keep_open(hwnd),

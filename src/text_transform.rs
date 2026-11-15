@@ -4,6 +4,8 @@
 //! （[`crate::actions`]）。Win32 API に触れないので、Linux 上でもテストできる。
 //!
 //! 整え方は `settings.json` では `"trim,zen_to_han"` のようにカンマ区切りの名前で書く。
+//!
+//! 履歴の一覧の右クリックのメニュー「整えて貼り付け」の整え方（[`QuickFormat`]）もここにある。
 
 /// 整え方の種類。並び順がそのまま当てる順になる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +112,49 @@ pub fn apply(text: &str, transforms: &[Transform]) -> String {
         };
     }
     text.replace('\n', "\r\n")
+}
+
+/// 履歴の一覧の「整えて貼り付け」で選ぶ整え方（1 つずつ当てる）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuickFormat {
+    /// 前後の空白・改行を除く
+    Trim,
+    /// 改行を空白にして 1 行にまとめる
+    OneLine,
+    /// 大文字にする
+    Upper,
+    /// 小文字にする
+    Lower,
+    /// 全角の英数字・記号・空白を半角にする
+    ZenToHan,
+}
+
+/// 「整えて貼り付け」のメニューに並べる順と、その名前。
+pub const QUICK_FORMATS: [(QuickFormat, &str); 5] = [
+    (QuickFormat::Trim, "前後の空白を除く"),
+    (QuickFormat::OneLine, "1 行にまとめる（改行を空白に）"),
+    (QuickFormat::Upper, "大文字にする"),
+    (QuickFormat::Lower, "小文字にする"),
+    (QuickFormat::ZenToHan, "全角英数を半角にする"),
+];
+
+/// 「整えて貼り付け」の整え方を当てる。改行は \r\n にそろえる。
+pub fn quick_format(text: &str, format: QuickFormat) -> String {
+    match format {
+        QuickFormat::Trim => apply(text, &[Transform::Trim]),
+        QuickFormat::ZenToHan => apply(text, &[Transform::ZenToHan]),
+        QuickFormat::OneLine => {
+            // 各行の前後の空白を除き、空の行は飛ばして、空白 1 つでつなぐ。
+            let text = text.replace("\r\n", "\n").replace('\r', "\n");
+            text.split('\n')
+                .map(|l| l.trim_matches(is_space))
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        QuickFormat::Upper => apply(&text.to_uppercase(), &[]),
+        QuickFormat::Lower => apply(&text.to_lowercase(), &[]),
+    }
 }
 
 /// 空白とみなす文字（半角・全角の空白とタブ）。
@@ -338,6 +383,16 @@ mod tests {
         assert_eq!(run("1 2　3\t4", "remove_spaces"), "1234");
         assert_eq!(run("あいう\r\nえお\n", "join_lines"), "あいうえお");
         assert_eq!(run("\r\n  abc  \r\n", "trim"), "abc");
+    }
+
+    #[test]
+    fn quick_formats() {
+        assert_eq!(quick_format("\r\n  abc \r\n", QuickFormat::Trim), "abc");
+        assert_eq!(quick_format(" a \r\n\r\n b\nc\r", QuickFormat::OneLine), "a b c");
+        assert_eq!(quick_format("abc ｘｙ ß", QuickFormat::Upper), "ABC ＸＹ SS");
+        assert_eq!(quick_format("ABC\nＸＹ", QuickFormat::Lower), "abc\r\nｘｙ");
+        assert_eq!(quick_format("ＡＢ１２　ｃ", QuickFormat::ZenToHan), "AB12 c");
+        assert_eq!(QUICK_FORMATS.len(), 5);
     }
 
     #[test]
