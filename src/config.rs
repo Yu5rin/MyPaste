@@ -75,6 +75,8 @@ pub struct Snippet {
     pub name: String,
     /// 貼り付ける本文（改行は \n）。
     pub text: String,
+    /// まとめておくためのグループ（空ならグループ無し）。
+    pub group: String,
 }
 
 /// クリップボードの履歴に関する設定。
@@ -422,6 +424,8 @@ impl Settings {
         section(value, "clipboard_history", &mut settings.clipboard_history, &mut problems);
         list(value, "hotkeys", &mut settings.hotkeys, &mut problems);
         list(value, "snippets", &mut settings.snippets, &mut problems);
+        // 同じグループの定型文が続くように並べる（手で書き換えたファイルでも一覧がまとまるよう）。
+        crate::snippets::sort_by_group(&mut settings.snippets, None);
         (settings, problems)
     }
 
@@ -564,7 +568,10 @@ pub fn save_from_settings_window(settings: &Settings) -> Result<(), String> {
 }
 
 /// 定型文を `settings.json` に書き込む（定型文の画面と、履歴から登録したとき）。
+/// 同じグループの定型文が続くように並べてから書く。
 pub fn save_snippets(snippets: &[Snippet]) -> Result<(), String> {
+    let mut snippets = snippets.to_vec();
+    crate::snippets::sort_by_group(&mut snippets, None);
     let value = serde_json::to_value(snippets).map_err(|e| e.to_string())?;
     save_patch(&serde_json::json!({ "snippets": value }))
 }
@@ -1483,6 +1490,7 @@ mod tests {
             snippets: vec![super::Snippet {
                 name: "a".into(),
                 text: "b".into(),
+                ..Default::default()
             }],
             ..Default::default()
         };

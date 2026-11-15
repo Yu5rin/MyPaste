@@ -1,24 +1,29 @@
 //! 定型文の画面。
 //!
 //! トレイメニューの「定型文の編集...」（または履歴の一覧の右クリック「定型文の編集...」）から開く。
-//! 左に定型文の一覧、右に選んだ定型文の名前と本文を出す。「新規」で書き始め、書いて「追加」で
-//! 一覧に足し、一覧で選んで書き換えたら「上書き」で直す。「OK」を押すと `settings.json` の
+//! 左に定型文の一覧、右に選んだ定型文のグループ・名前・本文を出す。「新規」で書き始め、書いて
+//! 「追加」で一覧に足し、一覧で選んで書き換えたら「上書き」で直す。「OK」を押すと `settings.json` の
 //! `snippets` に書き込み、すぐに履歴の一覧の「定型文」タブで使えるようにする（再起動は要らない）。
 //!
-//! CSV での読み込み・書き出しもできる（1 列目が名前、2 列目が本文。Excel で編集できる。
-//! 読み込みは UTF-8 と Shift_JIS のどちらでもよい）。
-//! 名前の決め方・検証・CSV の読み書きは [`crate::snippets`] にあり、Linux でもテストできる。
+//! グループを付けた定型文は、一覧に `[グループ] 名前` と出し、同じグループのものを続けて並べる。
+//!
+//! CSV での読み込み・書き出しもできる（1 列目が名前、2 列目が本文、3 列目がグループ。
+//! Excel で編集できる。2 列だけの CSV も読める。読み込みは UTF-8 と Shift_JIS のどちらでもよい）。
+//! 名前の決め方・並べ方・検証・CSV の読み書きは [`crate::snippets`] にあり、Linux でもテストできる。
 
 use std::cell::RefCell;
 
-use windows::core::w;
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HFONT};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DestroyWindow, IsWindow, MessageBoxW, PostQuitMessage, SetForegroundWindow, ShowWindow,
-    IDCANCEL, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING,
-    MB_YESNOCANCEL, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, IsWindow, MessageBoxW, PostQuitMessage,
+    SendMessageW, SetForegroundWindow, ShowWindow, CBS_AUTOHSCROLL, CBS_DROPDOWN, CB_LIMITTEXT,
+    HMENU, IDCANCEL, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING,
+    MB_YESNOCANCEL, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY,
+    WM_DPICHANGED, WM_SETFONT, WS_CHILD, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::config::{self, Snippet};
@@ -42,12 +47,15 @@ const ID_UPDATE: i32 = 508;
 const ID_IMPORT: i32 = 509;
 const ID_EXPORT: i32 = 510;
 const ID_NEW: i32 = 511;
+const ID_GROUP: i32 = 512;
 
 /// 画面の中身の大きさ（96 DPI 基準）。
 const CLIENT_W: i32 = 700;
 const CLIENT_H: i32 = 460;
 
 /// 画面の構成。並び順がそのまま Tab キーで移る順になる。
+/// グループの欄（`ID_GROUP`）は、書き込めるコンボボックスにするため [`create_group_box`] で作る
+/// （ここでは位置と大きさだけを使う）。
 const ITEMS: &[Item] = &[
     item(600, Kind::Label, "定型文（この順に一覧に並びます）", 12, 8, 270, 22),
     item(ID_LIST, Kind::ListBox, "", 12, 32, 270, 332),
@@ -55,10 +63,12 @@ const ITEMS: &[Item] = &[
     item(ID_DOWN, Kind::Button, "下へ(&W)", 78, 372, 62, 28),
     item(ID_NEW, Kind::Button, "新規(&N)", 154, 372, 62, 28),
     item(ID_DELETE, Kind::Button, "削除(&D)", 220, 372, 62, 28),
-    item(601, Kind::Label, "名前（空なら、本文の最初の行を一覧に出します）", 296, 8, 392, 22),
-    item(ID_NAME, Kind::Edit, "", 296, 32, 392, 24),
-    item(602, Kind::Label, "本文（改行もそのまま貼り付けます）", 296, 64, 392, 22),
-    item(ID_TEXT, Kind::MultiEdit, "", 296, 88, 392, 226),
+    item(604, Kind::Label, "グループ（空でもよい。同じグループはまとめて並べます）", 296, 8, 392, 22),
+    item(ID_GROUP, Kind::Combo, "", 296, 32, 392, 200),
+    item(601, Kind::Label, "名前（空なら、本文の最初の行を一覧に出します）", 296, 64, 392, 22),
+    item(ID_NAME, Kind::Edit, "", 296, 88, 392, 24),
+    item(602, Kind::Label, "本文（改行もそのまま貼り付けます）", 296, 120, 392, 22),
+    item(ID_TEXT, Kind::MultiEdit, "", 296, 144, 392, 170),
     item(603, Kind::Note, "{date} は今日の日付、{time} は今の時刻、{datetime} は両方に置き換えて貼り付けます。{ そのものは {{、} は }} と書きます。", 296, 320, 392, 44),
     item(ID_ADD, Kind::Button, "新しい定型文として追加(&A)", 296, 372, 192, 28),
     item(ID_UPDATE, Kind::Button, "選んだ定型文に上書き(&R)", 496, 372, 192, 28),
@@ -107,10 +117,8 @@ pub fn close() {
 unsafe fn thread_main(list: Vec<Snippet>) {
     // 手で書き換えた設定ファイルの定型文は、改行や名前の前後の空白がそろっていないことがある。
     // そろえておかないと、何も変えていないのに「変更があります」と尋ねてしまう。
-    let list: Vec<Snippet> = list
-        .into_iter()
-        .map(|s| snippets::make(&s.name, &s.text).unwrap_or(s))
-        .collect();
+    let mut list: Vec<Snippet> = list.into_iter().map(snippets::normalize).collect();
+    snippets::sort_by_group(&mut list, None);
     ui::init_common_controls();
     let title = format!("定型文 - アタイの貼り付け v{}", env!("CARGO_PKG_VERSION"));
     let Some(hwnd) = ui::create_top_window(w!("AtaiPasteSnippets"), Some(wnd_proc), &title) else {
@@ -130,7 +138,11 @@ unsafe fn thread_main(list: Vec<Snippet>) {
             dirty: false,
         })
     });
-    ui::create_controls(hwnd, ITEMS, font);
+    // Tab キーの順を ITEMS の並びのままにするため、グループの欄の前後に分けて作る。
+    let group_at = ITEMS.iter().position(|i| i.id == ID_GROUP).unwrap_or(ITEMS.len());
+    ui::create_controls(hwnd, &ITEMS[..group_at], font);
+    create_group_box(hwnd, font);
+    ui::create_controls(hwnd, ITEMS.get(group_at + 1..).unwrap_or(&[]), font);
     refresh_list(hwnd, first.as_ref().map(|_| 0));
     load_editor(hwnd, first.as_ref());
     ui::place_window(hwnd, dpi, CLIENT_W, CLIENT_H);
@@ -154,13 +166,52 @@ fn list_snapshot() -> Vec<Snippet> {
     CONTEXT.with(|c| c.borrow().as_ref().map(|ctx| ctx.list.clone()).unwrap_or_default())
 }
 
+/// グループの欄を、書き込めるコンボボックス（一覧から選ぶことも、新しく書くこともできる）として作る。
+unsafe fn create_group_box(hwnd: HWND, font: HFONT) {
+    let instance = GetModuleHandleW(None).unwrap_or_default();
+    let control = CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        w!("COMBOBOX"),
+        PCWSTR::null(),
+        WINDOW_STYLE(
+            WS_CHILD.0
+                | WS_VISIBLE.0
+                | WS_VSCROLL.0
+                | WS_TABSTOP.0
+                | CBS_DROPDOWN as u32
+                | CBS_AUTOHSCROLL as u32,
+        ),
+        0,
+        0,
+        0,
+        0,
+        hwnd,
+        HMENU(ID_GROUP as isize as *mut core::ffi::c_void),
+        instance,
+        None,
+    );
+    if let Ok(control) = control {
+        if !font.is_invalid() {
+            SendMessageW(control, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        }
+        SendMessageW(control, CB_LIMITTEXT, WPARAM(snippets::MAX_GROUP_CHARS), LPARAM(0));
+    }
+}
+
+/// 一覧を出し直す。グループの欄の選択肢も、今あるグループに合わせる（書いている文字は残す）。
 unsafe fn refresh_list(hwnd: HWND, select: Option<usize>) {
-    let names: Vec<String> = list_snapshot().iter().map(snippets::display_name).collect();
+    let list = list_snapshot();
+    let names: Vec<String> = list.iter().map(snippets::display_name).collect();
     ui::set_list_items(hwnd, ID_LIST, &names, select);
+    let typed = get_text(hwnd, ID_GROUP);
+    let groups = snippets::groups(&list);
+    ui::add_combo_items(hwnd, ID_GROUP, groups.iter().map(String::as_str));
+    set_text(hwnd, ID_GROUP, &typed);
 }
 
 /// 定型文を右側の欄に入れる（`None` なら空にする）。
 unsafe fn load_editor(hwnd: HWND, snippet: Option<&Snippet>) {
+    set_text(hwnd, ID_GROUP, snippet.map_or("", |s| s.group.as_str()));
     set_text(hwnd, ID_NAME, snippet.map_or("", |s| s.name.as_str()));
     // 複数行の欄は改行を \r\n で渡す。
     let text = snippet.map_or(String::new(), |s| s.text.replace('\n', "\r\n"));
@@ -169,10 +220,17 @@ unsafe fn load_editor(hwnd: HWND, snippet: Option<&Snippet>) {
 
 /// 右側の欄を読み、検証する。誤りがあれば、直すべき欄の ID と理由を返す。
 unsafe fn read_editor(hwnd: HWND) -> Result<Snippet, (i32, String)> {
+    let group = get_text(hwnd, ID_GROUP);
     let name = get_text(hwnd, ID_NAME);
     let text = get_text(hwnd, ID_TEXT);
-    snippets::make(&name, &text).map_err(|e| {
-        let id = if e.contains("名前") { ID_NAME } else { ID_TEXT };
+    snippets::make_in_group(&group, &name, &text).map_err(|e| {
+        let id = if e.contains("グループ") {
+            ID_GROUP
+        } else if e.contains("名前") {
+            ID_NAME
+        } else {
+            ID_TEXT
+        };
         (id, format!("{e}。"))
     })
 }
@@ -282,8 +340,9 @@ unsafe fn on_new(hwnd: HWND) {
     ui::focus(hwnd, ID_NAME);
 }
 
-/// 同じ名前（一覧に出る名前）の定型文が、`except` 以外にあるか。キー割り当ての
-/// 「定型文を貼り付け」は名前で選ぶので、同じ名前が 2 つあると後ろのものを選べない。
+/// 同じ名前（一覧に出る名前。グループがあればグループも同じ）の定型文が、`except` 以外にあるか。
+/// キー割り当ての「定型文を貼り付け」は名前で選ぶので、同じ名前が 2 つあると後ろのものを選べない
+/// （グループが違えば `[グループ] 名前` で選べるので、知らせない）。
 fn name_taken(list: &[Snippet], snippet: &Snippet, except: Option<usize>) -> bool {
     let name = snippets::display_name(snippet);
     list.iter()
@@ -311,10 +370,12 @@ unsafe fn editor_differs(hwnd: HWND) -> bool {
             .as_ref()
             .and_then(|ctx| ctx.shown.and_then(|i| ctx.list.get(i).cloned()))
     });
+    let group = get_text(hwnd, ID_GROUP);
     let name = get_text(hwnd, ID_NAME);
     let text = get_text(hwnd, ID_TEXT).replace("\r\n", "\n");
     match shown {
-        Some(s) => s.name != name.trim() || s.text != text,
+        Some(s) => s.group != group.trim() || s.name != name.trim() || s.text != text,
+        // グループだけ書いて（選んで）あっても、書き始めたとはみなさない。
         None => !name.trim().is_empty() || !text.trim().is_empty(),
     }
 }
@@ -343,9 +404,12 @@ unsafe fn on_add(hwnd: HWND) -> bool {
         let mut c = c.borrow_mut();
         let ctx = c.as_mut()?;
         ctx.list.push(snippet);
+        // 同じグループの最後に入るよう並べ直す。
+        let last = ctx.list.len() - 1;
+        let index = snippets::sort_by_group(&mut ctx.list, Some(last));
         ctx.dirty = true;
-        ctx.shown = Some(ctx.list.len() - 1);
-        Some(ctx.list.len() - 1)
+        ctx.shown = index;
+        index
     });
     refresh_list(hwnd, index);
     true
@@ -371,16 +435,18 @@ unsafe fn on_update(hwnd: HWND) -> bool {
     if name_taken(&list_snapshot(), &snippet, Some(index)) && !confirm_same_name(hwnd, &snippet) {
         return false;
     }
-    CONTEXT.with(|c| {
-        if let Some(ctx) = c.borrow_mut().as_mut() {
-            if let Some(slot) = ctx.list.get_mut(index) {
-                *slot = snippet;
-                ctx.dirty = true;
-                ctx.shown = Some(index);
-            }
-        }
+    let index = CONTEXT.with(|c| {
+        let mut c = c.borrow_mut();
+        let ctx = c.as_mut()?;
+        let slot = ctx.list.get_mut(index)?;
+        *slot = snippet;
+        // グループを変えたときは、そのグループの所へ動く。
+        let index = snippets::sort_by_group(&mut ctx.list, Some(index));
+        ctx.dirty = true;
+        ctx.shown = index;
+        index
     });
-    refresh_list(hwnd, Some(index));
+    refresh_list(hwnd, index);
     true
 }
 
@@ -408,7 +474,8 @@ unsafe fn on_delete(hwnd: HWND) {
     show_selected(hwnd);
 }
 
-/// 一覧で選んでいる定型文を上下に動かす。
+/// 一覧で選んでいる定型文を上下に動かす。グループの境目では、グループごと動かす
+/// （[`snippets::move_item`]）。
 unsafe fn on_move(hwnd: HWND, delta: isize) {
     let Some(index) = ui::list_index(hwnd, ID_LIST) else {
         return;
@@ -416,16 +483,15 @@ unsafe fn on_move(hwnd: HWND, delta: isize) {
     let moved = CONTEXT.with(|c| {
         let mut c = c.borrow_mut();
         let ctx = c.as_mut()?;
-        let to = index.checked_add_signed(delta).filter(|to| *to < ctx.list.len())?;
-        ctx.list.swap(index, to);
+        let shown = ctx.shown.and_then(|s| ctx.list.get(s).cloned().map(|snippet| (s, snippet)));
+        let to = snippets::move_item(&mut ctx.list, index, delta)?;
         ctx.dirty = true;
-        ctx.shown = ctx.shown.map(|s| {
+        // 右側に出している定型文の、動かしたあとの位置（同じ中身が 2 つあっても、出す中身は同じ）。
+        ctx.shown = shown.and_then(|(s, snippet)| {
             if s == index {
-                to
-            } else if s == to {
-                index
+                Some(to)
             } else {
-                s
+                ctx.list.iter().position(|x| *x == snippet)
             }
         });
         Some(to)
@@ -479,7 +545,7 @@ unsafe fn on_import(hwnd: HWND) {
         true
     } else {
         let text = ui::wide(&format!(
-            "{} 件の定型文を読み込みます。\n\n「はい」: 今の {current} 件の後ろに足す\n\
+            "{} 件の定型文を読み込みます。\n\n「はい」: 今の {current} 件に足す（グループのあるものは、同じグループの所に並べる）\n\
              「いいえ」: 今の定型文を消して、読み込んだものに置き換える",
             imported.len()
         ));
@@ -505,6 +571,8 @@ unsafe fn on_import(hwnd: HWND) {
         }
         let first = ctx.list.len();
         ctx.list.extend(imported);
+        // 読み込んだ定型文も、同じグループの所へ並べる。
+        let first = snippets::sort_by_group(&mut ctx.list, Some(first)).unwrap_or(0);
         ctx.dirty = true;
         Some(Ok(first))
     });
@@ -590,7 +658,7 @@ unsafe fn on_save(hwnd: HWND) {
         .into_iter()
         // 開いたときと同じそろえ方をしてから比べる（そろえないと、手で書いた定型文を
         // 「ほかの場所で足された」と数えてしまう）。
-        .map(|s| snippets::make(&s.name, &s.text).unwrap_or(s))
+        .map(snippets::normalize)
         .filter(|s| !loaded.contains(s) && !current.contains(s))
         .collect();
     if !added.is_empty()
@@ -608,6 +676,7 @@ unsafe fn on_save(hwnd: HWND) {
             if let Some(ctx) = c.borrow_mut().as_mut() {
                 ctx.list.extend(added);
                 ctx.list.truncate(snippets::MAX_SNIPPETS);
+                snippets::sort_by_group(&mut ctx.list, None);
             }
         });
     }
