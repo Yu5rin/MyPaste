@@ -18,6 +18,8 @@
 //! 今のタブを絞り込む（大文字と小文字は区別しない。空白で区切ると、すべてを含むもの。定型文は
 //! 名前と本文、画像は一覧に出す文で探す）。入力している間も、上下・PageUp / PageDown で選び、
 //! Enter で貼り付けられる。Esc の 1 回目で検索をやめ（言葉も消す）、2 回目で閉じる。
+//! 履歴のタブでは、検索の欄の左に出す種類（すべて・文字だけ・画像だけ）を出し、`F` キーか
+//! クリックで切り替える（検索と組み合わせられる。出したままにして出し直しても保つ）。
 //! 絞り込んだ一覧の位置は、元の一覧の位置に置き換えてから消す・ピン留め・貼り付けをする。
 //!
 //! 一覧は前面（アクティブ）にしない。前面にすると、元のアプリの入力欄からカーソルが外れて
@@ -82,7 +84,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::clip_history::{self, GateState, KeyGate, KeyRoute, MenuPosition, Palette, Theme};
 use crate::config::Snippet;
-use crate::clip_images::{self, Item, Thumb};
+use crate::clip_images::{self, Item, KindFilter, Thumb};
 use crate::ui;
 use crate::{clip_image_store, ime_indicator, snippets};
 
@@ -339,6 +341,8 @@ pub struct Resume {
     places: [(Option<usize>, usize); 2],
     /// 検索の言葉（出し直したときも、同じ言葉で絞り込んだまま出す）。
     query: String,
+    /// 履歴のタブで出す種類。
+    kind: KindFilter,
 }
 
 impl Resume {
@@ -487,6 +491,8 @@ struct State {
     visible: [Vec<usize>; 2],
     /// 検索の言葉。
     query: String,
+    /// 履歴のタブで出す種類（すべて・文字だけ・画像だけ）。
+    kind: KindFilter,
     /// 検索の入力欄に入力している（一覧を前面にしている）。
     searching: bool,
     /// 検索で探す文（大文字と小文字の違いをなくしたもの。最初に検索するときに作る）。
@@ -502,6 +508,8 @@ struct State {
     tab_rects: [RECT; 2],
     /// 見出しの中の「出したまま」の範囲。
     keep_rect: RECT,
+    /// 見出しの下の段の、出す種類の範囲（履歴のタブだけ）。
+    kind_rect: RECT,
     /// 見出しの下の段の、検索の欄の範囲と、そこに置いた入力欄の範囲（置いていなければ空）。
     search_rect: RECT,
     edit_rect: RECT,
@@ -533,6 +541,7 @@ impl State {
     /// 絞り込んでいるか（見出しに、該当の件数を出す）。
     fn filtered(&self) -> bool {
         !clip_history::query_terms(&self.query).is_empty()
+            || (self.tab == Tab::History && self.kind != KindFilter::All)
     }
 
     /// 検索で探す文（大文字と小文字の違いをなくしたもの）。
@@ -560,7 +569,9 @@ impl State {
                     .and_then(|f| f[list].get(i))
                     .is_some_and(|text| clip_history::matches_terms(text, &terms))
         };
-        let history: Vec<usize> = (0..self.history.len()).filter(|i| hit(0, *i)).collect();
+        let history: Vec<usize> = (0..self.history.len())
+            .filter(|i| self.kind.accepts(&self.history[*i]) && hit(0, *i))
+            .collect();
         let snippets: Vec<usize> = (0..self.snippets.len()).filter(|i| hit(1, *i)).collect();
         self.visible = [history, snippets];
     }
@@ -735,6 +746,7 @@ pub unsafe fn choose(
         Some(resume) => Tab::from_index(resume.tab),
         None => Tab::from_index(counts.iter().position(|c| *c > 0).unwrap_or(0)),
     };
+    let kind = resume.as_ref().map(|r| r.kind).unwrap_or_default();
     let query = resume.map(|r| r.query).unwrap_or_default();
     STATE.with(|s| {
         *s.borrow_mut() = Some(State {
@@ -749,6 +761,7 @@ pub unsafe fn choose(
             places: [(None, 0); 2],
             visible: [Vec::new(), Vec::new()],
             query,
+            kind,
             searching: false,
             folded: None,
             page_size,
@@ -759,6 +772,7 @@ pub unsafe fn choose(
             back_brush: CreateSolidBrush(COLORREF(colors.back)),
             tab_rects: [RECT::default(); 2],
             keep_rect: RECT::default(),
+            kind_rect: RECT::default(),
             search_rect: RECT::default(),
             edit_rect: RECT::default(),
             tip,
@@ -870,6 +884,7 @@ pub unsafe fn choose(
             tab: st.tab.index(),
             places: st.actual_places(),
             query: st.query.clone(),
+            kind: st.kind,
         };
         std::mem::take(&mut st.outcome)
     });
@@ -1142,6 +1157,8 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
         // Ctrl+F か / で検索を始める。
         v if v == u16::from(b'F') && ctrl => enter_search(hwnd),
         v if (v == VK_OEM_2.0 || v == VK_DIVIDE.0) && !ctrl => enter_search(hwnd),
+        // F で、履歴のタブで出す種類を切り替える（すべて → 文字だけ → 画像だけ）。
+        v if v == u16::from(b'F') => cycle_kind(hwnd),
         v if v == VK_RETURN.0 => choose_current(),
         v if v == vk_prev => move_to(current - 1),
         v if v == vk_next => move_to(current + 1),
@@ -1317,6 +1334,21 @@ unsafe fn toggle_keep_open(hwnd: HWND) {
         st.outcome.keep_open = Some(st.keep_open);
     });
     let _ = InvalidateRect(control(hwnd, ID_HEADER), None, true);
+}
+
+/// 履歴のタブで出す種類を切り替える（すべて → 文字だけ → 画像だけ）。定型文のタブでは何もしない。
+unsafe fn cycle_kind(hwnd: HWND) {
+    let changed = with_state(|st| {
+        if st.tab != Tab::History {
+            return false;
+        }
+        st.kind = st.kind.next();
+        st.refilter();
+        true
+    });
+    if changed == Some(true) {
+        show_page(hwnd);
+    }
 }
 
 /// 検索の入力欄。
@@ -1894,15 +1926,47 @@ unsafe fn paint_header(hwnd: HWND) {
 
 /// 見出しの下の段（検索の欄）を描く。入力欄に入力しているなら `true`（入力欄を置き直す）。
 unsafe fn paint_filter_row(hdc: HDC, row: RECT, colors: Palette, dpi: u32) -> bool {
-    let Some((query, searching)) = with_state(|st| (st.query.clone(), st.searching)) else {
+    let Some((query, searching, tab, kind)) =
+        with_state(|st| (st.query.clone(), st.searching, st.tab, st.kind))
+    else {
         return false;
     };
     let pad = ui::scale(PAD, dpi);
     let inset = ui::scale(2, dpi);
+    // 履歴のタブでは、左に出す種類（押すと切り替わる。絞り込んでいるときは目立たせる）。
+    let mut kind_rect = RECT::default();
+    let mut left = row.left;
+    if tab == Tab::History {
+        let widest = [KindFilter::All, KindFilter::Text, KindFilter::Image]
+            .iter()
+            .map(|k| text_width(hdc, k.label()))
+            .max()
+            .unwrap_or(0);
+        kind_rect = RECT {
+            left: row.left,
+            right: row.left + widest + ui::scale(TAB_PAD, dpi) * 2,
+            ..row
+        };
+        if kind != KindFilter::All {
+            fill(hdc, &kind_rect, colors.back);
+            let bar = RECT {
+                top: kind_rect.bottom - ui::scale(2, dpi),
+                ..kind_rect
+            };
+            fill(hdc, &bar, colors.sel_back);
+            SetTextColor(hdc, COLORREF(colors.text));
+        } else {
+            SetTextColor(hdc, COLORREF(colors.header_text));
+        }
+        let mut text_rect = kind_rect;
+        draw_line(hdc, kind.label(), &mut text_rect, DT_CENTER);
+        left = kind_rect.right;
+    }
+    with_state(|st| st.kind_rect = kind_rect);
     let search = RECT {
-        left: row.left + pad,
+        left: left + pad,
         top: row.top + inset / 2,
-        right: (row.right - pad).max(row.left + pad),
+        right: (row.right - pad).max(left + pad),
         bottom: row.bottom - inset,
     };
     // 入力欄のような枠（入力しているときは、選んだ行と同じ色の枠にする）。
@@ -2127,13 +2191,16 @@ unsafe extern "system" fn header_proc(
             let x = (lparam.0 & 0xFFFF) as u16 as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
             let hit = |r: &RECT| x >= r.left && x < r.right && y >= r.top && y < r.bottom;
-            let (rects, keep, search) =
-                with_state(|st| (st.tab_rects, st.keep_rect, st.search_rect)).unwrap_or_default();
+            let (rects, keep, kind, search) =
+                with_state(|st| (st.tab_rects, st.keep_rect, st.kind_rect, st.search_rect))
+                    .unwrap_or_default();
             let parent = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd).unwrap_or_default();
             if let Some(i) = rects.iter().position(hit) {
                 switch_tab(parent, Tab::from_index(i));
             } else if hit(&keep) {
                 toggle_keep_open(parent);
+            } else if hit(&kind) {
+                cycle_kind(parent);
             } else if hit(&search) {
                 enter_search(parent);
             }

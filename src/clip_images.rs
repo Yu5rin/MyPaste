@@ -232,6 +232,45 @@ pub fn row_label(entry: &Entry) -> String {
     }
 }
 
+/// 「履歴」のタブで出すものの種類（`F` キーで すべて → 文字だけ → 画像だけ と切り替える）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KindFilter {
+    #[default]
+    All,
+    Text,
+    Image,
+}
+
+impl KindFilter {
+    /// 次の種類（画像だけの次は、すべてに戻る）。
+    pub fn next(self) -> KindFilter {
+        match self {
+            KindFilter::All => KindFilter::Text,
+            KindFilter::Text => KindFilter::Image,
+            KindFilter::Image => KindFilter::All,
+        }
+    }
+
+    /// 見出しに出す名前。
+    pub fn label(self) -> &'static str {
+        match self {
+            KindFilter::All => "すべて",
+            KindFilter::Text => "文字だけ",
+            KindFilter::Image => "画像だけ",
+        }
+    }
+
+    /// この種類に入るか。
+    pub fn accepts(self, item: &Item) -> bool {
+        matches!(
+            (self, item),
+            (KindFilter::All, _)
+                | (KindFilter::Text, Item::Text { .. })
+                | (KindFilter::Image, Item::Image(_))
+        )
+    }
+}
+
 /// 検索で探す文（文字は全文、画像は一覧に出す文）。
 pub fn search_text(item: &Item) -> String {
     match item {
@@ -586,5 +625,21 @@ mod tests {
             pinned: false,
         };
         assert_eq!(search_text(&text), "abc");
+    }
+
+    #[test]
+    fn kind_filter_cycles_and_accepts() {
+        let image = Item::Image(entry(1, 1));
+        let text = Item::Text {
+            text: "a".into(),
+            pinned: false,
+        };
+        assert_eq!(KindFilter::default().next(), KindFilter::Text);
+        assert_eq!(KindFilter::Text.next(), KindFilter::Image);
+        assert_eq!(KindFilter::Image.next(), KindFilter::All);
+        assert!(KindFilter::All.accepts(&image) && KindFilter::All.accepts(&text));
+        assert!(KindFilter::Text.accepts(&text) && !KindFilter::Text.accepts(&image));
+        assert!(KindFilter::Image.accepts(&image) && !KindFilter::Image.accepts(&text));
+        assert_eq!(KindFilter::Image.label(), "画像だけ");
     }
 }
