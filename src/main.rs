@@ -78,17 +78,19 @@ const HELP_URL: &str = "https://github.com/Yu5rin/MyPaste#readme";
 fn report_save(result: Result<(), String>) {
     if let Err(e) = result {
         log::error!("設定を保存できませんでした: {e}");
-        // メインスレッドを止めないよう、別のスレッドで知らせる。
-        thread::spawn(move || {
-            update::notice_box(
-                &format!(
-                    "切り替えた状態を保存できませんでした。\n\
-                     今回の起動中は切り替えた状態で動きますが、次回の起動では元に戻ります。\n\n詳細: {e}"
-                ),
-                MB_OK | MB_ICONERROR,
-            );
-        });
+        notice_in_background(format!(
+            "切り替えた状態を保存できませんでした。\n\
+             今回の起動中は切り替えた状態で動きますが、次回の起動では元に戻ります。\n\n詳細: {e}"
+        ));
     }
+}
+
+/// 失敗のお知らせを、別のスレッドで出す。メインスレッドで出すと、閉じるまでトレイの操作や
+/// 終了の要求（更新で入れ替えたあとの終了も）を受け取れなくなるため。
+fn notice_in_background(text: String) {
+    thread::spawn(move || {
+        update::notice_box(&text, MB_OK | MB_ICONERROR);
+    });
 }
 
 /// 動いている間の更新確認の時刻かを確かめる間隔。
@@ -283,10 +285,9 @@ fn main() {
                 Err(e) => {
                     log::error!("自動起動設定失敗: {e}");
                     tray.update(|s| s.startup = startup::is_enabled());
-                    update::notice_box(
-                        &format!("Windows の起動時に実行する設定を、切り替えられませんでした。\n\n詳細: {e}"),
-                        MB_OK | MB_ICONERROR,
-                    );
+                    notice_in_background(format!(
+                        "Windows の起動時に実行する設定を、切り替えられませんでした。\n\n詳細: {e}"
+                    ));
                 }
             },
             TrayMessage::ToggleHistory => {
@@ -303,9 +304,8 @@ fn main() {
             TrayMessage::ToggleImeIndicator => {
                 if ime_indicator.is_none() {
                     // 起動時に表示ウィンドウを作れなかった。切り替えても動かないので知らせる。
-                    update::notice_box(
-                        "入力モード表示を開始できなかったため、切り替えられません。",
-                        MB_OK | MB_ICONERROR,
+                    notice_in_background(
+                        "入力モード表示を開始できなかったため、切り替えられません。".to_string(),
                     );
                     continue;
                 }
@@ -316,13 +316,10 @@ fn main() {
                 // 次回の起動でも同じ状態になるよう settings.json に保存する。
                 if let Err(e) = config::save_ime_indicator_enabled(on) {
                     log::error!("入力モード表示の設定を保存できませんでした: {e}");
-                    update::notice_box(
-                        &format!(
-                            "入力モード表示の設定を保存できませんでした。\n\
-                             今回の起動中は切り替えた状態で動きますが、次回の起動では元に戻ります。\n\n詳細: {e}"
-                        ),
-                        MB_OK | MB_ICONERROR,
-                    );
+                    notice_in_background(format!(
+                        "入力モード表示の設定を保存できませんでした。\n\
+                         今回の起動中は切り替えた状態で動きますが、次回の起動では元に戻ります。\n\n詳細: {e}"
+                    ));
                 }
                 log::info!("入力モード表示: {}", if on { "有効" } else { "無効" });
             }

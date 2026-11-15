@@ -564,7 +564,23 @@ fn install(new_exe: &Path) -> Result<PathBuf, String> {
 
     // 3) `.new` を本来の場所へリネーム。失敗したら 2 を巻き戻す。
     if let Err(e) = std::fs::rename(&staged, &current) {
-        let _ = std::fs::rename(&old, &current);
+        if let Err(back) = std::fs::rename(&old, &current) {
+            // 元に戻せなかった。実行ファイルが無いままなので、手で名前を戻してもらう。
+            log::error!(
+                "新しい実行ファイルを配置できず（{e}）、元の実行ファイルにも戻せませんでした（{} → {}）: {back}",
+                old.display(),
+                current.display()
+            );
+            return Err(format!(
+                "新しい実行ファイルを配置できず、元の実行ファイルにも戻せませんでした。\n\n\
+                 このままではアプリを起動できません。次のフォルダで、\n\
+                 {old_name} の名前を {exe_name} に戻してください。\n{}\n\n\
+                 配置できなかった理由: {e}\n戻せなかった理由: {back}",
+                dir.display(),
+                old_name = old.file_name().unwrap_or_default().to_string_lossy(),
+                exe_name = current.file_name().unwrap_or_default().to_string_lossy(),
+            ));
+        }
         return Err(format!("新しい実行ファイルを配置できません（元に戻しました）: {e}"));
     }
 
@@ -605,6 +621,12 @@ pub fn cleanup_old() {
         } else if old.exists() {
             match std::fs::remove_file(&old) {
                 Ok(()) => log::info!("前回の更新の残骸を削除しました"),
+                // 更新した直後は、古い版がまだ終わりきらず、ファイルが使われていることがある。
+                // 少し待ちながら、別のスレッドで何度か消し直す（起動を待たせない）。
+                Err(e) if std::env::args().any(|a| a == crate::single_instance::AFTER_UPDATE_ARG) => {
+                    log::info!("前回の更新の残骸をまだ削除できないため、少し待って再試行します: {e}");
+                    std::thread::spawn(move || retry_remove_old(&old));
+                }
                 // まだロックされている場合もある。次回の起動で消えるので無視してよい。
                 Err(e) => log::warn!("残骸の削除に失敗しました（次回起動時に再試行）: {e}"),
             }
@@ -618,6 +640,26 @@ pub fn cleanup_old() {
         }
     }
     cleanup_temp_files();
+}
+
+/// 更新した直後の起動で、古い版（`.old`）を消し直す回数と間隔。
+const OLD_REMOVE_RETRIES: u32 = 10;
+const OLD_REMOVE_INTERVAL: Duration = Duration::from_millis(300);
+
+/// 古い版（`.old`）を、少し待ちながら何度か消し直す。消せなければ次回の起動に任せる。
+fn retry_remove_old(old: &Path) {
+    for _ in 0..OLD_REMOVE_RETRIES {
+        std::thread::sleep(OLD_REMOVE_INTERVAL);
+        match std::fs::remove_file(old) {
+            Ok(()) => {
+                log::info!("前回の更新の残骸を削除しました");
+                return;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) => {}
+        }
+    }
+    log::warn!("残骸の削除に失敗しました（次回起動時に再試行）: {}", old.display());
 }
 
 /// 一時フォルダに残った更新ファイルを削除する。
@@ -843,6 +885,11 @@ fn ask_and_install(info: &Available, tx: &Sender<TrayMessage>) {
         log::info!("アプリの終了中のため、更新しません");
         return;
     }
+    // 入れ替えると画面を閉じて再起動するので、保存していない変更が消えてしまう。
+    if editing_windows_open() {
+        notify_editing_windows_open();
+        return;
+    }
 
     // ダウンロードと検証。
     let downloaded = match download_and_verify(info, tx) {
@@ -860,7 +907,33 @@ fn ask_and_install(info: &Available, tx: &Sender<TrayMessage>) {
             return;
         }
     };
+    // ダウンロードしている間に開かれたときも、入れ替えない。
+    if editing_windows_open() {
+        let _ = std::fs::remove_file(&downloaded);
+        let _ = tx.send(TrayMessage::UpdateFinished);
+        notify_editing_windows_open();
+        return;
+    }
     install_and_restart(info, &downloaded, tx, false);
+}
+
+/// 編集中の内容を持つ画面（設定・キー割り当て・定型文）が開いているか。
+/// 更新で入れ替えるときはこれらの画面を保存せずに閉じるので、開いている間は入れ替えない。
+fn editing_windows_open() -> bool {
+    settings_window::is_open() || hotkey_window::is_open() || snippet_window::is_open()
+}
+
+/// 編集中の画面が開いているため、今回は更新しなかったことを知らせる。
+/// 失敗ではないので、次に確認するまでの間は空けない（すぐにやり直せる）。
+fn notify_editing_windows_open() {
+    log::info!("設定などの画面が開いているため、今回は更新しません");
+    message_box(
+        "設定・キー割り当て・定型文の画面が開いているため、更新を中止しました\
+         （更新すると、保存していない変更が消えてしまいます）。\n\n\
+         開いている画面で変更を保存して閉じてから、トレイメニューの「更新を確認」を\
+         もう一度選んでください。",
+        MB_OK | MB_ICONINFORMATION,
+    );
 }
 
 /// 尋ねずに更新する。ダウンロードと検証を済ませてから、操作が無いときに入れ替える。
@@ -947,8 +1020,17 @@ fn install_and_restart(info: &Available, downloaded: &Path, tx: &Sender<TrayMess
             let _ = std::fs::remove_file(downloaded);
             // 動いている間の定期的な確認で、同じ版で何度も失敗して知らせないように。
             remember_offered(info.version);
-            if auto {
+            // 元の実行ファイルにも戻せず、実行ファイルが無いままのときは、尋ねずに更新する
+            // 設定でも必ず知らせる（手で名前を戻さないと、次から起動できない）。
+            let exe_missing = std::env::current_exe().is_ok_and(|p| !p.exists());
+            if auto && !exe_missing {
                 // 尋ねずに更新するときは、失敗も画面に出さない（記録にだけ残す）。
+                let _ = tx.send(TrayMessage::UpdateFinished);
+                return;
+            }
+            if exe_missing {
+                // 名前を戻す手順は `e` に書いてある。
+                message_box(&e, MB_OK | MB_ICONERROR);
                 let _ = tx.send(TrayMessage::UpdateFinished);
                 return;
             }
@@ -994,8 +1076,7 @@ pub fn auto_updated_notice() -> Option<String> {
     }
     log::info!("尋ねずに更新したあとの起動です");
     Some(format!(
-        "新しいバージョン {} に更新しました。変更点は、トレイメニューの「使い方を開く」から\
-         リリースのページで確かめられます。",
+        "新しいバージョン {} に更新しました。変更点は、GitHub のリリースのページで確かめられます。",
         Version::current()
     ))
 }

@@ -87,8 +87,10 @@ pub fn toggle() -> Result<bool> {
 /// COM を使って .lnk ショートカットを作成する。
 fn create_shortcut(target: &Path, lnk: &Path) -> Result<()> {
     unsafe {
-        // このスレッド用に COM を初期化（既に初期化済みでも害はない）。
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        // このスレッド用に COM を初期化する（既に初期化済みなら S_FALSE が返り、これも成功）。
+        // 別の方式で初期化済み（RPC_E_CHANGED_MODE）など失敗したときは、COM はそのまま使えるが、
+        // 終わりの CoUninitialize は呼ばない（呼ぶと、このスレッドの数が合わなくなる）。
+        let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
 
         let result = (|| -> Result<()> {
             let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
@@ -110,7 +112,9 @@ fn create_shortcut(target: &Path, lnk: &Path) -> Result<()> {
             Ok(())
         })();
 
-        CoUninitialize();
+        if initialized {
+            CoUninitialize();
+        }
         result
     }
 }

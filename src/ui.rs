@@ -151,7 +151,16 @@ impl SingleWindow {
     /// 画面のスレッドを始める。すでに開いていれば手前に出すだけ。
     /// `run` は画面を作ってメッセージループを回し、閉じたら戻る関数。
     pub fn open(&'static self, run: impl FnOnce() + Send + 'static) {
-        if self.running.load(Ordering::SeqCst) {
+        // 別のスレッド（トレイと、履歴の一覧の「定型文の編集...」など）からほぼ同時に開かれても
+        // 二つ開かないよう、先にロックを取り、そのうえで「開いていない → 開いている」への切り替えを
+        // 一度に行う。切り替えられなければ、もう開いているので手前に出すだけ。
+        let mut slot = self.thread.lock().unwrap_or_else(|p| p.into_inner());
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            drop(slot);
             let window = self.window.load(Ordering::SeqCst);
             if window != 0 {
                 unsafe {
@@ -162,12 +171,10 @@ impl SingleWindow {
             }
             return;
         }
-        let mut slot = self.thread.lock().unwrap_or_else(|p| p.into_inner());
         // 前回開いたときのスレッドは終わっているので、片付けてから新しく作る。
         if let Some(previous) = slot.take() {
             let _ = previous.join();
         }
-        self.running.store(true, Ordering::SeqCst);
         *slot = Some(std::thread::spawn(move || {
             run();
             self.window.store(0, Ordering::SeqCst);

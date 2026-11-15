@@ -21,6 +21,40 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # タグと Cargo.toml の version が違うまま公開すると、アプリは自分の版をいつまでも
+      # 「古い」と判断し、更新を繰り返してしまう。main 以外から作った版も公開しない。
+      - name: Check tag, version and branch
+        shell: pwsh
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          GIT_REF: ${{ github.ref }}
+        run: |
+          if ($env:GIT_REF -ne "refs/heads/main") {
+            Write-Error "main ブランチから実行してください（現在: $env:GIT_REF）"
+            exit 1
+          }
+          $version = $null
+          $inPackage = $false
+          foreach ($line in Get-Content Cargo.toml -Encoding utf8) {
+            if ($line -match '^\s*\[(.+)\]\s*$') {
+              $inPackage = ($Matches[1] -eq "package")
+              continue
+            }
+            if ($inPackage -and $line -match '^\s*version\s*=\s*"([^"]+)"') {
+              $version = $Matches[1]
+              break
+            }
+          }
+          if (-not $version) {
+            Write-Error "Cargo.toml の [package] に version が見つかりません"
+            exit 1
+          }
+          if ($env:INPUT_TAG -cne "v$version") {
+            Write-Error "タグ（$env:INPUT_TAG）が Cargo.toml の version（v$version）と一致しません"
+            exit 1
+          }
+          Write-Host "タグ $env:INPUT_TAG と Cargo.toml の version が一致しました"
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 

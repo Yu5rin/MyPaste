@@ -342,7 +342,9 @@ impl Settings {
                 // ファイルはあるが読めない（例: UTF-16 で保存されている等）。
                 // ここで既定値を書き戻すと利用者の編集内容を消してしまうため、
                 // 上書き保存はせず、今回だけ既定値で動作する。
+                // この時点では動作の記録がまだ始まっていないので、起動したあとで利用者に知らせる。
                 log::warn!("settings.json を読み込めなかったため既定値で動作します: {e}");
+                report_load_problem(&path, &format!("{e}"), &[read_error_reason(&e)], true);
                 return Self::default();
             }
         };
@@ -364,7 +366,7 @@ impl Settings {
                         vec!["ファイル全体を JSON として読めません（かっこやカンマの書き間違いなど）".to_string()],
                     ),
                 };
-                report_load_problem(&path, &format!("{e}"), &problems);
+                report_load_problem(&path, &format!("{e}"), &problems, false);
                 settings
             }
         }
@@ -434,9 +436,22 @@ impl Settings {
 /// settings.json を読めなかった所の説明（起動時に 1 度だけ知らせる）。
 static LOAD_PROBLEM: Mutex<Option<String>> = Mutex::new(None);
 
+/// settings.json を読めなかったとき（ファイルはある）の、利用者向けの理由。
+fn read_error_reason(e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::InvalidData {
+        // read_to_string は、UTF-8 として読めないと InvalidData を返す。
+        "文字コードが UTF-8 ではありません（UTF-16 や Shift_JIS で保存されている可能性があります）"
+            .to_string()
+    } else {
+        format!("ファイルを読めません: {e}")
+    }
+}
+
 /// settings.json に読めない所があったことを覚えておく。最初の 1 回は、直す前の中身を
 /// `settings.json.bak` に写しておく（このあとの保存で、読めなかった所が既定値に置き換わるため）。
-fn report_load_problem(path: &Path, error: &str, problems: &[String]) {
+/// `unreadable` は、ファイルそのものを読めなかった（文字コードが違うなど）とき。このときは
+/// 全体を既定値で動かし、設定の保存もできない（[`save_patch`] が書き込まない）。
+fn report_load_problem(path: &Path, error: &str, problems: &[String], unreadable: bool) {
     // 知らせるのも写しを作るのも、起動してから最初の 1 回だけ（あとの読み込みで写しを
     // 作り直すと、保存で変わったあとの中身で、元の中身の写しを上書きしてしまう）。
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -448,10 +463,17 @@ fn report_load_problem(path: &Path, error: &str, problems: &[String]) {
     backup.push(".bak");
     let backup = PathBuf::from(backup);
     let copied = std::fs::copy(path, &backup).is_ok();
-    let mut message = format!(
-        "設定ファイル（settings.json）に読めない所があったため、その部分は既定値で動いています。\n\n{}\n\n読めなかった所:\n",
-        path.display()
-    );
+    let mut message = if unreadable {
+        format!(
+            "設定ファイル（settings.json）を読めなかったため、すべて既定値で動いています。\n\n{}\n\n理由:\n",
+            path.display()
+        )
+    } else {
+        format!(
+            "設定ファイル（settings.json）に読めない所があったため、その部分は既定値で動いています。\n\n{}\n\n読めなかった所:\n",
+            path.display()
+        )
+    };
     for problem in problems.iter().take(8) {
         message.push_str(&format!("・{problem}\n"));
     }
@@ -464,7 +486,14 @@ fn report_load_problem(path: &Path, error: &str, problems: &[String]) {
             backup.display()
         ));
     }
-    message.push_str("\nこのあと設定を保存すると、読めなかった所は既定値に置き換わります。");
+    if unreadable {
+        message.push_str(
+            "\nこのままでは設定を保存できません。メモ帳などで文字コードを UTF-8 にして保存し直してから、\
+             アプリを起動し直してください。",
+        );
+    } else {
+        message.push_str("\nこのあと設定を保存すると、読めなかった所は既定値に置き換わります。");
+    }
     *slot = Some(message);
 }
 
@@ -565,6 +594,13 @@ pub fn export_all(autostart: bool) -> Result<String, String> {
     let mut root = match settings_path().map(|p| std::fs::read_to_string(&p)) {
         Some(Ok(text)) => serde_json::from_str::<serde_json::Value>(strip_bom(&text))
             .map_err(|e| format!("settings.json を解釈できないため書き出せません: {e}"))?,
+        // ファイルはあるのに読めないときは、既定値を書き出さない（正しい控えに見えてしまう）。
+        Some(Err(e)) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "settings.json を読めないため書き出せません。\n{}",
+                read_error_reason(&e)
+            ))
+        }
         _ => serde_json::to_value(Settings::load()).map_err(|e| e.to_string())?,
     };
     let object = root
@@ -923,8 +959,28 @@ pub fn is_writable(dir: &Path) -> bool {
 mod tests {
     use super::{
         hotkeys_from_json, hotkeys_to_json, is_due, merge_import, merge_json, parse_import,
-        strip_bom, HotkeyRuleSetting, Settings,
+        read_error_reason, strip_bom, HotkeyRuleSetting, Settings,
     };
+
+    #[test]
+    fn read_error_reason_explains_non_utf8() {
+        // Shift_JIS で保存された「設定」。UTF-8 としては読めない。
+        let dir = std::env::temp_dir().join(format!("atai-cfg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sjis.json");
+        std::fs::write(&path, [0x90u8, 0xdd, 0x92, 0xe8]).unwrap();
+        let e = std::fs::read_to_string(&path).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(read_error_reason(&e).contains("UTF-8 ではありません"));
+    }
+
+    #[test]
+    fn read_error_reason_keeps_other_errors() {
+        let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let reason = read_error_reason(&e);
+        assert!(!reason.contains("UTF-8"));
+        assert!(reason.contains("denied"));
+    }
 
     const HOUR: u64 = 3600;
 
