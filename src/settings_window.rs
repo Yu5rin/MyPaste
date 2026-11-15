@@ -118,6 +118,8 @@ const ID_TABS: i32 = 171;
 const ID_BADGE: i32 = 180;
 const ID_BADGE_SIZE: i32 = 181;
 const ID_FLASH: i32 = 182;
+const ID_CH_IMAGES: i32 = 183;
+const ID_CH_KEEP_OPEN: i32 = 184;
 
 /// 画面の中身の大きさ（96 DPI 基準）。ノート PC（1366x768、表示 125%）でも収まる大きさにする。
 const CLIENT_W: i32 = 500;
@@ -205,42 +207,44 @@ const PAGE_IME: &[Item] = &[
 
 /// 「クリップボードの履歴」のページ。
 const PAGE_HISTORY: &[Item] = &[
-    item(ID_CH_ENABLED, Kind::Check, "コピーした文字を履歴に残し、一覧から選んで貼り付ける", 16, 48, 468, 22),
-    item(240, Kind::Group, "一覧を出す操作", 12, 76, 476, 94),
-    item(241, Kind::Label, "操作", 24, 98, 100, 24),
-    item(ID_CH_TRIGGER, Kind::Combo, "", 128, 98, 348, 200),
+    item(ID_CH_ENABLED, Kind::Check, "コピーした文字や画像を履歴に残し、一覧から選んで貼り付ける", 16, 48, 468, 22),
+    item(240, Kind::Group, "一覧を出す操作", 12, 72, 476, 86),
+    item(241, Kind::Label, "操作", 24, 92, 100, 24),
+    item(ID_CH_TRIGGER, Kind::Combo, "", 128, 92, 348, 200),
     // キーの組み合わせのときはキーの欄を、2 回押しのときは間隔の欄を、同じ行に出し分ける。
-    item(ID_CH_KEY_LABEL, Kind::Label, "キー", 24, 130, 100, 24),
-    item(ID_CH_CTRL, Kind::Check, "Ctrl", 128, 131, 54, 22),
-    item(ID_CH_SHIFT, Kind::Check, "Shift", 184, 131, 60, 22),
-    item(ID_CH_ALT, Kind::Check, "Alt", 246, 131, 48, 22),
-    item(ID_CH_WIN, Kind::Check, "Win", 296, 131, 52, 22),
-    item(ID_CH_PLUS, Kind::Label, "+", 350, 130, 14, 24),
-    item(ID_CH_KEY, Kind::Combo, "", 366, 130, 110, 300),
-    item(ID_CH_INTERVAL_LABEL, Kind::Label, "2 回押しの間隔", 24, 130, 100, 24),
-    item(ID_CH_INTERVAL, Kind::Edit, "", 128, 130, 70, 24),
-    item(ID_CH_INTERVAL_UNIT, Kind::Label, "秒以内（0.2〜1）", 204, 130, 200, 24),
-    item(242, Kind::Group, "一覧の見た目", 12, 178, 476, 94),
-    item(243, Kind::Label, "出す位置", 24, 200, 100, 24),
-    item(ID_CH_POSITION, Kind::Combo, "", 128, 200, 150, 200),
-    item(244, Kind::Label, "配色", 296, 200, 40, 24),
-    item(ID_CH_THEME, Kind::Combo, "", 340, 200, 136, 200),
-    item(245, Kind::Label, "幅（px）", 24, 232, 100, 24),
-    item(ID_CH_WIDTH, Kind::NumberEdit, "", 128, 232, 50, 24),
-    item(246, Kind::Label, "不透明度（%）", 196, 232, 90, 24),
-    item(ID_CH_OPACITY, Kind::NumberEdit, "", 288, 232, 44, 24),
-    item(247, Kind::Label, "1 ページの件数", 346, 232, 86, 24),
-    item(ID_CH_PAGE, Kind::NumberEdit, "", 436, 232, 40, 24),
-    item(248, Kind::Group, "履歴の保存", 12, 280, 476, 140),
-    item(249, Kind::Label, "残す件数", 24, 302, 100, 24),
-    item(ID_CH_MAX, Kind::NumberEdit, "", 128, 302, 70, 24),
-    item(250, Kind::Label, "件（10〜10000）", 204, 302, 110, 24),
-    item(ID_CH_CLEAR, Kind::Button, "履歴をすべて削除(&D)...", 316, 300, 160, 28),
-    item(ID_CH_KEEP, Kind::Check, "アプリを終了しても履歴を残す（暗号化して保存）", 24, 332, 452, 22),
-    item(ID_CH_MOVE_TOP, Kind::Check, "一覧から貼り付けたものを、いちばん上に移す", 24, 356, 452, 22),
-    item(251, Kind::Label, "履歴に残さないアプリ", 24, 384, 130, 24),
-    item(ID_CH_EXCLUDE, Kind::Edit, "", 158, 384, 208, 24),
-    item(ID_CH_PICK_EXCLUDE, Kind::Button, "アプリを選ぶ...", 372, 382, 104, 28),
+    item(ID_CH_KEY_LABEL, Kind::Label, "キー", 24, 122, 100, 24),
+    item(ID_CH_CTRL, Kind::Check, "Ctrl", 128, 123, 54, 22),
+    item(ID_CH_SHIFT, Kind::Check, "Shift", 184, 123, 60, 22),
+    item(ID_CH_ALT, Kind::Check, "Alt", 246, 123, 48, 22),
+    item(ID_CH_WIN, Kind::Check, "Win", 296, 123, 52, 22),
+    item(ID_CH_PLUS, Kind::Label, "+", 350, 122, 14, 24),
+    item(ID_CH_KEY, Kind::Combo, "", 366, 122, 110, 300),
+    item(ID_CH_INTERVAL_LABEL, Kind::Label, "2 回押しの間隔", 24, 122, 100, 24),
+    item(ID_CH_INTERVAL, Kind::Edit, "", 128, 122, 70, 24),
+    item(ID_CH_INTERVAL_UNIT, Kind::Label, "秒以内（0.2〜1）", 204, 122, 200, 24),
+    item(242, Kind::Group, "一覧の見た目", 12, 162, 476, 110),
+    item(243, Kind::Label, "出す位置", 24, 182, 100, 24),
+    item(ID_CH_POSITION, Kind::Combo, "", 128, 182, 176, 200),
+    item(244, Kind::Label, "配色", 314, 182, 36, 24),
+    item(ID_CH_THEME, Kind::Combo, "", 352, 182, 124, 200),
+    item(245, Kind::Label, "幅（px）", 24, 212, 100, 24),
+    item(ID_CH_WIDTH, Kind::NumberEdit, "", 128, 212, 50, 24),
+    item(246, Kind::Label, "不透明度（%）", 196, 212, 90, 24),
+    item(ID_CH_OPACITY, Kind::NumberEdit, "", 288, 212, 44, 24),
+    item(247, Kind::Label, "1 ページの件数", 346, 212, 86, 24),
+    item(ID_CH_PAGE, Kind::NumberEdit, "", 436, 212, 40, 24),
+    item(ID_CH_KEEP_OPEN, Kind::Check, "貼り付けても、一覧を出したままにする（Esc で閉じる）", 24, 242, 452, 22),
+    item(248, Kind::Group, "履歴の保存", 12, 276, 476, 148),
+    item(249, Kind::Label, "残す件数", 24, 296, 100, 24),
+    item(ID_CH_MAX, Kind::NumberEdit, "", 128, 296, 70, 24),
+    item(250, Kind::Label, "件（10〜10000）", 204, 296, 110, 24),
+    item(ID_CH_CLEAR, Kind::Button, "履歴をすべて削除(&D)...", 316, 294, 160, 28),
+    item(ID_CH_KEEP, Kind::Check, "アプリを終了しても履歴を残す（暗号化して保存）", 24, 324, 452, 22),
+    item(ID_CH_IMAGES, Kind::Check, "画像（スクリーンショットなど）も履歴に残す（合計 500 MB まで）", 24, 346, 452, 22),
+    item(ID_CH_MOVE_TOP, Kind::Check, "一覧から貼り付けたものを、いちばん上に移す", 24, 368, 452, 22),
+    item(251, Kind::Label, "履歴に残さないアプリ", 24, 394, 130, 24),
+    item(ID_CH_EXCLUDE, Kind::Edit, "", 158, 394, 208, 24),
+    item(ID_CH_PICK_EXCLUDE, Kind::Button, "アプリを選ぶ...", 372, 392, 104, 28),
 ];
 
 /// ページ（[`TAB_NAMES`] と同じ順）。
@@ -497,6 +501,8 @@ unsafe fn fill_history(hwnd: HWND, settings: &ClipboardHistorySettings) {
     set_text(hwnd, ID_CH_OPACITY, &config.opacity.to_string());
     set_text(hwnd, ID_CH_PAGE, &config.page_size.to_string());
     set_checked(hwnd, ID_CH_MOVE_TOP, config.move_to_top);
+    set_checked(hwnd, ID_CH_IMAGES, config.record_images);
+    set_checked(hwnd, ID_CH_KEEP_OPEN, config.keep_open);
     // 空白を含む名前は " で囲む（読むときに 1 つの名前として読めるように）。
     set_text(hwnd, ID_CH_EXCLUDE, &remap_logic::apps_to_line(&config.exclude_apps));
     let theme_index = HistoryTheme::ALL.iter().position(|(t, _, _)| *t == config.theme).unwrap_or(0);
@@ -532,6 +538,8 @@ unsafe fn update_history_fields(hwnd: HWND) {
         ID_CH_PAGE,
         ID_CH_THEME,
         ID_CH_MOVE_TOP,
+        ID_CH_IMAGES,
+        ID_CH_KEEP_OPEN,
         ID_CH_EXCLUDE,
         ID_CH_PICK_EXCLUDE,
     ] {
@@ -649,6 +657,8 @@ unsafe fn read_history(hwnd: HWND) -> Result<ClipboardHistorySettings, (i32, Str
             .map_or("system", |(t, _, _)| t.as_setting())
             .to_string(),
         move_to_top: is_checked(hwnd, ID_CH_MOVE_TOP),
+        record_images: is_checked(hwnd, ID_CH_IMAGES),
+        keep_open: is_checked(hwnd, ID_CH_KEEP_OPEN),
         exclude_apps: remap_logic::normalize_apps([get_text(hwnd, ID_CH_EXCLUDE).as_str()]),
     })
 }

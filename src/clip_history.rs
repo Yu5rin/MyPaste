@@ -452,13 +452,19 @@ pub enum MenuPosition {
     Caret,
     /// マウスの近く。
     Mouse,
+    /// 画面の右端に、上から下までの縦のパネル。
+    Side,
+    /// 画面の下に、横長の帯（カードを横に並べる）。
+    Bottom,
 }
 
 impl MenuPosition {
     /// (値, settings.json に書く名前, 画面に出す名前)
-    pub const ALL: [(MenuPosition, &'static str, &'static str); 2] = [
+    pub const ALL: [(MenuPosition, &'static str, &'static str); 4] = [
         (MenuPosition::Caret, "caret", "入力位置の近く"),
         (MenuPosition::Mouse, "mouse", "マウスの近く"),
+        (MenuPosition::Side, "side", "画面の右端に縦のパネル"),
+        (MenuPosition::Bottom, "bottom", "画面の下に横長の帯"),
     ];
 
     pub fn from_setting(text: &str) -> MenuPosition {
@@ -493,6 +499,10 @@ pub struct Config {
     pub move_to_top: bool,
     /// 記録しないアプリ（大文字のプロセス名）。
     pub exclude_apps: Vec<String>,
+    /// 画像も記録するか。
+    pub record_images: bool,
+    /// 貼り付けても一覧を出したままにするか。
+    pub keep_open: bool,
     /// 使えない値があったときの理由（記録用）。
     pub problem: Option<String>,
 }
@@ -528,6 +538,8 @@ impl Config {
             theme: Theme::from_setting(&settings.theme),
             move_to_top: settings.move_to_top,
             exclude_apps: crate::remap_logic::normalize_app_list(&settings.exclude_apps),
+            record_images: settings.record_images,
+            keep_open: settings.keep_open,
             problem,
         }
     }

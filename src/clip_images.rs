@@ -66,10 +66,6 @@ impl Index {
             .map(|e| e.id)
     }
 
-    pub fn get(&self, id: u64) -> Option<&Entry> {
-        self.items.iter().find(|e| e.id == id)
-    }
-
     /// 新しい画像を加え、上限を超えた分を消す。消した画像の番号を返す（ファイルを消すため）。
     pub fn push(&mut self, entry: Entry, max: usize) -> Vec<u64> {
         self.items.retain(|e| e.id != entry.id);
@@ -159,9 +155,6 @@ impl Index {
         self.items.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
 
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
@@ -427,7 +420,7 @@ mod tests {
         d[12..14].copy_from_slice(&1u16.to_le_bytes());
         d[14..16].copy_from_slice(&bits.to_le_bytes());
         d[16..20].copy_from_slice(&compression.to_le_bytes());
-        d.extend(std::iter::repeat(0).take(extra));
+        d.extend(std::iter::repeat_n(0, extra));
         d
     }
 

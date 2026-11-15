@@ -34,6 +34,8 @@ mod config;
 mod excel_check;
 mod actions;
 mod clip_history;
+mod clip_image_store;
+mod clip_images;
 mod clip_store;
 mod snippet_window;
 mod snippets;
@@ -501,7 +503,9 @@ fn configure_hotkeys(settings: &config::Settings) {
         max_items: history.max_items,
         keep: history.keep_after_exit,
         move_to_top: history.move_to_top,
+        record_images: history.record_images,
         view: history_window::View {
+            keep_open: history.keep_open,
             position: history.position,
             width: history.width,
             opacity: history.opacity,

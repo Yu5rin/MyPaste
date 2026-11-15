@@ -19,6 +19,8 @@
 //! Linux でもテストできる。
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -51,7 +53,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow, SetLayeredWindowAttributes,
     SetWindowPos, ShowWindow, TrackPopupMenuEx, TranslateMessage, GUITHREADINFO, HMENU,
     HWND_TOPMOST, LB_GETITEMRECT, LB_ITEMFROMPOINT, LB_SETCOUNT, LB_SETCURSEL, LB_SETITEMHEIGHT,
-    LWA_ALPHA, MA_NOACTIVATE, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SWP_NOACTIVATE,
+    LWA_ALPHA, MA_NOACTIVATE, MF_CHECKED, MF_GRAYED, WM_SETFONT, MF_SEPARATOR, MF_STRING, MSG, SWP_NOACTIVATE,
     SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN,
     PostMessageW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_CTLCOLORLISTBOX,
     WM_DRAWITEM, WM_NULL,
@@ -62,8 +64,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::clip_history::{self, MenuPosition, Palette, Theme};
 use crate::config::Snippet;
-use crate::ui::{self, item, Item, Kind};
-use crate::{ime_indicator, snippets};
+use crate::clip_images::{self, Entry, Thumb};
+use crate::ui;
+use crate::{clip_image_store, ime_indicator, snippets};
 
 const ID_HEADER: i32 = 1;
 const ID_LIST: i32 = 2;
@@ -101,12 +104,46 @@ const MENU_DELETE: usize = 3;
 const MENU_EDIT_SNIPPETS: usize = 4;
 const MENU_CLOSE: usize = 5;
 const MENU_PIN: usize = 6;
+const MENU_KEEP: usize = 7;
 /// ピン留めした行の左端に引く線の太さ（96 DPI 基準）。
 const PIN_BAR_W: i32 = 3;
 
 /// 画面の部品（位置と大きさは、幅と件数に合わせて [`layout`] で決める）。見出しは自分で描く
 /// ウィンドウなので、ここには一覧だけを書く。
-const ITEMS: &[Item] = &[item(ID_LIST, Kind::OwnerList, "", 0, 0, 0, 0)];
+/// 帯（画面の下に出すとき）のカードの大きさ（96 DPI 基準）。
+const CARD_W: i32 = 200;
+const CARD_H: i32 = 132;
+/// カードのまわりのすき間と、カードの中の余白。
+const CARD_GAP: i32 = 4;
+const CARD_PAD: i32 = 6;
+/// 縦のパネル（画面の右端に出すとき）の幅の下限。
+const SIDE_MIN_W: i32 = 300;
+/// 読み込んだ縮小した絵を覚えておく枚数。
+const THUMB_CACHE: usize = 80;
+/// `LBS_MULTICOLUMN` と `LB_SETCOLUMNWIDTH`（帯では、一覧を横に並べる）。
+const LBS_MULTICOLUMN: u32 = 0x0200;
+const LB_SETCOLUMNWIDTH: u32 = 0x0195;
+
+/// 画面の形。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    /// 入力位置・マウスの近くの、小さな一覧。
+    List,
+    /// 画面の右端の、縦のパネル。
+    Side,
+    /// 画面の下の、横長の帯。
+    Band,
+}
+
+impl Layout {
+    fn of(position: MenuPosition) -> Layout {
+        match position {
+            MenuPosition::Caret | MenuPosition::Mouse => Layout::List,
+            MenuPosition::Side => Layout::Side,
+            MenuPosition::Bottom => Layout::Band,
+        }
+    }
+}
 
 /// 画面の出し方（設定の値）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +156,8 @@ pub struct View {
     /// 1 ページの件数。
     pub page_size: usize,
     pub theme: Theme,
+    /// 貼り付けても一覧を出したままにするか。
+    pub keep_open: bool,
 }
 
 /// 選ばれたもの。
@@ -128,6 +167,15 @@ pub enum Pick {
     History(String),
     /// 定型文（{date} などを置き換えてから貼り付ける）。
     Snippet(String),
+    /// 履歴の画像（番号）。
+    Image(u64),
+}
+
+/// 一覧を閉じたときの、タブと選んでいた位置（出したままにするとき、同じ所から出し直す）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Resume {
+    tab: usize,
+    places: [(Option<usize>, usize); 3],
 }
 
 /// 一覧の画面の結果。
@@ -141,6 +189,14 @@ pub struct Outcome {
     pub registered: Vec<String>,
     /// ピン留めを変えたもの（文字, ピン留めしたか）。同じものを何度も変えたら、最後のものが効く。
     pub pin_changes: Vec<(String, bool)>,
+    /// 履歴から消した画像（番号）。
+    pub removed_images: Vec<u64>,
+    /// ピン留めを変えた画像（番号, ピン留めしたか）。
+    pub image_pin_changes: Vec<(u64, bool)>,
+    /// 「出したままにする」を切り替えた（切り替えなければ `None`）。
+    pub keep_open: Option<bool>,
+    /// 閉じたときのタブと位置。
+    pub resume: Resume,
     /// 「定型文の編集...」を選んだ。
     pub edit_snippets: bool,
     /// Shift+ホイールで変えた不透明度（変えなければ `None`）。
@@ -170,14 +226,30 @@ pub fn request_close() {
 enum Tab {
     History,
     Snippets,
+    Images,
 }
 
 impl Tab {
+    /// 見出しに並べる順と、その名前。
+    const ALL: [(Tab, &'static str); 3] =
+        [(Tab::History, "履歴"), (Tab::Snippets, "定型文"), (Tab::Images, "画像")];
+
     fn index(self) -> usize {
         match self {
             Tab::History => 0,
             Tab::Snippets => 1,
+            Tab::Images => 2,
         }
+    }
+
+    fn from_index(index: usize) -> Tab {
+        Self::ALL[index % Self::ALL.len()].0
+    }
+
+    /// 隣のタブ（端まで行ったら反対の端へ）。
+    fn step(self, delta: isize) -> Tab {
+        let count = Self::ALL.len() as isize;
+        Tab::from_index((self.index() as isize + delta).rem_euclid(count) as usize)
     }
 }
 
@@ -187,9 +259,15 @@ struct State {
     /// 除いていく。
     history: Vec<(String, bool)>,
     snippets: Vec<Snippet>,
+    /// 画像（ピン留めしたものが先、続けて新しい順）。
+    images: Vec<Entry>,
+    /// 読み込んだ縮小した絵（読めなかったものは `None`）。
+    thumbs: HashMap<u64, Option<Rc<Thumb>>>,
+    layout: Layout,
+    keep_open: bool,
     tab: Tab,
     /// タブごとの (選んでいる位置, 出しているページ)。
-    places: [(Option<usize>, usize); 2],
+    places: [(Option<usize>, usize); 3],
     page_size: usize,
     opacity: u32,
     dpi: u32,
@@ -198,10 +276,13 @@ struct State {
     /// 一覧の背景を塗るブラシ。
     back_brush: HBRUSH,
     /// 見出しの中のタブの範囲（クリックで切り替えるため）。
-    tab_rects: [RECT; 2],
-    /// 全文の吹き出しと、そこに出している文。
+    tab_rects: [RECT; 3],
+    /// 見出しの中の「出したまま」の範囲。
+    keep_rect: RECT,
+    /// 全文の吹き出しと、そこに出している文（画像のときは絵）。
     tip: HWND,
     tip_text: String,
+    tip_image: Option<Rc<Thumb>>,
     /// 最後に見たマウスの位置（動いていないのに届く WM_MOUSEMOVE で選び直さないため）。
     last_mouse: Option<(i32, i32)>,
     /// 一覧の上でマウスのボタンを押したか（押したまま一覧に来て離しても貼り付けないため）。
@@ -217,7 +298,19 @@ impl State {
         match self.tab {
             Tab::History => self.history.len(),
             Tab::Snippets => self.snippets.len(),
+            Tab::Images => self.images.len(),
         }
+    }
+
+    /// 縮小した絵（最初に使うときにファイルから読む）。
+    fn thumb(&mut self, id: u64) -> Option<Rc<Thumb>> {
+        if !self.thumbs.contains_key(&id) && self.thumbs.len() >= THUMB_CACHE {
+            self.thumbs.clear();
+        }
+        self.thumbs
+            .entry(id)
+            .or_insert_with(|| clip_image_store::load_thumb(id).map(Rc::new))
+            .clone()
     }
 
     fn selected(&self) -> Option<usize> {
@@ -245,6 +338,10 @@ impl State {
                 let lines = clip_history::row_text(&snippet.text).1;
                 Some((index + 1, snippets::display_name(snippet), lines, false))
             }
+            Tab::Images => {
+                let entry = self.images.get(index)?;
+                Some((index + 1, clip_images::row_label(entry), 1, entry.pinned))
+            }
         }
     }
 
@@ -253,6 +350,7 @@ impl State {
         match self.tab {
             Tab::History => self.history.get(index).map(|(t, _)| t.clone()),
             Tab::Snippets => self.snippets.get(index).map(|s| s.text.clone()),
+            Tab::Images => None,
         }
     }
 }
@@ -270,8 +368,10 @@ fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
 pub unsafe fn choose(
     history: Vec<(String, bool)>,
     snippets: Vec<Snippet>,
+    images: Vec<Entry>,
     view: View,
     target: HWND,
+    resume: Option<Resume>,
 ) -> Option<Outcome> {
     let anchor = anchor_point(target, view.position);
     let monitor = MonitorFromPoint(anchor, MONITOR_DEFAULTTONEAREST);
@@ -280,46 +380,74 @@ pub unsafe fn choose(
     if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y).is_err() {
         dpi = 96;
     }
-
-    // 画面の高さに収まる件数にする（低い画面で、下の行がはみ出さないように）。
+    let layout = Layout::of(view.position);
     let work = work_area(monitor);
-    let fit = ((work.bottom - work.top - ui::scale(HEADER_H, dpi) - BORDER * 2)
-        / ui::scale(ROW_H, dpi).max(1))
-    .max(1) as usize;
-    let view = View {
-        page_size: view.page_size.clamp(1, fit),
-        ..view
+    let (work_w, work_h) = (work.right - work.left, work.bottom - work.top);
+    let header_h = ui::scale(HEADER_H, dpi);
+
+    // 画面の形ごとに、1 ページの件数・1 件の大きさ・一覧の大きさを決める。
+    let (page_size, item_w, item_h, list_w, list_h) = match layout {
+        Layout::List => {
+            // 画面の高さに収まる件数にする（低い画面で、下の行がはみ出さないように）。
+            let row_h = ui::scale(ROW_H, dpi).max(1);
+            let fit = ((work_h - header_h - BORDER * 2) / row_h).max(1) as usize;
+            let size = view.page_size.clamp(1, fit);
+            let width = ui::scale(view.width as i32, dpi);
+            (size, width, row_h, width, row_h * size as i32)
+        }
+        Layout::Side => {
+            let row_h = ui::scale(ROW_H, dpi).max(1);
+            let list_h = (work_h - header_h - BORDER * 2).max(row_h);
+            let width = ui::scale((view.width as i32).max(SIDE_MIN_W), dpi).min(work_w - BORDER * 2);
+            ((list_h / row_h).max(1) as usize, width, row_h, width, list_h)
+        }
+        Layout::Band => {
+            let list_w = (work_w - BORDER * 2).max(1);
+            let size = (list_w / ui::scale(CARD_W, dpi).max(1)).max(1);
+            let card_h = ui::scale(CARD_H, dpi).min((work_h - header_h - BORDER * 2).max(1));
+            (size as usize, list_w / size, card_h, list_w, card_h)
+        }
     };
+    let (width, height) = (list_w + BORDER * 2, header_h + list_h + BORDER * 2);
 
     let hwnd = create_window()?;
     let tip = create_tip_window(hwnd);
     let font = ui::create_ui_font(dpi);
     let colors = view.theme.palette().unwrap_or_else(|| system_palette());
-    // 履歴が無く定型文があるときは、定型文のタブから始める。
-    let tab = if history.is_empty() && !snippets.is_empty() {
-        Tab::Snippets
-    } else {
-        Tab::History
+    let counts = [history.len(), snippets.len(), images.len()];
+    // 前に閉じたときの場所があれば、そこから（件数が減っていれば収まる所へ）。無ければ、
+    // 中身のある最初のタブから始める。
+    let mut places = [(None, 0); 3];
+    for (i, count) in counts.iter().enumerate() {
+        let wanted = resume.and_then(|r| r.places[i].0).unwrap_or(0);
+        let selected = (*count > 0).then(|| wanted.min(count - 1));
+        places[i] = (selected, selected.map_or(0, |s| s / page_size));
+    }
+    let tab = match resume {
+        Some(resume) => Tab::from_index(resume.tab),
+        None => Tab::from_index(counts.iter().position(|c| *c > 0).unwrap_or(0)),
     };
-    let places = [
-        ((!history.is_empty()).then_some(0), 0),
-        ((!snippets.is_empty()).then_some(0), 0),
-    ];
     STATE.with(|s| {
         *s.borrow_mut() = Some(State {
             history,
             snippets,
+            images,
+            thumbs: HashMap::new(),
+            layout,
+            keep_open: view.keep_open,
             tab,
             places,
-            page_size: view.page_size.max(1),
+            page_size,
             opacity: view.opacity,
             dpi,
             font,
             colors,
             back_brush: CreateSolidBrush(COLORREF(colors.back)),
-            tab_rects: [RECT::default(); 2],
+            tab_rects: [RECT::default(); 3],
+            keep_rect: RECT::default(),
             tip,
             tip_text: String::new(),
+            tip_image: None,
             last_mouse: None,
             pressed_on_list: false,
             wheel: 0,
@@ -329,20 +457,48 @@ pub unsafe fn choose(
     });
     set_opacity(hwnd, view.opacity);
     create_header(hwnd);
-    ui::create_controls(hwnd, ITEMS, font);
-    let (width, height) = layout(hwnd, view, dpi);
+    let list = create_list(hwnd, layout, font);
+    let _ = SetWindowPos(
+        control(hwnd, ID_HEADER),
+        None,
+        BORDER,
+        BORDER,
+        list_w,
+        header_h,
+        SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+    let _ = SetWindowPos(
+        list,
+        None,
+        BORDER,
+        BORDER + header_h,
+        list_w,
+        list_h,
+        SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+    SendMessageW(list, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(item_h as isize));
+    if layout == Layout::Band {
+        SendMessageW(list, LB_SETCOLUMNWIDTH, WPARAM(item_w as usize), LPARAM(0));
+    }
 
     // 一覧では日本語入力を使わない（文字を打つと変換が始まり、Esc や Enter が効かなくなるため）。
-    let _ = ImmAssociateContextEx(control(hwnd, ID_LIST), None, 0);
+    let _ = ImmAssociateContextEx(list, None, 0);
 
-    // 置く場所: 基準の位置の下（入らなければ上）。モニターの作業領域に収める。
-    let mut x = anchor.x;
-    let mut y = anchor.y + ui::scale(4, dpi);
-    if y + height > work.bottom {
-        y = anchor.y - height - ui::scale(24, dpi);
-    }
-    x = x.clamp(work.left, (work.right - width).max(work.left));
-    y = y.clamp(work.top, (work.bottom - height).max(work.top));
+    // 置く場所。モニターの作業領域に収める。
+    let (x, y) = match layout {
+        Layout::List => {
+            // 基準の位置の下（入らなければ上）。
+            let mut y = anchor.y + ui::scale(4, dpi);
+            if y + height > work.bottom {
+                y = anchor.y - height - ui::scale(24, dpi);
+            }
+            (anchor.x, y)
+        }
+        Layout::Side => (work.right - width, work.top),
+        Layout::Band => (work.left, work.bottom - height),
+    };
+    let x = x.clamp(work.left, (work.right - width).max(work.left));
+    let y = y.clamp(work.top, (work.bottom - height).max(work.top));
     let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height, SWP_SHOWWINDOW);
     pump_for(SHOW_WAIT);
     if !bring_to_front(hwnd, target) {
@@ -350,16 +506,52 @@ pub unsafe fn choose(
         close(hwnd);
         return None;
     }
-    let _ = SetFocus(control(hwnd, ID_LIST));
+    let _ = SetFocus(list);
     show_page(hwnd);
 
     CLOSE_REQUESTED.store(false, Ordering::SeqCst);
     OPEN.store(true, Ordering::SeqCst);
     run_loop(hwnd);
     OPEN.store(false, Ordering::SeqCst);
-    let outcome = with_state(|st| std::mem::take(&mut st.outcome));
+    let outcome = with_state(|st| {
+        st.outcome.resume = Resume {
+            tab: st.tab.index(),
+            places: st.places,
+        };
+        std::mem::take(&mut st.outcome)
+    });
     close(hwnd);
     outcome
+}
+
+/// 一覧（行をこちらで描くリストボックス）を作る。帯では、横に並べる。
+unsafe fn create_list(parent: HWND, layout: Layout, font: HFONT) -> HWND {
+    let Ok(instance) = GetModuleHandleW(None) else {
+        return HWND::default();
+    };
+    // LBS_OWNERDRAWFIXED | LBS_NODATA | LBS_NOINTEGRALHEIGHT | LBS_NOTIFY
+    // 枠は付けない（画面の側で 1 ピクセルの枠を描く）。
+    let mut style = WS_CHILD.0 | WS_VISIBLE.0 | 0x0010 | 0x2000 | 0x0100 | 0x0001;
+    if layout == Layout::Band {
+        style |= LBS_MULTICOLUMN;
+    }
+    let list = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        w!("LISTBOX"),
+        w!(""),
+        WINDOW_STYLE(style),
+        0,
+        0,
+        0,
+        0,
+        parent,
+        HMENU(ID_LIST as isize as *mut core::ffi::c_void),
+        instance,
+        None,
+    )
+    .unwrap_or_default();
+    SendMessageW(list, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    list
 }
 
 /// 「Windows の色」の配色。
@@ -378,35 +570,6 @@ unsafe fn system_palette() -> Palette {
         tip_back: GetSysColor(COLOR_INFOBK),
         tip_text: GetSysColor(COLOR_INFOTEXT),
     }
-}
-
-/// 見出しと一覧を、幅と件数に合わせて置く。枠を含めた画面の大きさ（幅, 高さ）を返す。
-unsafe fn layout(hwnd: HWND, view: View, dpi: u32) -> (i32, i32) {
-    let width = ui::scale(view.width as i32, dpi);
-    let header_h = ui::scale(HEADER_H, dpi);
-    let row_h = ui::scale(ROW_H, dpi);
-    let list_h = row_h * view.page_size as i32;
-    let _ = SetWindowPos(
-        control(hwnd, ID_HEADER),
-        None,
-        BORDER,
-        BORDER,
-        width,
-        header_h,
-        SWP_NOZORDER | SWP_NOACTIVATE,
-    );
-    let list = control(hwnd, ID_LIST);
-    let _ = SetWindowPos(
-        list,
-        None,
-        BORDER,
-        BORDER + header_h,
-        width,
-        list_h,
-        SWP_NOZORDER | SWP_NOACTIVATE,
-    );
-    SendMessageW(list, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(row_h as isize));
-    (width + BORDER * 2, header_h + list_h + BORDER * 2)
 }
 
 /// 画面の不透明度を変える。
@@ -562,28 +725,32 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
     let range = clip_history::page_range(page, count, page_size);
     let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
     let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
-    let other_tab = with_state(|st| match st.tab {
-        Tab::History => Tab::Snippets,
-        Tab::Snippets => Tab::History,
-    })
-    .unwrap_or(Tab::History);
+    let (tab, layout) = with_state(|st| (st.tab, st.layout)).unwrap_or((Tab::History, Layout::List));
+    // 帯では左右で選び、上下でタブを切り替える（一覧・パネルではその逆）。
+    let (vk_prev, vk_next, vk_tab_prev, vk_tab_next) = if layout == Layout::Band {
+        (VK_LEFT.0, VK_RIGHT.0, VK_UP.0, VK_DOWN.0)
+    } else {
+        (VK_UP.0, VK_DOWN.0, VK_LEFT.0, VK_RIGHT.0)
+    };
     match vk {
         v if v == VK_ESCAPE.0 => finish(None),
         v if v == VK_RETURN.0 => choose_current(),
-        v if v == VK_UP.0 => move_to(current - 1),
-        v if v == VK_DOWN.0 => move_to(current + 1),
+        v if v == vk_prev => move_to(current - 1),
+        v if v == vk_next => move_to(current + 1),
         // Ctrl を押していれば、全体の最初・最後へ。
         v if v == VK_HOME.0 && ctrl => move_to(0),
         v if v == VK_END.0 && ctrl => move_to(count as isize - 1),
         v if v == VK_HOME.0 => move_to(range.start as isize),
         v if v == VK_END.0 => move_to(range.end as isize - 1),
-        v if v == VK_TAB.0 => switch_tab(hwnd, other_tab),
+        v if v == VK_TAB.0 => switch_tab(hwnd, tab.step(if shift { -1 } else { 1 })),
+        // K で「出したままにする」を切り替える。
+        v if v == u16::from(b'K') && !ctrl => toggle_keep_open(hwnd),
         // P でピン留めを切り替える（一覧では文字を入力しないので、文字のキーを使える）。
         v if v == u16::from(b'P') && !ctrl => toggle_pin_current(hwnd),
         v if v == VK_PRIOR.0 => turn_page(hwnd, -1),
         v if v == VK_NEXT.0 => turn_page(hwnd, 1),
-        v if v == VK_LEFT.0 => switch_tab(hwnd, Tab::History),
-        v if v == VK_RIGHT.0 => switch_tab(hwnd, Tab::Snippets),
+        v if v == vk_tab_prev => switch_tab(hwnd, tab.step(-1)),
+        v if v == vk_tab_next => switch_tab(hwnd, tab.step(1)),
         v if v == VK_DELETE.0 => remove_current(hwnd),
         v if v == VK_APPS.0 || (v == VK_F10.0 && shift) => {
             context_menu(hwnd, selected_row_point(hwnd), true);
@@ -625,10 +792,11 @@ unsafe fn turn_page(hwnd: HWND, delta: isize) {
 /// 選んでいるものを貼り付けるために閉じる。
 fn choose_current() {
     let chosen = with_state(|st| {
-        let text = st.selected().and_then(|pos| st.full_text(pos))?;
+        let pos = st.selected()?;
         Some(match st.tab {
-            Tab::History => Pick::History(text),
-            Tab::Snippets => Pick::Snippet(text),
+            Tab::History => Pick::History(st.full_text(pos)?),
+            Tab::Snippets => Pick::Snippet(st.full_text(pos)?),
+            Tab::Images => Pick::Image(st.images.get(pos)?.id),
         })
     })
     .flatten();
@@ -640,16 +808,20 @@ fn choose_current() {
 /// 選んでいる履歴を 1 件消す（定型文は定型文の画面で消す）。
 unsafe fn remove_current(hwnd: HWND) {
     let removed = with_state(|st| {
-        if st.tab != Tab::History {
-            return None;
-        }
         let pos = st.selected()?;
-        if pos >= st.history.len() {
-            return None;
-        }
-        let (text, _) = st.history.remove(pos);
-        st.outcome.removed.push(text);
-        let count = st.history.len();
+        let count = match st.tab {
+            Tab::History if pos < st.history.len() => {
+                let (text, _) = st.history.remove(pos);
+                st.outcome.removed.push(text);
+                st.history.len()
+            }
+            Tab::Images if pos < st.images.len() => {
+                let entry = st.images.remove(pos);
+                st.outcome.removed_images.push(entry.id);
+                st.images.len()
+            }
+            _ => return None,
+        };
         let selected = (count > 0).then(|| pos.min(count - 1));
         st.set_place(selected, selected.map_or(0, |s| s / st.page_size));
         Some(())
@@ -703,14 +875,22 @@ unsafe fn register_current(hwnd: HWND) {
 /// 選んでいる履歴のピン留めを切り替える。ピン留めしたものは、件数の上限で消えない。
 unsafe fn toggle_pin_current(hwnd: HWND) {
     let changed = with_state(|st| {
-        if st.tab != Tab::History {
-            return None;
-        }
         let pos = st.selected()?;
-        let (text, pinned) = st.history.get_mut(pos)?;
-        *pinned = !*pinned;
-        let change = (text.clone(), *pinned);
-        st.outcome.pin_changes.push(change);
+        match st.tab {
+            Tab::History => {
+                let (text, pinned) = st.history.get_mut(pos)?;
+                *pinned = !*pinned;
+                let change = (text.clone(), *pinned);
+                st.outcome.pin_changes.push(change);
+            }
+            Tab::Images => {
+                let entry = st.images.get_mut(pos)?;
+                entry.pinned = !entry.pinned;
+                let change = (entry.id, entry.pinned);
+                st.outcome.image_pin_changes.push(change);
+            }
+            Tab::Snippets => return None,
+        }
         Some(())
     })
     .flatten();
@@ -719,12 +899,24 @@ unsafe fn toggle_pin_current(hwnd: HWND) {
     }
 }
 
+/// 「出したままにする」（貼り付けても一覧を閉じない）を切り替える。
+unsafe fn toggle_keep_open(hwnd: HWND) {
+    with_state(|st| {
+        st.keep_open = !st.keep_open;
+        st.outcome.keep_open = Some(st.keep_open);
+    });
+    let _ = InvalidateRect(control(hwnd, ID_HEADER), None, true);
+}
+
 /// 右クリックのメニューを出す。
 unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
-    let Some((tab, has_row, pinned)) = with_state(|st| {
-        let pinned = st.tab == Tab::History
-            && st.selected().and_then(|p| st.history.get(p)).is_some_and(|(_, p)| *p);
-        (st.tab, on_row && st.selected().is_some(), pinned)
+    let Some((tab, has_row, pinned, keep_open)) = with_state(|st| {
+        let pinned = st.selected().is_some_and(|p| match st.tab {
+            Tab::History => st.history.get(p).is_some_and(|(_, pinned)| *pinned),
+            Tab::Images => st.images.get(p).is_some_and(|e| e.pinned),
+            Tab::Snippets => false,
+        });
+        (st.tab, on_row && st.selected().is_some(), pinned, st.keep_open)
     }) else {
         return;
     };
@@ -733,17 +925,21 @@ unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
     };
     let row_flag = if has_row { MF_STRING } else { MF_STRING | MF_GRAYED };
     let _ = AppendMenuW(menu, row_flag, MENU_PASTE, w!("貼り付け(&V)\tEnter"));
-    if tab == Tab::History {
+    if tab != Tab::Snippets {
         let pin_label = if pinned {
             w!("ピン留めを外す(&I)\tP")
         } else {
             w!("ピン留めする(&I)\tP")
         };
         let _ = AppendMenuW(menu, row_flag, MENU_PIN, pin_label);
-        let _ = AppendMenuW(menu, row_flag, MENU_REGISTER, w!("定型文に登録(&T)"));
+        if tab == Tab::History {
+            let _ = AppendMenuW(menu, row_flag, MENU_REGISTER, w!("定型文に登録(&T)"));
+        }
         let _ = AppendMenuW(menu, row_flag, MENU_DELETE, w!("この履歴を削除(&D)\tDelete"));
     }
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let keep_flag = if keep_open { MF_STRING | MF_CHECKED } else { MF_STRING };
+    let _ = AppendMenuW(menu, keep_flag, MENU_KEEP, w!("貼り付けても出したままにする(&K)\tK"));
     let _ = AppendMenuW(menu, MF_STRING, MENU_EDIT_SNIPPETS, w!("定型文の編集...(&E)"));
     let _ = AppendMenuW(menu, MF_STRING, MENU_CLOSE, w!("閉じる(&C)\tEsc"));
     let chosen = TrackPopupMenuEx(
@@ -760,6 +956,7 @@ unsafe fn context_menu(hwnd: HWND, point: POINT, on_row: bool) {
         MENU_PASTE => choose_current(),
         MENU_REGISTER => register_current(hwnd),
         MENU_PIN => toggle_pin_current(hwnd),
+        MENU_KEEP => toggle_keep_open(hwnd),
         MENU_DELETE => remove_current(hwnd),
         MENU_EDIT_SNIPPETS => {
             with_state(|st| st.outcome.edit_snippets = true);
@@ -870,6 +1067,10 @@ unsafe fn draw_row(item: &DRAWITEMSTRUCT) {
     let hdc = item.hDC;
     let rect = item.rcItem;
     let selected = item.itemState.0 & ODS_SELECTED.0 != 0;
+    if with_state(|st| st.layout) == Some(Layout::Band) {
+        draw_card(hdc, rect, row, selected);
+        return;
+    }
     let background = if selected {
         colors.sel_back
     } else if row % 2 == 1 {
@@ -913,6 +1114,99 @@ unsafe fn draw_row(item: &DRAWITEMSTRUCT) {
     SelectObject(hdc, old_font);
 }
 
+/// 帯の 1 件（カード）を描く: 上に番号と名前・行数、その下に中身（文字は数行、画像は絵）。
+unsafe fn draw_card(hdc: HDC, rect: RECT, row: usize, selected: bool) {
+    let Some(Some((number, title, lines, pinned, body, thumb, dpi, font, colors))) =
+        with_state(|st| {
+            let index = st.page() * st.page_size + row;
+            let (number, shown, lines, pinned) = st.row(index)?;
+            // 上の行: 定型文は名前、画像は大きさと日時。履歴は番号だけ。
+            let title = if st.tab == Tab::History { String::new() } else { shown };
+            let body = st.full_text(index).map(|t| clip_history::tip_text(&t));
+            let thumb = match st.tab {
+                Tab::Images => st.images.get(index).map(|e| e.id).and_then(|id| st.thumb(id)),
+                _ => None,
+            };
+            Some((number, title, lines, pinned, body, thumb, st.dpi, st.font, st.colors))
+        })
+    else {
+        fill(hdc, &rect, with_state(|st| st.colors.back).unwrap_or(0));
+        return;
+    };
+    fill(hdc, &rect, colors.back);
+    let gap = ui::scale(CARD_GAP, dpi);
+    let pad = ui::scale(CARD_PAD, dpi);
+    let card = RECT {
+        left: rect.left + gap,
+        top: rect.top + gap,
+        right: rect.right - gap,
+        bottom: rect.bottom - gap,
+    };
+    fill(hdc, &card, if selected { colors.sel_back } else { colors.alt });
+    if pinned {
+        let bar = RECT {
+            right: card.left + ui::scale(PIN_BAR_W, dpi),
+            ..card
+        };
+        fill(hdc, &bar, if selected { colors.sel_text } else { colors.sel_back });
+    }
+    let old_font = SelectObject(hdc, font);
+    SetBkMode(hdc, TRANSPARENT);
+    let (main, sub) = if selected {
+        (colors.sel_text, colors.sel_text)
+    } else {
+        (colors.text, colors.sub)
+    };
+    let head_h = ui::scale(ROW_H, dpi);
+    SetTextColor(hdc, COLORREF(sub));
+    let mut head = RECT {
+        left: card.left + pad,
+        right: card.right - pad,
+        bottom: card.top + head_h,
+        ..card
+    };
+    let label = if title.is_empty() {
+        number.to_string()
+    } else {
+        format!("{number}  {title}")
+    };
+    if lines > 1 {
+        let mut lines_rect = RECT {
+            left: head.right - ui::scale(LINES_W, dpi),
+            ..head
+        };
+        draw_line(hdc, &format!("{lines}行"), &mut lines_rect, DT_RIGHT);
+        head.right = lines_rect.left;
+    }
+    draw_line(hdc, &label, &mut head, DT_LEFT | DT_END_ELLIPSIS);
+    let mut inner = RECT {
+        left: card.left + pad,
+        top: card.top + head_h,
+        right: card.right - pad,
+        bottom: card.bottom - pad,
+    };
+    if let Some(thumb) = thumb {
+        clip_image_store::draw_thumb(
+            hdc,
+            &thumb,
+            inner.left,
+            inner.top,
+            inner.right - inner.left,
+            inner.bottom - inner.top,
+        );
+    } else if let Some(body) = body {
+        SetTextColor(hdc, COLORREF(main));
+        let mut units: Vec<u16> = body.encode_utf16().collect();
+        DrawTextW(
+            hdc,
+            &mut units,
+            &mut inner,
+            DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX | DT_EXPANDTABS | DT_END_ELLIPSIS,
+        );
+    }
+    SelectObject(hdc, old_font);
+}
+
 unsafe fn draw_line(hdc: HDC, text: &str, rect: &mut RECT, align: DRAW_TEXT_FORMAT) {
     let mut units: Vec<u16> = text.encode_utf16().collect();
     DrawTextW(hdc, &mut units, rect, align | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
@@ -948,9 +1242,9 @@ unsafe fn paint_header(hwnd: HWND) {
     let hdc = BeginPaint(hwnd, &mut ps);
     let mut rect = RECT::default();
     let _ = GetClientRect(hwnd, &mut rect);
-    if let Some((colors, font, dpi, tab, label)) = with_state(|st| {
+    if let Some((colors, font, dpi, tab, label, keep_open)) = with_state(|st| {
         let label = clip_history::page_label(st.page(), st.len(), st.page_size);
-        (st.colors, st.font, st.dpi, st.tab, label)
+        (st.colors, st.font, st.dpi, st.tab, label, st.keep_open)
     }) {
         fill(hdc, &rect, colors.header_back);
         let old = SelectObject(hdc, font);
@@ -958,11 +1252,8 @@ unsafe fn paint_header(hwnd: HWND) {
         // タブ: 選んでいるタブは一覧と同じ色にして、つながって見えるようにする。
         let pad = ui::scale(TAB_PAD, dpi);
         let mut left = rect.left;
-        let mut rects = [RECT::default(); 2];
-        for (i, (this, name)) in [(Tab::History, "履歴"), (Tab::Snippets, "定型文")]
-            .into_iter()
-            .enumerate()
-        {
+        let mut rects = [RECT::default(); 3];
+        for (i, (this, name)) in Tab::ALL.into_iter().enumerate() {
             let mut tab_rect = RECT {
                 left,
                 right: left + text_width(hdc, name) + pad * 2,
@@ -984,12 +1275,42 @@ unsafe fn paint_header(hwnd: HWND) {
             draw_line(hdc, name, &mut tab_rect, DT_CENTER);
             left = tab_rect.right;
         }
-        with_state(|st| st.tab_rects = rects);
-        // ページ（右寄せ）
+        // ページ（右寄せ）と、その左の「出したまま」（押すと切り替わる。ON のときは目立たせる）。
+        let right = rect.right - ui::scale(PAD + 2, dpi);
+        let keep_name = "出したまま";
+        let keep_w = text_width(hdc, keep_name) + pad;
+        let page_left = (right - text_width(hdc, &label) - pad).max(left);
+        let mut keep_rect = RECT {
+            left: page_left - keep_w,
+            right: page_left,
+            ..rect
+        };
+        // 幅が足りないときは「出したまま」を出さない（タブに重ねない）。
+        if keep_rect.left < left {
+            keep_rect = RECT::default();
+        } else {
+            if keep_open {
+                fill(hdc, &keep_rect, colors.back);
+                let bar = RECT {
+                    top: keep_rect.bottom - ui::scale(2, dpi),
+                    ..keep_rect
+                };
+                fill(hdc, &bar, colors.sel_back);
+                SetTextColor(hdc, COLORREF(colors.text));
+            } else {
+                SetTextColor(hdc, COLORREF(blend(colors.header_text, colors.header_back, 55)));
+            }
+            let mut text_rect = keep_rect;
+            draw_line(hdc, keep_name, &mut text_rect, DT_CENTER);
+        }
+        with_state(|st| {
+            st.tab_rects = rects;
+            st.keep_rect = keep_rect;
+        });
         SetTextColor(hdc, COLORREF(colors.header_text));
         let mut page_rect = RECT {
-            left,
-            right: rect.right - ui::scale(PAD + 2, dpi),
+            left: page_left,
+            right,
             ..rect
         };
         draw_line(hdc, &label, &mut page_rect, DT_RIGHT | DT_END_ELLIPSIS);
@@ -999,10 +1320,10 @@ unsafe fn paint_header(hwnd: HWND) {
 }
 
 /// 選んでいるものが 1 行に収まらない（複数行か、途中で切れている）とき、または定型文のときは、
-/// 選んだ行の横に全文の吹き出しを出す。それ以外は隠す。
+/// 選んだ行の横に全文の吹き出しを出す。画像のときは、大きめの絵を出す。それ以外は隠す。
 unsafe fn update_tip(hwnd: HWND) {
-    let Some((tip, dpi, font, selected, page, size, tab)) = with_state(|st| {
-        (st.tip, st.dpi, st.font, st.selected(), st.page(), st.page_size, st.tab)
+    let Some((tip, dpi, font, selected, page, size, tab, layout)) = with_state(|st| {
+        (st.tip, st.dpi, st.font, st.selected(), st.page(), st.page_size, st.tab, st.layout)
     }) else {
         return;
     };
@@ -1013,15 +1334,17 @@ unsafe fn update_tip(hwnd: HWND) {
     let row = selected.and_then(|s| s.checked_sub(page * size)).filter(|r| *r < size);
     let content = with_state(|st| {
         let pos = selected?;
-        Some((st.full_text(pos)?, st.row(pos)?))
+        let image = match st.tab {
+            Tab::Images => st.images.get(pos).map(|e| e.id).and_then(|id| st.thumb(id)),
+            _ => None,
+        };
+        Some((st.full_text(pos), image, st.row(pos)?))
     })
     .flatten();
-    let (Some(row), Some((full, (_, shown, lines, _)))) = (row, content) else {
+    let (Some(row), Some((full, image, (_, shown, lines, _)))) = (row, content) else {
         let _ = ShowWindow(tip, SW_HIDE);
         return;
     };
-
-    // 一覧の行の、文字を書く幅に収まるか。
     let mut item_rect = RECT::default();
     SendMessageW(
         list,
@@ -1029,43 +1352,65 @@ unsafe fn update_tip(hwnd: HWND) {
         WPARAM(row),
         LPARAM(&mut item_rect as *mut RECT as isize),
     );
-    let available = text_rect(&item_rect, lines, dpi);
-    let hdc = GetDC(list);
-    let old = SelectObject(hdc, font);
-    let shown_width = text_width(hdc, &shown);
-    SelectObject(hdc, old);
-    ReleaseDC(list, hdc);
-    let fits = lines <= 1 && shown_width <= available.right - available.left;
-    if fits && tab == Tab::History {
+    let pad = ui::scale(TIP_PAD, dpi);
+    let max_w = ui::scale(TIP_MAX_W, dpi);
+    let max_h = ui::scale(TIP_MAX_H, dpi);
+
+    let (text, width, height) = if let Some(thumb) = &image {
+        // 画像: 絵の大きさに合わせる。
+        let (w, h) = clip_images::thumb_size(
+            thumb.width,
+            thumb.height,
+            (max_w - pad * 2).max(1) as u32,
+            (max_h - pad * 2).max(1) as u32,
+        );
+        (String::new(), w as i32 + pad * 2 + 2, h as i32 + pad * 2 + 2)
+    } else if let Some(full) = full {
+        let fits = if layout == Layout::Band {
+            // カードには数行が出ているので、長いものだけ吹き出しにする。
+            lines <= 5 && full.chars().count() <= 120
+        } else {
+            // 一覧の行の、文字を書く幅に収まるか。
+            let available = text_rect(&item_rect, lines, dpi);
+            let hdc = GetDC(list);
+            let old = SelectObject(hdc, font);
+            let shown_width = text_width(hdc, &shown);
+            SelectObject(hdc, old);
+            ReleaseDC(list, hdc);
+            lines <= 1 && shown_width <= available.right - available.left
+        };
+        if fits && (tab == Tab::History || layout == Layout::Band) {
+            let _ = ShowWindow(tip, SW_HIDE);
+            return;
+        }
+        // 吹き出しの大きさを、中身に合わせて決める（上限あり）。
+        let text = clip_history::tip_text(&full);
+        let mut calc = RECT {
+            left: 0,
+            top: 0,
+            right: max_w - pad * 2,
+            bottom: 0,
+        };
+        let hdc = GetDC(tip);
+        let old = SelectObject(hdc, font);
+        let mut units: Vec<u16> = text.encode_utf16().collect();
+        // DT_EDITCONTROL: 空白の無い長い行（URL など）も、幅で折り返す。
+        DrawTextW(
+            hdc,
+            &mut units,
+            &mut calc,
+            DT_CALCRECT | DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX | DT_EXPANDTABS,
+        );
+        SelectObject(hdc, old);
+        ReleaseDC(tip, hdc);
+        let width = ((calc.right - calc.left) + pad * 2 + 2).min(max_w);
+        let height = ((calc.bottom - calc.top) + pad * 2 + 2).min(max_h);
+        (text, width, height)
+    } else {
         let _ = ShowWindow(tip, SW_HIDE);
         return;
-    }
-
-    // 吹き出しの大きさを、中身に合わせて決める（上限あり）。
-    let text = clip_history::tip_text(&full);
-    let pad = ui::scale(TIP_PAD, dpi);
-    let mut calc = RECT {
-        left: 0,
-        top: 0,
-        right: ui::scale(TIP_MAX_W, dpi) - pad * 2,
-        bottom: 0,
     };
-    let hdc = GetDC(tip);
-    let old = SelectObject(hdc, font);
-    let mut units: Vec<u16> = text.encode_utf16().collect();
-    // DT_EDITCONTROL: 空白の無い長い行（URL など）も、幅で折り返す。
-    DrawTextW(
-        hdc,
-        &mut units,
-        &mut calc,
-        DT_CALCRECT | DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX | DT_EXPANDTABS,
-    );
-    SelectObject(hdc, old);
-    ReleaseDC(tip, hdc);
-    let width = ((calc.right - calc.left) + pad * 2 + 2).min(ui::scale(TIP_MAX_W, dpi));
-    let height = ((calc.bottom - calc.top) + pad * 2 + 2).min(ui::scale(TIP_MAX_H, dpi));
 
-    // 置く場所: 画面の右（入らなければ左）、選んでいる行の高さ。
     let mut window = RECT::default();
     let _ = GetWindowRect(hwnd, &mut window);
     let mut top_left = POINT {
@@ -1075,13 +1420,23 @@ unsafe fn update_tip(hwnd: HWND) {
     let _ = ClientToScreen(list, &mut top_left);
     let work = work_area(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST));
     let gap = ui::scale(4, dpi);
-    let mut x = window.right + gap;
-    if x + width > work.right {
-        x = window.left - gap - width;
-    }
-    let y = top_left.y.clamp(work.top, (work.bottom - height).max(work.top));
+    let (x, y) = if layout == Layout::Band {
+        // 帯: 選んだカードの上。
+        (top_left.x, window.top - gap - height)
+    } else {
+        // 画面の右（入らなければ左）、選んでいる行の高さ。
+        let mut x = window.right + gap;
+        if x + width > work.right {
+            x = window.left - gap - width;
+        }
+        (x, top_left.y)
+    };
+    let y = y.clamp(work.top, (work.bottom - height).max(work.top));
     let x = x.clamp(work.left, (work.right - width).max(work.left));
-    with_state(|st| st.tip_text = text);
+    with_state(|st| {
+        st.tip_text = text;
+        st.tip_image = image;
+    });
     let _ = SetWindowPos(
         tip,
         HWND_TOPMOST,
@@ -1147,12 +1502,12 @@ unsafe extern "system" fn header_proc(
         WM_ERASEBKGND => LRESULT(1),
         WM_LBUTTONDOWN => {
             let x = (lparam.0 & 0xFFFF) as u16 as i16 as i32;
-            let rects = with_state(|st| st.tab_rects).unwrap_or_default();
+            let (rects, keep) = with_state(|st| (st.tab_rects, st.keep_rect)).unwrap_or_default();
             let parent = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd).unwrap_or_default();
-            if x >= rects[0].left && x < rects[0].right {
-                switch_tab(parent, Tab::History);
-            } else if x >= rects[1].left && x < rects[1].right {
-                switch_tab(parent, Tab::Snippets);
+            if let Some(i) = rects.iter().position(|r| x >= r.left && x < r.right) {
+                switch_tab(parent, Tab::from_index(i));
+            } else if x >= keep.left && x < keep.right {
+                toggle_keep_open(parent);
             }
             LRESULT(0)
         }
@@ -1168,10 +1523,23 @@ unsafe extern "system" fn tip_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let hdc = BeginPaint(hwnd, &mut ps);
             let mut rect = RECT::default();
             let _ = GetClientRect(hwnd, &mut rect);
-            if let Some((text, font, dpi, colors)) =
-                with_state(|st| (st.tip_text.clone(), st.font, st.dpi, st.colors))
-            {
+            if let Some((text, image, font, dpi, colors)) = with_state(|st| {
+                (st.tip_text.clone(), st.tip_image.clone(), st.font, st.dpi, st.colors)
+            }) {
                 fill(hdc, &rect, colors.tip_back);
+                if let Some(thumb) = image {
+                    let pad = ui::scale(TIP_PAD, dpi);
+                    clip_image_store::draw_thumb(
+                        hdc,
+                        &thumb,
+                        rect.left + pad,
+                        rect.top + pad,
+                        rect.right - rect.left - pad * 2,
+                        rect.bottom - rect.top - pad * 2,
+                    );
+                    let _ = EndPaint(hwnd, &ps);
+                    return LRESULT(0);
+                }
                 let old = SelectObject(hdc, font);
                 SetBkMode(hdc, TRANSPARENT);
                 SetTextColor(hdc, COLORREF(colors.tip_text));

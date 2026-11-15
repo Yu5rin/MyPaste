@@ -110,8 +110,6 @@ pub enum Kind {
     NumberEdit,
     MultiEdit,
     ListBox,
-    /// 行をアプリが描く一覧（中身の文字は持たず、行数だけを持つ）。
-    OwnerList,
     Button,
     DefaultButton,
     /// ページを切り替えるタブ（見出しの並びだけを使い、中身は同じ画面の上に出し分ける）。
@@ -410,13 +408,6 @@ pub unsafe fn create_controls(hwnd: HWND, items: &[Item], font: HFONT) {
                 w!("LISTBOX"),
                 LBS_NOTIFY as u32 | WS_VSCROLL.0 | WS_TABSTOP.0,
                 WS_EX_CLIENTEDGE.0,
-            ),
-            Kind::OwnerList => (
-                w!("LISTBOX"),
-                // LBS_OWNERDRAWFIXED | LBS_NODATA | LBS_NOINTEGRALHEIGHT | LBS_NOTIFY
-                // 枠は付けない（一覧の画面の側で 1 ピクセルの枠を描く）。
-                0x0010 | 0x2000 | 0x0100 | LBS_NOTIFY as u32,
-                0,
             ),
             Kind::Tabs => (w!("SysTabControl32"), WS_TABSTOP.0 | WS_CLIPSIBLINGS.0, 0),
             Kind::Button => (w!("BUTTON"), BS_PUSHBUTTON as u32 | WS_TABSTOP.0, 0),

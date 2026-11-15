@@ -107,6 +107,10 @@ pub struct ClipboardHistorySettings {
     pub move_to_top: bool,
     /// 記録しないアプリ（プロセス名）。そのアプリでコピーしたものは履歴に入れない。
     pub exclude_apps: Vec<String>,
+    /// 画像（スクリーンショットなど）も記録するか。
+    pub record_images: bool,
+    /// 一覧から貼り付けても、一覧を出したままにするか。
+    pub keep_open: bool,
 }
 
 impl Default for ClipboardHistorySettings {
@@ -125,6 +129,8 @@ impl Default for ClipboardHistorySettings {
             theme: "system".to_string(),
             move_to_top: true,
             exclude_apps: Vec::new(),
+            record_images: true,
+            keep_open: false,
         }
     }
 }
@@ -511,6 +517,11 @@ pub fn save_clipboard_history_opacity(opacity: u32) -> Result<(), String> {
     save_patch(&serde_json::json!({ "clipboard_history": { "opacity": opacity } }))
 }
 
+/// 一覧を出したままにするかだけを書き込む（一覧の上で切り替えたとき）。
+pub fn save_clipboard_history_keep_open(keep_open: bool) -> Result<(), String> {
+    save_patch(&serde_json::json!({ "clipboard_history": { "keep_open": keep_open } }))
+}
+
 /// キー割り当ての一覧を `settings.json` に書き込む（キー割り当て画面から使う）。
 pub fn save_hotkeys(hotkeys: &[HotkeyRuleSetting]) -> Result<(), String> {
     let value = serde_json::to_value(hotkeys).map_err(|e| e.to_string())?;
@@ -626,6 +637,11 @@ pub fn replace_settings(root: &serde_json::Value) -> Result<(), String> {
 /// クリップボードの履歴を残しておくファイルのパス。
 pub fn clip_history_file() -> Option<PathBuf> {
     data_dir().map(|d| d.join(CLIP_HISTORY_FILE))
+}
+
+/// クリップボードの履歴の画像を置くフォルダー。
+pub fn clip_images_dir() -> Option<PathBuf> {
+    data_dir().map(|d| d.join("clip_images"))
 }
 
 /// ファイルを、途中で壊れないように書き換える（[`write_replacing`]）。

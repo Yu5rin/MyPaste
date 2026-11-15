@@ -73,7 +73,7 @@ pub fn delete() {
 }
 
 /// DPAPI で暗号化する（今のユーザーだけが元に戻せる）。
-fn protect(plain: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn protect(plain: &[u8]) -> Option<Vec<u8>> {
     let input = CRYPT_INTEGER_BLOB {
         cbData: u32::try_from(plain.len()).ok()?,
         pbData: plain.as_ptr() as *mut u8,
@@ -95,7 +95,7 @@ fn protect(plain: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// DPAPI で暗号化したものを元に戻す。
-fn unprotect(data: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn unprotect(data: &[u8]) -> Option<Vec<u8>> {
     let input = CRYPT_INTEGER_BLOB {
         cbData: u32::try_from(data.len()).ok()?,
         pbData: data.as_ptr() as *mut u8,

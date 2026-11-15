@@ -51,13 +51,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::clip_history::{self, History, MenuPosition};
+use crate::clip_images::{self, Index};
 use crate::hotkey_rules::{self, Action, LocalTime};
 use crate::remap_logic::Hotkey;
 use crate::config::Snippet;
-use crate::{clip_store, config, history_window, snippet_window, ime_indicator, keyboard, remap_logic, sendinput, text_transform};
+use crate::{clip_image_store, clip_store, config, history_window, snippet_window, ime_indicator, keyboard, remap_logic, sendinput, text_transform};
 
 /// クリップボードの文字（`CF_UNICODETEXT`）。
 const CF_UNICODETEXT: u32 = 13;
+/// 画像（DIB）とファイルの一覧の形式。
+const CF_DIB: u32 = 8;
+const CF_HDROP: u32 = 15;
 /// クリップボードがほかのアプリに使われているときに、開き直す回数と間隔。
 const CLIPBOARD_RETRIES: u32 = 10;
 const CLIPBOARD_RETRY_WAIT: Duration = Duration::from_millis(20);
@@ -78,6 +82,10 @@ thread_local! {
     static CLIP_WINDOW: Cell<HWND> = const { Cell::new(HWND(std::ptr::null_mut())) };
     /// 遅延レンダリングで、求められたら渡す文字（UTF-16 と終端の 0 をバイト列にしたもの）。
     static PENDING_TEXT: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    /// 遅延レンダリングで、求められたら渡す画像（DIB）。
+    static PENDING_IMAGE: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    /// コピーされた画像の目録（中身はファイルにある）。
+    static IMAGES: RefCell<Index> = RefCell::new(Index::default());
     /// 貼り付け先が文字を読みに来たか。
     static RENDERED: Cell<bool> = const { Cell::new(false) };
     /// 動作を実行している途中か（履歴の一覧を出している間も、届いた依頼を割り込ませない）。
@@ -110,6 +118,8 @@ pub struct HistoryConfig {
     pub keep: bool,
     /// 一覧から貼り付けたものを、いちばん上に移すか。
     pub move_to_top: bool,
+    /// 画像も記録するか。
+    pub record_images: bool,
     /// 一覧の出し方（位置・幅・不透明度・1 ページの件数）。
     pub view: history_window::View,
 }
@@ -119,7 +129,9 @@ static HISTORY_CONFIG: Mutex<HistoryConfig> = Mutex::new(HistoryConfig {
     max_items: clip_history::DEFAULT_ITEMS,
     keep: false,
     move_to_top: true,
+    record_images: true,
     view: history_window::View {
+        keep_open: false,
         position: MenuPosition::Caret,
         width: clip_history::DEFAULT_WIDTH,
         opacity: clip_history::DEFAULT_OPACITY,
@@ -226,6 +238,10 @@ pub fn start() -> Worker {
 
         WORKER_WINDOW.store(0, Ordering::SeqCst);
         save_history_now();
+        if !history_config().keep {
+            // 終了後は残さない設定なら、画像のファイルも消す。
+            clip_image_store::delete_all();
+        }
         if !window.is_invalid() {
             let _ = RemoveClipboardFormatListener(window);
             let _ = DestroyWindow(window);
@@ -314,6 +330,10 @@ unsafe fn apply_history_setting(window: HWND) {
             save_history_now();
         }
         HISTORY.with(|h| h.borrow_mut().clear());
+        IMAGES.with(|i| *i.borrow_mut() = Index::default());
+        if !config.keep && previous.is_some() {
+            clip_image_store::delete_all();
+        }
         HISTORY_DIRTY.with(|d| d.set(false));
         HISTORY_LOADED.with(|l| l.set(false));
         return;
@@ -337,7 +357,24 @@ unsafe fn apply_history_setting(window: HWND) {
                     HISTORY_STORE_UNREADABLE.with(|u| u.set(true));
                 }
             }
+            match clip_image_store::load_index() {
+                Ok(index) => {
+                    // 目録に無いファイル（途中で終了して残ったもの）を消す。
+                    clip_image_store::sweep(&index.ids());
+                    log::debug!("保存していた画像の履歴を読みました（{} 枚）", index.len());
+                    IMAGES.with(|i| *i.borrow_mut() = index);
+                }
+                Err(e) => log::warn!("保存していた画像の履歴を読めません（空から始めます）: {e}"),
+            }
+        } else {
+            // 終了後は残さない設定。前の回のものが残っていれば消す。
+            clip_image_store::delete_all();
         }
+    }
+    let trimmed = IMAGES.with(|i| i.borrow_mut().trim(config.max_items));
+    if !trimmed.is_empty() {
+        clip_image_store::delete(&trimmed);
+        save_image_index();
     }
     let before = HISTORY.with(|h| h.borrow().len());
     HISTORY.with(|h| h.borrow_mut().set_max(config.max_items));
@@ -453,6 +490,11 @@ unsafe fn clear_all_history() {
         mark_history_changed();
         save_history_now();
     }
+    let removed = IMAGES.with(|i| i.borrow_mut().clear_unpinned());
+    if !removed.is_empty() {
+        clip_image_store::delete(&removed);
+        save_image_index();
+    }
     log::debug!("クリップボードの履歴を消しました（ピン留め {remaining} 件は残します）");
 }
 
@@ -490,17 +532,103 @@ unsafe fn record_clipboard() {
     if owner.is_some() && owner == Some(clip_window()) {
         return;
     }
-    if IsClipboardFormatAvailable(CF_UNICODETEXT).is_err()
-        || excluded_from_history()
-        || copied_in_excluded_app()
-    {
+    let has_text = IsClipboardFormatAvailable(CF_UNICODETEXT).is_ok();
+    // 文字があれば文字として覚える（Excel のセルのように、文字と画像の両方を置くアプリがある）。
+    // ファイルのコピー（エクスプローラー）は、画像としては覚えない。
+    let has_image = !has_text
+        && history_config().record_images
+        && IsClipboardFormatAvailable(CF_DIB).is_ok()
+        && IsClipboardFormatAvailable(CF_HDROP).is_err();
+    if (!has_text && !has_image) || excluded_from_history() || copied_in_excluded_app() {
         return;
     }
-    if let Some(text) = read_clipboard_text() {
+    if has_image {
+        record_image();
+    } else if let Some(text) = read_clipboard_text() {
         if HISTORY.with(|h| h.borrow_mut().push(&text)) {
             mark_history_changed();
         }
     }
+}
+
+/// クリップボードの画像を履歴に加える。同じ画像がすでにあれば、いちばん新しい位置へ移す。
+unsafe fn record_image() {
+    let Some(dib) = read_clipboard_bytes(CF_DIB, clip_images::MAX_IMAGE_BYTES) else {
+        return;
+    };
+    let Some(info) = clip_images::dib_info(&dib) else {
+        return;
+    };
+    let hash = clip_images::hash(&dib);
+    if let Some(id) = IMAGES.with(|i| i.borrow().find(hash, info.width, info.height)) {
+        if IMAGES.with(|i| i.borrow_mut().touch(id)) {
+            save_image_index();
+        }
+        return;
+    }
+    let id = IMAGES.with(|i| i.borrow_mut().take_id());
+    let stored = match clip_image_store::save_image(id, &dib) {
+        Ok(stored) => stored,
+        Err(e) => {
+            log::warn!("画像の履歴: 画像を保存できませんでした: {e}");
+            return;
+        }
+    };
+    if let Some(thumb) = clip_image_store::make_thumb(&dib, info) {
+        clip_image_store::save_thumb(id, &thumb);
+    }
+    let now = local_time();
+    let entry = clip_images::Entry {
+        id,
+        width: info.width,
+        height: info.height,
+        stored,
+        hash,
+        time: format!("{}/{} {:02}:{:02}", now.month, now.day, now.hour, now.minute),
+        pinned: false,
+    };
+    let removed = IMAGES.with(|i| i.borrow_mut().push(entry, history_config().max_items));
+    clip_image_store::delete(&removed);
+    save_image_index();
+    log::debug!(
+        "画像の履歴: {}×{} を覚えました（{} KB、古い {} 枚を消しました）",
+        info.width,
+        info.height,
+        stored / 1024,
+        removed.len()
+    );
+}
+
+/// 画像の目録を保存する。
+fn save_image_index() {
+    let result = IMAGES.with(|i| clip_image_store::save_index(&i.borrow()));
+    if let Err(e) = result {
+        log::warn!("画像の履歴: 目録を保存できませんでした: {e}");
+    }
+}
+
+/// クリップボードの、メモリで渡される形式の中身を読む。`max` より大きいものは読まない。
+unsafe fn read_clipboard_bytes(format: u32, max: usize) -> Option<Vec<u8>> {
+    if !open_clipboard() {
+        return None;
+    }
+    let bytes = (|| {
+        let handle = GetClipboardData(format).ok()?;
+        let memory = HGLOBAL(handle.0);
+        let size = GlobalSize(memory);
+        if size == 0 || size > max {
+            return None;
+        }
+        let ptr = GlobalLock(memory) as *const u8;
+        if ptr.is_null() {
+            return None;
+        }
+        let bytes = std::slice::from_raw_parts(ptr, size).to_vec();
+        let _ = GlobalUnlock(memory);
+        Some(bytes)
+    })();
+    let _ = CloseClipboard();
+    bytes
 }
 
 /// パスワード管理ソフトなどが「記録しないで」と印を付けた内容か。
@@ -688,21 +816,46 @@ unsafe fn paste_transformed(held: &Hotkey, transforms: &[text_transform::Transfo
 unsafe fn paste_from_history(held: &Hotkey) {
     // 押されたままの修飾キーを先に離す（一覧でのキー操作に混ざらないように）。
     sendinput::release_modifiers(held);
-    let config = history_config();
-    if !config.record {
-        return;
-    }
-    let items = HISTORY.with(|h| h.borrow().entries());
-    let snippets = snippets();
-    if items.is_empty() && snippets.is_empty() {
-        ime_indicator::notify("空");
+    if !history_config().record {
         return;
     }
     let target = GetForegroundWindow();
-    let Some(outcome) = history_window::choose(items, snippets, config.view, target) else {
-        ime_indicator::notify("不可");
-        return;
-    };
+    let mut resume = None;
+    // 「出したままにする」のときは、貼り付けたあとにもう一度一覧を出す。
+    loop {
+        let config = history_config();
+        let items = HISTORY.with(|h| h.borrow().entries());
+        let images = IMAGES.with(|i| i.borrow().entries());
+        let snippets = snippets();
+        if items.is_empty() && snippets.is_empty() && images.is_empty() {
+            ime_indicator::notify("空");
+            return;
+        }
+        let Some(outcome) =
+            history_window::choose(items, snippets, images, config.view, target, resume.take())
+        else {
+            ime_indicator::notify("不可");
+            return;
+        };
+        let keep_open = outcome.keep_open.unwrap_or(config.view.keep_open);
+        let place = outcome.resume;
+        if !apply_history_outcome(outcome, &config, target) || !keep_open {
+            return;
+        }
+        // 貼り付け先が前面でなくなっていたら（閉じられた など）、出し直さない。
+        if target.is_invalid() || GetForegroundWindow() != target {
+            return;
+        }
+        resume = Some(place);
+    }
+}
+
+/// 一覧の結果を反映する（消す・ピン留め・登録・貼り付け）。貼り付けたら `true`。
+unsafe fn apply_history_outcome(
+    outcome: history_window::Outcome,
+    config: &HistoryConfig,
+    target: HWND,
+) -> bool {
     // ほかのウィンドウをクリックして閉じたときは、そちらを使いたいので元のウィンドウに戻さない。
     // 定型文の編集を開くときも戻さない（戻すと、開いた画面が元のウィンドウの後ろに隠れる）。
     if !target.is_invalid() && !outcome.left_for_other_window && !outcome.edit_snippets {
@@ -713,6 +866,12 @@ unsafe fn paste_from_history(held: &Hotkey) {
         HISTORY_CONFIG.lock().unwrap_or_else(|p| p.into_inner()).view.opacity = opacity;
         if let Err(e) = config::save_clipboard_history_opacity(opacity) {
             log::warn!("クリップボードの履歴の不透明度を保存できませんでした: {e}");
+        }
+    }
+    if let Some(keep_open) = outcome.keep_open {
+        HISTORY_CONFIG.lock().unwrap_or_else(|p| p.into_inner()).view.keep_open = keep_open;
+        if let Err(e) = config::save_clipboard_history_keep_open(keep_open) {
+            log::warn!("一覧を出したままにする設定を保存できませんでした: {e}");
         }
     }
     if !outcome.removed.is_empty() {
@@ -737,6 +896,21 @@ unsafe fn paste_from_history(held: &Hotkey) {
             mark_history_changed();
         }
     }
+    if !outcome.removed_images.is_empty() || !outcome.image_pin_changes.is_empty() {
+        IMAGES.with(|i| {
+            let mut i = i.borrow_mut();
+            for id in &outcome.removed_images {
+                i.remove(*id);
+            }
+            for (id, pin) in &outcome.image_pin_changes {
+                i.set_pinned(*id, *pin);
+            }
+        });
+        clip_image_store::delete(&outcome.removed_images);
+        let trimmed = IMAGES.with(|i| i.borrow_mut().trim(config.max_items));
+        clip_image_store::delete(&trimmed);
+        save_image_index();
+    }
     if !outcome.registered.is_empty() {
         register_snippets(&outcome.registered);
     }
@@ -755,12 +929,58 @@ unsafe fn paste_from_history(held: &Hotkey) {
         Some(history_window::Pick::Snippet(text)) => {
             hotkey_rules::expand_placeholders(&text, &local_time())
         }
-        None => return,
+        Some(history_window::Pick::Image(id)) => {
+            if config.move_to_top && IMAGES.with(|i| i.borrow_mut().touch(id)) {
+                save_image_index();
+            }
+            pump_messages_until(MENU_REFOCUS_WAIT, || false);
+            paste_image(id);
+            return true;
+        }
+        None => return false,
     };
     // 元のウィンドウに入力が戻ってから貼り付ける。
     pump_messages_until(MENU_REFOCUS_WAIT, || false);
     log::debug!("クリップボードの履歴・定型文から貼り付けます（{} 文字）", text.chars().count());
     paste_text(&Hotkey::unpack(0), &text);
+    true
+}
+
+/// 履歴の画像を貼り付ける。クリップボードに画像を一時的に置いて Ctrl+V を送り、
+/// 貼り付け先が読み終えたら元の内容に戻す。
+unsafe fn paste_image(id: u64) {
+    let Some(dib) = clip_image_store::load_image(id) else {
+        log::warn!("画像の履歴: 画像を読めませんでした");
+        ime_indicator::notify("不可");
+        return;
+    };
+    log::debug!("画像の履歴から貼り付けます（{} KB）", dib.len() / 1024);
+    let saved = save_clipboard();
+    if let Err(e) = offer_image(dib) {
+        log::warn!("画像の履歴: クリップボードを使えません: {e}");
+        ime_indicator::notify("不可");
+        return;
+    }
+    sendinput::send_key_sequence(&Hotkey::unpack(0), &[ctrl_v()]);
+    let (accepted, target_hung) = wait_for_paste();
+    if matches!(saved, Saved::Unavailable) {
+        // 元の内容を控えられなかったときは、画像をクリップボードに残す（予約のままにしない）。
+        if GetClipboardOwner().ok() == Some(clip_window()) && OpenClipboard(clip_window()).is_ok() {
+            render_pending(CF_DIB);
+            let _ = CloseClipboard();
+        }
+        PENDING_IMAGE.with(|p| p.borrow_mut().take());
+    } else {
+        PENDING_IMAGE.with(|p| p.borrow_mut().take());
+        restore_after_paste(&saved);
+    }
+    if target_hung {
+        log::warn!("画像の履歴: 貼り付け先が応答しないため、貼り付けをやめました");
+        ime_indicator::notify("応答なし");
+    } else if !accepted {
+        log::debug!("画像の履歴: 貼り付け先が画像を受け取りませんでした");
+        ime_indicator::notify("不可");
+    }
 }
 
 /// 名前で選んだ定型文を貼り付ける（キー割り当て「定型文を貼り付け」）。
@@ -876,6 +1096,26 @@ unsafe fn paste_text(held: &Hotkey, text: &str) {
     }
     sendinput::send_key_sequence(held, &[ctrl_v()]);
 
+    let (accepted, target_hung) = wait_for_paste();
+    PENDING_TEXT.with(|p| p.borrow_mut().take());
+    restore_after_paste(&saved);
+
+    if target_hung {
+        // 最後まで応答が無い。入力しても届かず、あとでまとめて入ってしまうので、あきらめる。
+        log::warn!("キー割り当て: 貼り付け先が応答しないため、貼り付けをやめました");
+        ime_indicator::notify("応答なし");
+    } else if !accepted {
+        log::debug!(
+            "キー割り当て: 貼り付けを受け付けない入力欄のため、1 文字ずつ入力します（{}）",
+            crate::excel_check::foreground_process_name().unwrap_or_else(|| "不明".into())
+        );
+        // 修飾キーは Ctrl+V を送るときに離してある。
+        sendinput::send_text(&Hotkey::unpack(0), text);
+    }
+}
+
+/// Ctrl+V を送ったあと、貼り付け先が中身を読みに来るのを待つ。(読みに来たか, 相手が固まったままか)。
+unsafe fn wait_for_paste() -> (bool, bool) {
     let mut accepted = pump_messages_until(PASTE_ACCEPT_WAIT, || RENDERED.with(Cell::get));
     // 貼り付け先が固まっている（再計算中の Excel など）だけなら、Ctrl+V はまだ相手に届いていない。
     // ここで 1 文字ずつ入力すると、相手が動き出したときに貼り付けと入力の両方が入るので、
@@ -898,11 +1138,14 @@ unsafe fn paste_text(held: &Hotkey, text: &str) {
     if accepted {
         pump_messages_until(PASTE_SETTLE_WAIT, || false);
     }
-    PENDING_TEXT.with(|p| p.borrow_mut().take());
+    (accepted, target_hung)
+}
 
+/// 貼り付けのために置いたものを、元の内容に戻す。
+unsafe fn restore_after_paste(saved: &Saved) {
     // 自分が持ち主のままなら元に戻す（別のものがコピーされていたら戻さない）。
     if GetClipboardOwner().ok() == Some(clip_window()) {
-        match &saved {
+        match saved {
             Saved::Contents(Some(saved)) => {
                 if let Err(e) = restore_clipboard(saved) {
                     log::warn!("キー割り当て: クリップボードを元に戻せませんでした: {e}");
@@ -921,19 +1164,26 @@ unsafe fn paste_text(held: &Hotkey, text: &str) {
     } else {
         log::debug!("キー割り当て: クリップボードが新しくなったため、元に戻しません");
     }
+}
 
-    if target_hung {
-        // 最後まで応答が無い。入力しても届かず、あとでまとめて入ってしまうので、あきらめる。
-        log::warn!("キー割り当て: 貼り付け先が応答しないため、貼り付けをやめました");
-        ime_indicator::notify("応答なし");
-    } else if !accepted {
-        log::debug!(
-            "キー割り当て: 貼り付けを受け付けない入力欄のため、1 文字ずつ入力します（{}）",
-            crate::excel_check::foreground_process_name().unwrap_or_else(|| "不明".into())
-        );
-        // 修飾キーは Ctrl+V を送るときに離してある。
-        sendinput::send_text(&Hotkey::unpack(0), text);
+/// 画像を、遅延レンダリングでクリップボードに置く（[`offer_text`] の画像版）。
+unsafe fn offer_image(dib: Vec<u8>) -> Result<(), String> {
+    let window = clip_window();
+    if window.is_invalid() {
+        return Err("クリップボード用のウィンドウがありません".into());
     }
+    if !open_clipboard() {
+        return Err("ほかのアプリがクリップボードを使っています".into());
+    }
+    let result = EmptyClipboard().map_err(|e| e.to_string());
+    if result.is_ok() {
+        PENDING_IMAGE.with(|p| *p.borrow_mut() = Some(dib));
+        RENDERED.with(|r| r.set(false));
+        let _ = SetClipboardData(CF_DIB, HANDLE(std::ptr::null_mut()));
+        mark_exclude_from_history();
+    }
+    let _ = CloseClipboard();
+    result
 }
 
 /// 前面のウィンドウが、メッセージに応答していないか。
@@ -1018,13 +1268,17 @@ unsafe fn pump_messages_until(timeout: Duration, done: impl Fn() -> bool) -> boo
 }
 
 /// 予約しておいた文字を、クリップボードに渡す（クリップボードは開かれている前提）。
-unsafe fn render_pending_text() {
-    let bytes = PENDING_TEXT.with(|p| p.borrow().clone());
+unsafe fn render_pending(format: u32) {
+    let bytes = match format {
+        CF_UNICODETEXT => PENDING_TEXT.with(|p| p.borrow().clone()),
+        CF_DIB => PENDING_IMAGE.with(|p| p.borrow().clone()),
+        _ => None,
+    };
     let Some(bytes) = bytes else {
         return;
     };
     if let Ok(memory) = global_copy(&bytes) {
-        if SetClipboardData(CF_UNICODETEXT, HANDLE(memory.0)).is_err() {
+        if SetClipboardData(format, HANDLE(memory.0)).is_err() {
             let _ = GlobalFree(memory);
         } else {
             RENDERED.with(|r| r.set(true));
@@ -1042,16 +1296,15 @@ unsafe extern "system" fn clip_wnd_proc(
     match msg {
         // 貼り付け先が文字を求めてきた（クリップボードは相手が開いている）。
         WM_RENDERFORMAT => {
-            if wparam.0 as u32 == CF_UNICODETEXT {
-                render_pending_text();
-            }
+            render_pending(wparam.0 as u32);
             LRESULT(0)
         }
         // 持ち主のまま終了するときは、予約を中身に置き換えておく。
         WM_RENDERALLFORMATS => {
             if OpenClipboard(hwnd).is_ok() {
                 if GetClipboardOwner().ok() == Some(hwnd) {
-                    render_pending_text();
+                    render_pending(CF_UNICODETEXT);
+                    render_pending(CF_DIB);
                 }
                 let _ = CloseClipboard();
             }
@@ -1092,6 +1345,7 @@ unsafe extern "system" fn clip_wnd_proc(
         // 別のものがコピーされた（または自分で空にした）。予約は無効になる。
         WM_DESTROYCLIPBOARD => {
             PENDING_TEXT.with(|p| p.borrow_mut().take());
+            PENDING_IMAGE.with(|p| p.borrow_mut().take());
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
