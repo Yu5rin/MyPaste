@@ -147,6 +147,11 @@ pub fn history_opacity() -> u32 {
     history_config().view.opacity
 }
 
+/// 今の「貼り付けても一覧を出したままにする」（一覧の上で切り替えたものを含む）。
+pub fn history_keep_open() -> bool {
+    history_config().view.keep_open
+}
+
 fn history_config() -> HistoryConfig {
     *HISTORY_CONFIG.lock().unwrap_or_else(|p| p.into_inner())
 }

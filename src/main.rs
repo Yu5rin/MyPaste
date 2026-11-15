@@ -293,6 +293,7 @@ fn main() {
                 let on = !settings.clipboard_history.enabled;
                 settings.clipboard_history.enabled = on;
                 settings.clipboard_history.opacity = actions::history_opacity();
+                settings.clipboard_history.keep_open = actions::history_keep_open();
                 configure_hotkeys(&settings);
                 tray.update(|s| s.history = on);
                 report_save(config::save_clipboard_history_enabled(on));
@@ -332,6 +333,7 @@ fn main() {
                 current.ime_indicator.enabled = ime_indicator::is_enabled();
                 // 一覧の上で Shift+ホイールで変えた不透明度を出す（古い値で保存し直さないように）。
                 settings.clipboard_history.opacity = actions::history_opacity();
+                settings.clipboard_history.keep_open = actions::history_keep_open();
                 current.clipboard_history.opacity = settings.clipboard_history.opacity;
                 settings_window::open(tx.clone(), current, startup::is_enabled());
             }
@@ -373,6 +375,7 @@ fn main() {
                 settings.hotkeys = hotkeys;
                 // 一覧の上で Shift+ホイールで変えた不透明度を、古い値で戻さない。
                 settings.clipboard_history.opacity = actions::history_opacity();
+                settings.clipboard_history.keep_open = actions::history_keep_open();
                 configure_hotkeys(&settings);
             }
             TrayMessage::CheckUpdate => {
