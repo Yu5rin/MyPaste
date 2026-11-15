@@ -10,6 +10,10 @@
 //!   こちらが巻き込まれない。管理者権限のウィンドウなど、取れない場合は何もしない。
 //! - 表示するかどうかの判断（同じウィンドウ内でモードが変わったときだけ）や
 //!   フェード・配置の計算は [`crate::ime_logic`] にあり、Linux でもテストできる。
+//! - アプリごとの入力モード: 前面のアプリ（プロセス）が変わったとき、一覧にあるアプリなら
+//!   1 度だけ、同じ IME ウィンドウへ `IMC_SETOPENSTATUS` / `IMC_SETCONVERSIONMODE` を送って
+//!   入力モードを切り替える（判断は [`crate::ime_logic::AppModeTracker`]）。表示の ON/OFF とは
+//!   別に動く。
 //! - 表示ウィンドウはクリック透過（`WS_EX_TRANSPARENT`）・非アクティブ
 //!   （`WS_EX_NOACTIVATE` と `WM_MOUSEACTIVATE` で `MA_NOACTIVATE`）・タスクバー非表示
 //!   （`WS_EX_TOOLWINDOW`）・最前面（`WS_EX_TOPMOST`）。表示も `SWP_NOACTIVATE` で
@@ -71,8 +75,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::config::ImeIndicatorSettings;
 use crate::ime_logic::{
-    self, Badge, BadgeInput, BadgeMoment, BadgeTracker, BadgeWhen, ImeMode, ModeTracker, Position,
-    ReadabilityLog, Theme,
+    self, AppModeRule, AppModeTracker, Badge, BadgeInput, BadgeMoment, BadgeTracker, BadgeWhen,
+    ImeChange, ImeMode, ModeTracker, Position, ReadabilityLog, Theme,
 };
 
 /// IME の状態を調べる間隔（ミリ秒）。
@@ -90,6 +94,10 @@ const WM_IME_CONTROL: u32 = 0x0283;
 const IMC_GETCONVERSIONMODE: usize = 0x0001;
 /// `IMC_GETOPENSTATUS`。
 const IMC_GETOPENSTATUS: usize = 0x0005;
+/// `IMC_SETCONVERSIONMODE`。
+const IMC_SETCONVERSIONMODE: usize = 0x0002;
+/// `IMC_SETOPENSTATUS`。
+const IMC_SETOPENSTATUS: usize = 0x0006;
 
 /// タイマーの識別子: IME 状態の監視。
 const TIMER_POLL: usize = 1;
@@ -115,7 +123,8 @@ const WM_APP_PREVIEW: u32 = WM_APP + 1;
 /// お知らせを表示する（キー割り当ての結果など）。文字は [`NOTICE`] に置いてから送る。
 const WM_APP_NOTICE: u32 = WM_APP + 2;
 
-/// 機能の ON/OFF。トレイメニューから切り替えられ、監視スレッドが毎回見る。
+/// 表示の ON/OFF。トレイメニューから切り替えられ、監視スレッドが毎回見る（アプリごとの
+/// 入力モードは、これとは別に [`Params::app_modes_enabled`] で決める）。
 static ENABLED: AtomicBool = AtomicBool::new(true);
 /// 表示の設定。
 static PARAMS: Mutex<Params> = Mutex::new(Params::DEFAULT);
@@ -135,8 +144,8 @@ pub struct Timing {
     pub fade_ms: u64,
 }
 
-/// 表示の設定。
-#[derive(Debug, Clone, Copy)]
+/// 表示の設定（と、アプリごとの入力モード）。
+#[derive(Debug, Clone)]
 pub struct Params {
     pub timing: Timing,
     /// 一辺（96 DPI 基準のピクセル）。
@@ -165,6 +174,10 @@ pub struct Params {
     pub badge_on_ibeam: bool,
     /// 「おまかせ」のとき、入力位置の横では出し続ける（打っている間は消す）。
     pub badge_keep_at_caret: bool,
+    /// アプリに切り替えたときに、入力モードを自動で切り替えるか（表示の ON/OFF とは別）。
+    pub app_modes_enabled: bool,
+    /// アプリごとの入力モード。
+    pub app_modes: Vec<AppModeRule>,
 }
 
 /// キーを打った・マウスのボタンを押した時刻（`GetTickCount`。0 は「まだ見ていないものは無い」）。
@@ -203,6 +216,8 @@ impl Params {
         badge_opacity: ime_logic::DEFAULT_BADGE_OPACITY,
         badge_on_ibeam: true,
         badge_keep_at_caret: true,
+        app_modes_enabled: true,
+        app_modes: Vec::new(),
     };
 
     /// 設定ファイルの値から作る（範囲外は丸め、知らない値は既定にする）。
@@ -227,6 +242,10 @@ impl Params {
             badge_opacity: settings.badge_opacity,
             badge_on_ibeam: settings.badge_on_ibeam,
             badge_keep_at_caret: settings.badge_keep_at_caret,
+            app_modes_enabled: settings.app_modes_enabled,
+            app_modes: ime_logic::app_mode_rules(
+                settings.app_modes.iter().map(|r| (r.app.as_str(), r.mode.as_str())),
+            ),
         }
         .clamped()
     }
@@ -270,7 +289,13 @@ pub fn set_params(params: Params) {
 }
 
 fn current_params() -> Params {
-    *PARAMS.lock().unwrap_or_else(|p| p.into_inner())
+    PARAMS.lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+/// アプリごとの入力モードを使うか（ON で、一覧が空でないとき）と、その一覧。
+fn current_app_modes() -> Option<Vec<AppModeRule>> {
+    let params = PARAMS.lock().unwrap_or_else(|p| p.into_inner());
+    (params.app_modes_enabled && !params.app_modes.is_empty()).then(|| params.app_modes.clone())
 }
 
 /// 指定した設定で、試しに「あ」を表示する（機能が OFF でも、全画面のアプリの間でも表示する）。
@@ -377,6 +402,8 @@ pub fn start(settings: &ImeIndicatorSettings) -> Option<Indicator> {
 struct State {
     hwnd: HWND,
     tracker: ModeTracker,
+    /// アプリごとの入力モードを、切り替えたときに 1 度だけ当てるための状態。
+    app_modes: AppModeTracker,
     /// 表示中の内容。
     showing: Option<Showing>,
     /// 作成済みのフォントと、その文字の高さ（DPI が変わったら作り直す）。
@@ -426,6 +453,11 @@ struct Showing {
 struct Observed {
     /// フォーカス先のウィンドウ（「同じウィンドウ内での変化か」の判定に使う）。
     focus: HWND,
+    /// フォーカス先の IME ウィンドウ（入力モードを切り替えるときの送り先）。
+    ime_window: HWND,
+    /// IME のオン・オフと変換モード。
+    open: bool,
+    conversion: u32,
     mode: ImeMode,
     /// 入力位置（キャレット）の画面座標。取れなければ `None`。
     caret: Option<RECT>,
@@ -450,6 +482,7 @@ fn thread_main(ready: mpsc::Sender<u32>) {
             *s.borrow_mut() = Some(State {
                 hwnd,
                 tracker: ModeTracker::default(),
+                app_modes: AppModeTracker::default(),
                 showing: None,
                 font: None,
                 size: 0,
@@ -632,11 +665,14 @@ unsafe fn apply_capture_setting() {
 unsafe fn on_poll() {
     apply_capture_setting();
     let enabled = is_enabled();
-    let observed = if enabled {
-        query_foreground_ime(needs_accessible_caret(&current_params()))
+    // アプリごとの入力モードは、表示を OFF にしていても使う。
+    let app_modes = current_app_modes();
+    let mut observed = if enabled || app_modes.is_some() {
+        query_foreground_ime(enabled && needs_accessible_caret(&current_params()))
     } else {
         None
     };
+    apply_app_mode(app_modes.as_deref(), observed.as_mut());
 
     let to_show = STATE.with(|s| {
         let mut s = s.borrow_mut();
@@ -683,6 +719,77 @@ unsafe fn on_poll() {
         }
         log::debug!("入力モード: {} を表示します（位置: {}）", mode.label(), params.position.as_setting());
         show(mode.label(), observed.caret, &params, false);
+    }
+}
+
+/// アプリに切り替えたときに、そのアプリの入力モードにする（1 度だけ）。`rules` は使う一覧
+/// （使わないときは `None`）。切り替えたら `observed` を切り替えたあとの状態に直す。切り替えた
+/// あとの状態を、表示側は「ウィンドウを移ったときの状態」として受け取るので、大きな表示は出ない。
+unsafe fn apply_app_mode(rules: Option<&[AppModeRule]>, observed: Option<&mut Observed>) {
+    let Some(rules) = rules else {
+        STATE.with(|s| {
+            if let Some(state) = s.borrow_mut().as_mut() {
+                state.app_modes.reset();
+            }
+        });
+        return;
+    };
+    let foreground = GetForegroundWindow();
+    let app = if foreground.is_invalid() {
+        None
+    } else {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(foreground, Some(&mut pid));
+        (pid != 0).then_some(pid)
+    };
+    let ime = observed.as_ref().map(|o| (o.open, o.conversion));
+    let change = STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let state = s.as_mut()?;
+        state.app_modes.observe(app, ime, || {
+            // 自分自身のウィンドウ（設定画面など）は対象外。
+            if app == Some(GetCurrentProcessId()) {
+                return None;
+            }
+            let name = crate::excel_check::process_name_of_window(foreground)?;
+            ime_logic::app_mode_for(rules, &name)
+        })
+    });
+    let (Some(change), Some(observed)) = (change, observed) else {
+        return;
+    };
+    set_ime_state(observed.ime_window, change);
+    // 切り替えたあとの状態を読み直す（読めなければ、送った値になったことにする）。
+    let open = send_ime_control(observed.ime_window, IMC_GETOPENSTATUS)
+        .map(|v| v != 0)
+        .unwrap_or(change.open.unwrap_or(observed.open));
+    let conversion = send_ime_control(observed.ime_window, IMC_GETCONVERSIONMODE)
+        .map(|v| v as u32)
+        .unwrap_or(change.conversion.unwrap_or(observed.conversion));
+    let before = observed.mode;
+    observed.open = open;
+    observed.conversion = conversion;
+    observed.mode = ime_logic::mode_from_status(open, conversion);
+    log::debug!(
+        "入力モード: アプリに合わせて {} から {} に切り替えました",
+        before.label(),
+        observed.mode.label()
+    );
+    // 表示側には、切り替えたあとの状態を「別のウィンドウへ移った」ものとして渡す。
+    STATE.with(|s| {
+        if let Some(state) = s.borrow_mut().as_mut() {
+            state.tracker.reset();
+        }
+    });
+}
+
+/// IME の状態を変える（オン・オフ、続けて変換モード）。届かなくても何もしない。
+unsafe fn set_ime_state(ime_window: HWND, change: ImeChange) {
+    if let Some(open) = change.open {
+        let _ = send_ime_control_with(ime_window, IMC_SETOPENSTATUS, isize::from(open));
+    }
+    if let Some(conversion) = change.conversion {
+        let _ = send_ime_control_with(ime_window, IMC_SETCONVERSIONMODE, conversion as isize);
     }
 }
 
@@ -1058,6 +1165,9 @@ unsafe fn query_foreground_ime(accessible: bool) -> Option<Observed> {
     };
     Some(Observed {
         focus,
+        ime_window,
+        open: open != 0,
+        conversion: conversion as u32,
         mode: ime_logic::mode_from_status(open != 0, conversion as u32),
         caret,
     })
@@ -1246,12 +1356,17 @@ unsafe fn system_caret_rect(info: &GUITHREADINFO) -> Option<RECT> {
 ///
 /// 相手が固まっている・権限が上（UIPI で遮断される）などで届かなければ `None`。
 unsafe fn send_ime_control(ime_window: HWND, command: usize) -> Option<usize> {
+    send_ime_control_with(ime_window, command, 0)
+}
+
+/// [`send_ime_control`] に、値（`lParam`）を付けて送る（状態を変えるとき）。
+unsafe fn send_ime_control_with(ime_window: HWND, command: usize, value: isize) -> Option<usize> {
     let mut result = 0usize;
     let sent = SendMessageTimeoutW(
         ime_window,
         WM_IME_CONTROL,
         WPARAM(command),
-        LPARAM(0),
+        LPARAM(value),
         SMTO_ABORTIFHUNG,
         QUERY_TIMEOUT_MS,
         Some(&mut result),

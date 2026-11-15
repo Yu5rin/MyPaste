@@ -247,6 +247,37 @@ pub struct ImeIndicatorSettings {
     pub badge_on_ibeam: bool,
     /// 「おまかせ」のとき、入力位置の横では出し続けるか（打っている間は消す）。
     pub badge_keep_at_caret: bool,
+    /// アプリに切り替えたときに、入力モードを自動で切り替えるか（入力モードの表示とは別に使える）。
+    pub app_modes_enabled: bool,
+    /// アプリごとの入力モード。空なら何もしない。読めない件は飛ばす。
+    #[serde(deserialize_with = "lenient_app_modes")]
+    pub app_modes: Vec<AppImeModeSetting>,
+}
+
+/// アプリごとの入力モード 1 件（`ime_indicator.app_modes` の要素）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppImeModeSetting {
+    /// プロセス名（例 `EXCEL.EXE`）。
+    pub app: String,
+    /// `"on"`＝日本語（ひらがな） / `"off"`＝英字（IME オフ）。知らない値の件は使わない。
+    pub mode: String,
+}
+
+/// `app_modes` を読む。1 件が読めなくても、入力モードの表示の設定全体を既定に戻さないよう、
+/// 読めない件だけを飛ばす（配列でなければ空にする）。
+fn lenient_app_modes<'de, D>(deserializer: D) -> Result<Vec<AppImeModeSetting>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| serde_json::from_value(item).ok())
+            .collect(),
+        _ => Vec::new(),
+    })
 }
 
 impl Default for ImeIndicatorSettings {
@@ -270,6 +301,8 @@ impl Default for ImeIndicatorSettings {
             badge_opacity: crate::ime_logic::DEFAULT_BADGE_OPACITY,
             badge_on_ibeam: true,
             badge_keep_at_caret: true,
+            app_modes_enabled: true,
+            app_modes: Vec::new(),
         }
     }
 }
@@ -554,6 +587,8 @@ pub fn save_from_settings_window(settings: &Settings) -> Result<(), String> {
             "badge_opacity": settings.ime_indicator.badge_opacity,
             "badge_on_ibeam": settings.ime_indicator.badge_on_ibeam,
             "badge_keep_at_caret": settings.ime_indicator.badge_keep_at_caret,
+            "app_modes_enabled": settings.ime_indicator.app_modes_enabled,
+            "app_modes": settings.ime_indicator.app_modes,
         },
         "log": {
             "enabled": settings.log.enabled,

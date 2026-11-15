@@ -616,6 +616,433 @@ impl ReadabilityLog {
     }
 }
 
+/// アプリごとの入力モード（そのアプリに切り替えたときに、自動でこの入力モードにする）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppImeMode {
+    /// 日本語入力（IME オン・ひらがな）。
+    Japanese,
+    /// 英字（IME オフ）。
+    English,
+}
+
+impl AppImeMode {
+    /// 選択肢（値・設定ファイルの表記・設定画面の表示）。
+    pub const ALL: [(AppImeMode, &'static str, &'static str); 2] = [
+        (AppImeMode::Japanese, "on", "日本語（ひらがな）"),
+        (AppImeMode::English, "off", "英字（IME オフ）"),
+    ];
+
+    /// 設定ファイルの値から読む（大文字小文字は区別しない）。知らない値は `None`。
+    pub fn from_setting(text: &str) -> Option<AppImeMode> {
+        let text = text.trim();
+        AppImeMode::ALL
+            .iter()
+            .find(|(_, setting, _)| setting.eq_ignore_ascii_case(text))
+            .map(|(mode, _, _)| *mode)
+    }
+
+    /// 設定ファイルに書く値。
+    pub fn as_setting(self) -> &'static str {
+        match self {
+            AppImeMode::Japanese => "on",
+            AppImeMode::English => "off",
+        }
+    }
+
+    /// 一覧に出す短い名前。
+    pub fn short_label(self) -> &'static str {
+        match self {
+            AppImeMode::Japanese => "日本語",
+            AppImeMode::English => "英字",
+        }
+    }
+}
+
+/// アプリごとの入力モード 1 件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppModeRule {
+    /// プロセス名（[`crate::remap_logic::normalize_app`] でそろえたもの。例 `EXCEL.EXE`）。
+    pub app: String,
+    pub mode: AppImeMode,
+}
+
+impl AppModeRule {
+    /// 設定画面の一覧に出す文字（例 `EXCEL.EXE → 英字`）。
+    pub fn label(&self) -> String {
+        format!("{} → {}", self.app, self.mode.short_label())
+    }
+}
+
+/// 一覧にアプリを足す。すでにあるアプリなら、入力モードだけを置き換える。足した（置き換えた）
+/// 位置を返す。アプリ名が空なら何もせず `None`。
+pub fn add_app_mode_rule(rules: &mut Vec<AppModeRule>, app: &str, mode: AppImeMode) -> Option<usize> {
+    let app = crate::remap_logic::normalize_app(app)?;
+    if let Some(index) = rules.iter().position(|r| r.app == app) {
+        rules[index].mode = mode;
+        return Some(index);
+    }
+    rules.push(AppModeRule { app, mode });
+    Some(rules.len() - 1)
+}
+
+/// 設定ファイルの値（アプリ名と `"on"` / `"off"`）から一覧を作る。名前の書き方の揺れは直し、
+/// 名前が空・入力モードが読めないものは飛ばし、同じアプリが 2 度あれば後のものを使う。
+pub fn app_mode_rules<'a>(items: impl IntoIterator<Item = (&'a str, &'a str)>) -> Vec<AppModeRule> {
+    let mut rules = Vec::new();
+    for (app, mode) in items {
+        if let Some(mode) = AppImeMode::from_setting(mode) {
+            add_app_mode_rule(&mut rules, app, mode);
+        }
+    }
+    rules
+}
+
+/// プロセス名に合う入力モード（大文字小文字は区別しない）。無ければ `None`。
+pub fn app_mode_for(rules: &[AppModeRule], process_name: &str) -> Option<AppImeMode> {
+    rules
+        .iter()
+        .find(|r| r.app.eq_ignore_ascii_case(process_name))
+        .map(|r| r.mode)
+}
+
+/// IME へ送る変更。`None` の項目は変えない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImeChange {
+    /// IME のオン（`true`）・オフ（`false`）。
+    pub open: Option<bool>,
+    /// 変換モード。
+    pub conversion: Option<u32>,
+}
+
+/// いまの IME の状態（オン・オフと変換モード）を、`mode` にするための変更。すでにそうなって
+/// いれば `None`。
+///
+/// 日本語は、ひらがな（`NATIVE` と `FULLSHAPE`、`KATAKANA` は外す）にする。ローマ字入力・
+/// かな入力の別など、ほかのビットは利用者のものを残す。
+pub fn ime_change(mode: AppImeMode, open: bool, conversion: u32) -> Option<ImeChange> {
+    match mode {
+        AppImeMode::English => open.then_some(ImeChange {
+            open: Some(false),
+            conversion: None,
+        }),
+        AppImeMode::Japanese => {
+            let hiragana = (conversion & !CMODE_KATAKANA) | CMODE_NATIVE | CMODE_FULLSHAPE;
+            if open && conversion == hiragana {
+                return None;
+            }
+            Some(ImeChange {
+                open: (!open).then_some(true),
+                // IME がオフの間の変換モードは古いことがあるので、オンにするときは必ず送る。
+                conversion: (!open || conversion != hiragana).then_some(hiragana),
+            })
+        }
+    }
+}
+
+/// 離れてすぐ（この回数の監視のうち）に戻ってきたアプリは、離れなかったことにする
+/// （Alt+Tab の切り替え画面や、切り替えの途中で一瞬だけ前面が変わったときに、利用者が
+/// 自分で変えた入力モードを戻してしまわないように）。100ms ごとの監視で 0.5 秒。
+pub const APP_RETURN_QUIET_POLLS: u32 = 5;
+/// 切り替えた先の IME の状態がすぐに読めないとき（Excel などは切り替えた直後に一瞬
+/// 読めなくなる）に、読めるようになるまで待つ監視の回数。100ms ごとの監視で 1 秒。
+pub const APP_MODE_PENDING_POLLS: u32 = 10;
+
+/// 「アプリに切り替えたときに 1 度だけ、そのアプリの入力モードにする」ための状態。
+///
+/// アプリは、前面ウィンドウのプロセス（プロセス ID）で見分ける。同じプロセスの別の
+/// ウィンドウへ移ったときは、同じアプリのままとして扱い、切り替え直さない。切り替えたあとは
+/// 利用者が自由に変えてよく、そのアプリから離れて戻ってきたときにだけ、また切り替える。
+#[derive(Debug, Default)]
+pub struct AppModeTracker {
+    /// 監視を始めてから、まだ 1 度も見ていないか（`false` の間は、最初の 1 回）。
+    started: bool,
+    /// いま前面にあるアプリ（前回の監視で見たもの。前面ウィンドウが無ければ `None`）。
+    current: Option<u32>,
+    /// そのアプリが前面にある間の監視の回数。
+    current_polls: u32,
+    /// 直前に離れたアプリと、離れてからの監視の回数。
+    left: Option<(u32, u32)>,
+    /// まだ当てていない入力モードと、待てる残りの回数。
+    pending: Option<(AppImeMode, u32)>,
+}
+
+impl AppModeTracker {
+    /// 監視のたびに呼ぶ。`app` は前面ウィンドウのプロセス ID、`ime` は読めた IME の状態
+    /// （オン・オフと変換モード。読めなければ `None`）、`rule` は前面のアプリの入力モードを
+    /// 調べる（別のアプリへ移ったときだけ呼ぶ）。いま IME へ送る変更を返す。
+    ///
+    /// - 監視を始めて最初の 1 回は、いま前面にあるアプリを覚えるだけにする（起動したときや、
+    ///   機能を ON にしたときに、使っている最中のアプリの入力モードを変えないように）。
+    /// - 別のアプリへ移ったら、そのアプリの入力モードを覚え、IME の状態を読めたときに 1 度だけ
+    ///   当てる。すでにその入力モードなら何もしない。しばらく読めなければあきらめる。
+    /// - 離れてすぐに戻ってきたアプリ（[`APP_RETURN_QUIET_POLLS`]）は、離れなかったことにする。
+    pub fn observe(
+        &mut self,
+        app: Option<u32>,
+        ime: Option<(bool, u32)>,
+        rule: impl FnOnce() -> Option<AppImeMode>,
+    ) -> Option<ImeChange> {
+        if !self.started {
+            self.started = true;
+            self.current = app;
+            self.current_polls = APP_RETURN_QUIET_POLLS;
+            return None;
+        }
+        if let Some((_, polls)) = self.left.as_mut() {
+            *polls = polls.saturating_add(1);
+        }
+        if app == self.current {
+            self.current_polls = self.current_polls.saturating_add(1);
+        } else {
+            let quick_return = matches!(
+                (app, self.left),
+                (Some(a), Some((l, polls))) if a == l && polls <= APP_RETURN_QUIET_POLLS
+            );
+            // 一瞬だけ前面になったもの（切り替え画面など）は、離れたアプリとして覚えない。
+            if let Some(previous) = self.current {
+                if self.current_polls >= APP_RETURN_QUIET_POLLS || self.left.is_none() {
+                    self.left = Some((previous, 0));
+                }
+            }
+            self.current = app;
+            if quick_return {
+                self.left = None;
+                self.current_polls = APP_RETURN_QUIET_POLLS;
+                self.pending = None;
+            } else {
+                self.current_polls = 0;
+                self.pending = app.and_then(|_| rule()).map(|mode| (mode, APP_MODE_PENDING_POLLS));
+            }
+        }
+
+        let (mode, remaining) = self.pending?;
+        match ime {
+            Some((open, conversion)) => {
+                self.pending = None;
+                ime_change(mode, open, conversion)
+            }
+            None => {
+                self.pending = (remaining > 1).then_some((mode, remaining - 1));
+                None
+            }
+        }
+    }
+
+    /// 記録を消す（機能を OFF にしたとき・一覧が空のとき）。次の監視は、最初の 1 回として扱う。
+    pub fn reset(&mut self) {
+        *self = AppModeTracker::default();
+    }
+}
+
+#[cfg(test)]
+mod app_mode_tests {
+    use super::*;
+
+    const N: u32 = CMODE_NATIVE;
+    const K: u32 = CMODE_KATAKANA;
+    const F: u32 = CMODE_FULLSHAPE;
+    /// `IME_CMODE_ROMAN`（ローマ字入力）。
+    const R: u32 = 0x0010;
+
+    const OFF: Option<ImeChange> = Some(ImeChange {
+        open: Some(false),
+        conversion: None,
+    });
+
+    fn english() -> Option<AppImeMode> {
+        Some(AppImeMode::English)
+    }
+
+    #[test]
+    fn reads_and_writes_settings() {
+        assert_eq!(AppImeMode::from_setting("on"), Some(AppImeMode::Japanese));
+        assert_eq!(AppImeMode::from_setting(" OFF "), Some(AppImeMode::English));
+        assert_eq!(AppImeMode::from_setting("kana"), None);
+        for (mode, setting, _) in AppImeMode::ALL {
+            assert_eq!(mode.as_setting(), setting);
+            assert_eq!(AppImeMode::from_setting(setting), Some(mode));
+        }
+    }
+
+    #[test]
+    fn builds_rules_from_settings() {
+        let rules = app_mode_rules([
+            ("excel", "off"),
+            ("C:\\Tools\\Slack.exe", "on"),
+            ("", "on"),
+            ("notepad.exe", "unknown"),
+            ("EXCEL.EXE", "on"),
+        ]);
+        assert_eq!(
+            rules,
+            [
+                AppModeRule { app: "EXCEL.EXE".into(), mode: AppImeMode::Japanese },
+                AppModeRule { app: "SLACK.EXE".into(), mode: AppImeMode::Japanese },
+            ]
+        );
+        assert_eq!(rules[0].label(), "EXCEL.EXE → 日本語");
+        assert_eq!(app_mode_for(&rules, "slack.exe"), Some(AppImeMode::Japanese));
+        assert_eq!(app_mode_for(&rules, "NOTEPAD.EXE"), None);
+    }
+
+    #[test]
+    fn adding_a_listed_app_replaces_its_mode() {
+        let mut rules = Vec::new();
+        assert_eq!(add_app_mode_rule(&mut rules, "Excel.exe", AppImeMode::Japanese), Some(0));
+        assert_eq!(add_app_mode_rule(&mut rules, "slack", AppImeMode::Japanese), Some(1));
+        assert_eq!(add_app_mode_rule(&mut rules, "EXCEL", AppImeMode::English), Some(0));
+        assert_eq!(add_app_mode_rule(&mut rules, "  ", AppImeMode::English), None);
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].label(), "EXCEL.EXE → 英字");
+    }
+
+    #[test]
+    fn change_for_english_turns_ime_off_only_when_on() {
+        assert_eq!(ime_change(AppImeMode::English, true, N | F | R), OFF);
+        assert_eq!(ime_change(AppImeMode::English, false, N | F | R), None);
+    }
+
+    #[test]
+    fn change_for_japanese_sets_hiragana_and_keeps_roman_bit() {
+        // すでにひらがな
+        assert_eq!(ime_change(AppImeMode::Japanese, true, N | F | R), None);
+        // オフからは、オンにしてひらがなにする（ローマ字入力のまま）
+        assert_eq!(
+            ime_change(AppImeMode::Japanese, false, R),
+            Some(ImeChange { open: Some(true), conversion: Some(N | F | R) })
+        );
+        // オフでも、変換モードは必ず送る
+        assert_eq!(
+            ime_change(AppImeMode::Japanese, false, N | F),
+            Some(ImeChange { open: Some(true), conversion: Some(N | F) })
+        );
+        // オンの半角英数・カタカナから。かな入力（ローマ字のビット無し）はそのまま
+        assert_eq!(
+            ime_change(AppImeMode::Japanese, true, 0),
+            Some(ImeChange { open: None, conversion: Some(N | F) })
+        );
+        assert_eq!(
+            ime_change(AppImeMode::Japanese, true, N | K | F | R),
+            Some(ImeChange { open: None, conversion: Some(N | F | R) })
+        );
+    }
+
+    #[test]
+    fn first_poll_after_start_only_remembers() {
+        let mut t = AppModeTracker::default();
+        let mut asked = false;
+        assert_eq!(t.observe(Some(1), Some((true, N | F)), || { asked = true; english() }), None);
+        assert!(!asked, "最初の 1 回はアプリを調べない");
+        assert_eq!(t.observe(Some(1), Some((true, N | F)), english), None);
+    }
+
+    #[test]
+    fn applies_once_on_arrival_and_lets_the_user_switch() {
+        let mut t = AppModeTracker::default();
+        t.observe(Some(1), None, || None);
+        // Excel に移った
+        assert_eq!(t.observe(Some(2), Some((true, N | F)), english), OFF);
+        // その後、利用者が日本語にしても、戻さない
+        for _ in 0..20 {
+            assert_eq!(t.observe(Some(2), Some((true, N | F)), english), None);
+        }
+    }
+
+    #[test]
+    fn does_nothing_when_already_in_the_mode_or_no_rule() {
+        let mut t = AppModeTracker::default();
+        t.observe(Some(1), None, || None);
+        assert_eq!(t.observe(Some(2), Some((false, 0)), english), None);
+        assert_eq!(t.observe(Some(3), Some((true, N | F)), || None), None);
+    }
+
+    #[test]
+    fn same_app_other_window_is_not_an_arrival() {
+        // 同じプロセスの別のウィンドウ（Excel の別のブック）は、プロセス ID が同じなので切り替え直さない
+        let mut t = AppModeTracker::default();
+        t.observe(Some(1), None, || None);
+        assert_eq!(t.observe(Some(2), Some((true, N | F)), english), OFF);
+        let mut asked = false;
+        assert_eq!(t.observe(Some(2), Some((true, N | F)), || { asked = true; english() }), None);
+        assert!(!asked);
+    }
+
+    #[test]
+    fn returning_to_the_app_applies_again() {
+        let mut t = AppModeTracker::default();
+        t.observe(Some(1), None, || None);
+        assert_eq!(t.observe(Some(2), Some((true, N | F)), english), OFF);
+        // 別のアプリへ移り、しばらく使う
+        for _ in 0..APP_RETURN_QUIET_POLLS + 1 {
+            t.observe(Some(3), Some((true, N | F)), || None);
+        }
+        // 戻ってきたら、また英字にする
+        assert_eq!(t.observe(Some(2), Some((true, N | F)), english), OFF);
+    }
+
+    #[test]
+    fn quick_return_is_not_leaving() {
+        // Alt+Tab の切り替え画面が一瞬だけ前面になって、同じアプリに戻った
+        let mut t = AppModeTracker::default();
+        t.observe(Some(1), None, || None);
+        assert_eq!(t.observe(Some(2), Some((true, N | F)), english), OFF);
+        for _ in 0..APP_RETURN_QUIET_POLLS {
+            t.observe(Some(2), Some((true, N | F)), english);
+        }
+        t.observe(Some(9), None, || None);
+        t.observe(None, None, || None);
+        t.observe(Some(9), None, || None);
+        let mut asked = false;
+        assert_eq!(t.observe(Some(2), Some((true, N | F)), || { asked = true; english() }), None);
+        assert!(!asked);
+    }
+
+    #[test]
+    fn waits_until_the_state_can_be_read() {
+        let mut t = AppModeTracker::default();
+        t.observe(Some(1), None, || None);
+        // 切り替えた直後は読めない
+        assert_eq!(t.observe(Some(2), None, english), None);
+        assert_eq!(t.observe(Some(2), None, english), None);
+        assert_eq!(t.observe(Some(2), Some((true, N | F)), english), OFF);
+        assert_eq!(t.observe(Some(2), Some((true, N | F)), english), None);
+    }
+
+    #[test]
+    fn gives_up_when_the_state_stays_unreadable() {
+        // 管理者として動いているアプリなど
+        let mut t = AppModeTracker::default();
+        t.observe(Some(1), None, || None);
+        for _ in 0..APP_MODE_PENDING_POLLS {
+            assert_eq!(t.observe(Some(2), None, english), None);
+        }
+        assert_eq!(t.observe(Some(2), Some((true, N | F)), english), None);
+    }
+
+    #[test]
+    fn changed_rules_are_used_from_the_next_arrival() {
+        let mut t = AppModeTracker::default();
+        t.observe(Some(1), None, || None);
+        // 一覧に無いアプリにいる間に、一覧が変わっても、そのアプリでは切り替えない
+        assert_eq!(t.observe(Some(2), Some((true, N | F)), || None), None);
+        assert_eq!(t.observe(Some(2), Some((true, N | F)), english), None);
+        // 別のアプリ（設定画面など）へ移ってから戻ると、新しい一覧で切り替える
+        for _ in 0..APP_RETURN_QUIET_POLLS + 1 {
+            t.observe(Some(3), None, || None);
+        }
+        assert_eq!(t.observe(Some(2), Some((true, N | F)), english), OFF);
+    }
+
+    #[test]
+    fn reset_treats_next_poll_as_first() {
+        let mut t = AppModeTracker::default();
+        t.observe(Some(1), None, || None);
+        t.reset();
+        assert_eq!(t.observe(Some(2), Some((true, N | F)), english), None);
+        assert_eq!(t.observe(Some(3), Some((true, N | F)), english), OFF);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

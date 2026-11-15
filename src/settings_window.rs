@@ -1,6 +1,6 @@
 //! 設定画面。
 //!
-//! トレイメニューの「設定...」から開く。4 つのタブ（ページ）に分けてあり、「OK」か「適用」を
+//! トレイメニューの「設定...」から開く。5 つのタブ（ページ）に分けてあり、「OK」か「適用」を
 //! 押すと `settings.json` に書き込み、メインスレッドへ [`TrayMessage::SettingsSaved`] を送って
 //! その場で反映させる（再起動は要らない）。「適用」は閉じずに保存する。保存していない変更が
 //! あるまま閉じようとしたら、確かめる。
@@ -12,6 +12,7 @@
 //!   不透明度、全画面のアプリでは出さない（プレビュー付き）
 //! - クリップボードの履歴: ON/OFF、一覧を出す操作（キーの組み合わせ、Ctrl・Shift・Alt の
 //!   2 回押し）、一覧の見た目、残す件数、終了後も残すか、履歴に残さないアプリ、履歴の削除
+//! - アプリごとの入力: アプリに切り替えたときに、自動で入れる入力モード（日本語・英字）の一覧
 //!
 //! タブは見出しの並びだけを使い、すべてのコントロールを同じ画面の上に作って、選ばれた
 //! ページのものだけを見せる（[`show_page`]）。
@@ -43,11 +44,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::clip_history::{self, MenuPosition, Theme as HistoryTheme, Trigger};
-use crate::config::{self, ClipboardHistorySettings, ImeIndicatorSettings, Settings};
+use crate::config::{
+    self, AppImeModeSetting, ClipboardHistorySettings, ImeIndicatorSettings, Settings,
+};
 use crate::hotkey_rules;
 use crate::ime_indicator::{Params, Timing};
 use crate::ime_logic::{
-    self, Badge, BadgeWhen, Position, Theme, FADE_MS_MAX, FADE_MS_MIN, HOLD_MS_MAX, HOLD_MS_MIN, OPACITY_MAX,
+    self, AppImeMode, AppModeRule, Badge, BadgeWhen, Position, Theme, FADE_MS_MAX, FADE_MS_MIN, HOLD_MS_MAX, HOLD_MS_MIN, OPACITY_MAX,
     OPACITY_MIN, SIZE_MAX, SIZE_MIN,
 };
 use crate::remap_logic::{self, Hotkey, KEYS};
@@ -128,13 +131,20 @@ const ID_BADGE_IBEAM: i32 = 188;
 const ID_BADGE_ENABLED: i32 = 189;
 const ID_BADGE_KEEP: i32 = 190;
 const ID_NO_CAPTURE: i32 = 191;
+const ID_AM_ENABLED: i32 = 192;
+const ID_AM_LIST: i32 = 193;
+const ID_AM_APP: i32 = 194;
+const ID_AM_PICK: i32 = 195;
+const ID_AM_MODE: i32 = 196;
+const ID_AM_ADD: i32 = 197;
+const ID_AM_REMOVE: i32 = 198;
 
 /// 画面の中身の大きさ（96 DPI 基準）。ノート PC（1366x768、表示 125%）でも収まる大きさにする。
 const CLIENT_W: i32 = 500;
 const CLIENT_H: i32 = 472;
 
 /// タブの見出し（[`PAGES`] と同じ順）。
-const TAB_NAMES: [&str; 4] = ["全般", "値貼り付け", "入力モード", "クリップボードの履歴"];
+const TAB_NAMES: [&str; 5] = ["全般", "値貼り付け", "入力モード", "クリップボードの履歴", "アプリごとの入力"];
 
 /// どのページでも出すもの（タブ。作る順が Tab キーで移る順になるので、最初に作る）。
 const HEAD: &[Item] = &[item(ID_TABS, Kind::Tabs, "", 8, 8, 484, 28)];
@@ -272,8 +282,24 @@ const PAGE_HISTORY: &[Item] = &[
     item(ID_CH_PICK_EXCLUDE, Kind::Button, "アプリを選ぶ...", 372, 392, 104, 28),
 ];
 
+/// 「アプリごとの入力」のページ。
+const PAGE_APP_MODES: &[Item] = &[
+    item(ID_AM_ENABLED, Kind::Check, "アプリに切り替えたときに、入力モードを自動で切り替える", 16, 48, 468, 22),
+    item(260, Kind::Note, "下の一覧のアプリに切り替えると、選んだ入力モードにします。切り替えたあとは自由に変えられ、そのアプリから離れて戻ってきたときに、また切り替えます。入力モードの表示を OFF にしていても使えます。", 16, 74, 468, 58),
+    item(261, Kind::Group, "アプリと入力モード", 12, 136, 476, 288),
+    item(ID_AM_LIST, Kind::ListBox, "", 24, 156, 452, 146),
+    item(262, Kind::Label, "アプリ", 24, 312, 70, 24),
+    item(ID_AM_APP, Kind::Edit, "", 98, 312, 226, 24),
+    item(ID_AM_PICK, Kind::Button, "アプリを選ぶ...", 330, 310, 146, 28),
+    item(263, Kind::Label, "入力モード", 24, 344, 70, 24),
+    item(ID_AM_MODE, Kind::Combo, "", 98, 344, 226, 200),
+    item(ID_AM_ADD, Kind::Button, "追加", 330, 342, 70, 28),
+    item(ID_AM_REMOVE, Kind::Button, "削除", 406, 342, 70, 28),
+    item(264, Kind::Note, "同じアプリを追加すると、入力モードを置き換えます。管理者として実行しているアプリなど、切り替えられないアプリもあります。", 24, 378, 452, 40),
+];
+
 /// ページ（[`TAB_NAMES`] と同じ順）。
-const PAGES: [&[Item]; 4] = [PAGE_GENERAL, PAGE_REMAP, PAGE_IME, PAGE_HISTORY];
+const PAGES: [&[Item]; 5] = [PAGE_GENERAL, PAGE_REMAP, PAGE_IME, PAGE_HISTORY, PAGE_APP_MODES];
 
 /// すべてのコントロール（作る順 = Tab キーで移る順）。
 fn all_items() -> Vec<Item> {
@@ -352,6 +378,8 @@ struct Context {
     font: HFONT,
     /// 開いたとき（最後に保存・適用したとき）の、欄の中身の控え。
     baseline: String,
+    /// 「アプリごとの入力」の一覧（画面の一覧と同じ順）。
+    app_modes: Vec<AppModeRule>,
 }
 
 thread_local! {
@@ -391,7 +419,13 @@ unsafe fn thread_main(tx: Sender<TrayMessage>, settings: Settings, startup: bool
     let font = ui::create_ui_font(dpi);
     let form = Form::from_settings(&settings, startup);
     CONTEXT.with(|c| {
-        *c.borrow_mut() = Some(Context { tx, settings, font, baseline: String::new() })
+        *c.borrow_mut() = Some(Context {
+            tx,
+            settings,
+            font,
+            baseline: String::new(),
+            app_modes: Vec::new(),
+        })
     });
 
     let items = all_items();
@@ -407,6 +441,7 @@ unsafe fn thread_main(tx: Sender<TrayMessage>, settings: Settings, startup: bool
     ui::add_combo_items(hwnd, ID_CH_KEY, KEYS.iter().map(|(name, _)| *name));
     ui::add_combo_items(hwnd, ID_CH_POSITION, MenuPosition::ALL.iter().map(|(_, _, name)| *name));
     ui::add_combo_items(hwnd, ID_CH_THEME, HistoryTheme::ALL.iter().map(|(_, _, name)| *name));
+    ui::add_combo_items(hwnd, ID_AM_MODE, AppImeMode::ALL.iter().map(|(_, _, name)| *name));
     fill_form(hwnd, &form);
     ui::place_window(hwnd, dpi, CLIENT_W, CLIENT_H);
     ui::layout(hwnd, &items, dpi);
@@ -472,6 +507,93 @@ unsafe fn fill_form(hwnd: HWND, form: &Form) {
     set_checked(hwnd, ID_LOG, form.log);
     fill_history(hwnd, &form.history);
     update_ime_fields(hwnd);
+    set_checked(hwnd, ID_AM_ENABLED, ime.app_modes_enabled);
+    set_app_modes(hwnd, ime.app_modes.clone(), None);
+    set_text(hwnd, ID_AM_APP, "");
+    set_combo_index(hwnd, ID_AM_MODE, 0);
+    update_app_mode_fields(hwnd);
+}
+
+/// 「アプリごとの入力」の一覧を置き換え、画面の一覧に出す。`select` は選んでおく行。
+unsafe fn set_app_modes(hwnd: HWND, rules: Vec<AppModeRule>, select: Option<usize>) {
+    let labels: Vec<String> = rules.iter().map(AppModeRule::label).collect();
+    ui::set_list_items(hwnd, ID_AM_LIST, &labels, select);
+    CONTEXT.with(|c| {
+        if let Some(context) = c.borrow_mut().as_mut() {
+            context.app_modes = rules;
+        }
+    });
+}
+
+/// 「アプリごとの入力」の一覧（画面に出しているもの）。
+fn app_modes() -> Vec<AppModeRule> {
+    CONTEXT.with(|c| c.borrow().as_ref().map(|context| context.app_modes.clone()).unwrap_or_default())
+}
+
+/// アプリごとの入力モードを使わないときは、一覧と入力の欄を使えなくする。
+unsafe fn update_app_mode_fields(hwnd: HWND) {
+    let on = is_checked(hwnd, ID_AM_ENABLED);
+    for id in [ID_AM_LIST, ID_AM_APP, ID_AM_PICK, ID_AM_MODE, ID_AM_ADD, ID_AM_REMOVE] {
+        ui::set_enabled(hwnd, id, on);
+    }
+}
+
+/// 「追加」: 入力したアプリを、選んだ入力モードで一覧に足す（すでにあれば入力モードを置き換える）。
+unsafe fn on_add_app_mode(hwnd: HWND) {
+    let mode = selected_app_mode(hwnd);
+    let mut rules = app_modes();
+    let Some(index) = ime_logic::add_app_mode_rule(&mut rules, &get_text(hwnd, ID_AM_APP), mode) else {
+        report_invalid(hwnd, ID_AM_APP, "アプリのプロセス名を入力してください（例: EXCEL.EXE）。");
+        return;
+    };
+    set_app_modes(hwnd, rules, Some(index));
+    set_text(hwnd, ID_AM_APP, "");
+    ui::focus(hwnd, ID_AM_APP);
+}
+
+/// 「削除」: 一覧で選んでいるアプリを消す。
+unsafe fn on_remove_app_mode(hwnd: HWND) {
+    let mut rules = app_modes();
+    let Some(index) = ui::list_index(hwnd, ID_AM_LIST).filter(|&i| i < rules.len()) else {
+        show_message(hwnd, "削除するアプリを、一覧で選んでください。", MB_ICONINFORMATION);
+        return;
+    };
+    rules.remove(index);
+    let select = (!rules.is_empty()).then(|| index.min(rules.len() - 1));
+    set_app_modes(hwnd, rules, select);
+    ui::focus(hwnd, ID_AM_LIST);
+}
+
+/// 「アプリごとの入力」で選んでいる入力モード。
+unsafe fn selected_app_mode(hwnd: HWND) -> AppImeMode {
+    combo_index(hwnd, ID_AM_MODE)
+        .and_then(|i| AppImeMode::ALL.get(i))
+        .map_or(AppImeMode::Japanese, |(m, _, _)| *m)
+}
+
+/// 「アプリごとの入力」の欄に入れたまま、まだ「追加」していないアプリがあれば、その説明を返す
+/// （「追加」を押し忘れたまま保存して、効かないと思われないように）。
+unsafe fn app_mode_not_added(hwnd: HWND) -> Option<String> {
+    if !field_enabled(hwnd, ID_AM_APP) {
+        return None;
+    }
+    let app = remap_logic::normalize_app(&get_text(hwnd, ID_AM_APP))?;
+    let mode = selected_app_mode(hwnd);
+    let listed = app_modes().iter().any(|r| r.app == app && r.mode == mode);
+    (!listed).then(|| {
+        format!("「{app}」はまだ一覧に入っていません。「追加」を押すか、欄を空にしてください。")
+    })
+}
+
+/// 欄の中身の控え（保存していない変更があるかを調べるのに使う）。「アプリごとの入力」の一覧も含め、
+/// 一覧に足す前の入力欄は含めない。
+unsafe fn form_snapshot(hwnd: HWND) -> String {
+    let items: Vec<Item> = all_items()
+        .into_iter()
+        .filter(|item| item.id != ID_AM_APP && item.id != ID_AM_MODE)
+        .collect();
+    let rules: Vec<String> = app_modes().iter().map(AppModeRule::label).collect();
+    format!("{}\u{1f}{}", ui::snapshot(hwnd, &items), rules.join("\u{1e}"))
 }
 
 /// 入力モードの表示を使わないときは、表示のしかたの欄を使えなくする。
@@ -500,7 +622,7 @@ unsafe fn update_ime_fields(hwnd: HWND) {
 
 /// 今の欄の中身を「保存済みの状態」として覚える。
 unsafe fn mark_clean(hwnd: HWND) {
-    let snapshot = ui::snapshot(hwnd, &all_items());
+    let snapshot = form_snapshot(hwnd);
     CONTEXT.with(|c| {
         if let Some(context) = c.borrow_mut().as_mut() {
             context.baseline = snapshot;
@@ -511,7 +633,7 @@ unsafe fn mark_clean(hwnd: HWND) {
 /// 「キャンセル」・閉じるボタン・Esc: 保存していない変更があれば確かめてから閉じる。
 unsafe fn on_close(hwnd: HWND) {
     let baseline = CONTEXT.with(|c| c.borrow().as_ref().map(|context| context.baseline.clone()));
-    let changed = baseline.is_some_and(|baseline| baseline != ui::snapshot(hwnd, &all_items()));
+    let changed = baseline.is_some_and(|baseline| baseline != form_snapshot(hwnd));
     if changed && !ui::ask_yes_no(hwnd, "保存していない変更があります。保存せずに閉じますか？") {
         return;
     }
@@ -737,6 +859,9 @@ unsafe fn read_form(hwnd: HWND) -> Result<Form, (i32, String)> {
 
     let ime = read_ime_params(hwnd)?;
     let history = read_history(hwnd)?;
+    if let Some(message) = app_mode_not_added(hwnd) {
+        return Err((ID_AM_APP, message));
+    }
 
     Ok(Form {
         hotkey,
@@ -887,6 +1012,8 @@ unsafe fn read_ime_params(hwnd: HWND) -> Result<Params, (i32, String)> {
         badge_keep_at_caret: is_checked(hwnd, ID_BADGE_KEEP),
         badge_hold_ms,
         badge_opacity,
+        app_modes_enabled: is_checked(hwnd, ID_AM_ENABLED),
+        app_modes: app_modes(),
     })
 }
 
@@ -953,6 +1080,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             {
                 update_ime_fields(hwnd);
             }
+            if id == ID_AM_ENABLED && code == BN_CLICKED {
+                update_app_mode_fields(hwnd);
+            }
             if code == BN_CLICKED {
                 match id {
                     ID_SAVE => on_save(hwnd, true),
@@ -967,6 +1097,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     ID_IMPORT => on_import(hwnd),
                     ID_PICK_APP => on_pick_app(hwnd, ID_APPS),
                     ID_CH_PICK_EXCLUDE => on_pick_app(hwnd, ID_CH_EXCLUDE),
+                    ID_AM_PICK => on_pick_app(hwnd, ID_AM_APP),
+                    ID_AM_ADD => on_add_app_mode(hwnd),
+                    ID_AM_REMOVE => on_remove_app_mode(hwnd),
                     _ => {}
                 }
             }
@@ -1014,6 +1147,12 @@ unsafe fn on_pick_app(hwnd: HWND, id: i32) {
         return;
     };
     if !IsWindow(hwnd).as_bool() {
+        return;
+    }
+    if id == ID_AM_APP {
+        // アプリごとの入力は 1 つずつ足すので、選んだアプリで置き換える。
+        set_text(hwnd, id, &name);
+        ui::focus(hwnd, ID_AM_MODE);
         return;
     }
     let apps = remap_logic::add_app(&get_text(hwnd, id), &name);
@@ -1100,6 +1239,15 @@ unsafe fn on_save(hwnd: HWND, close: bool) {
     settings.ime_indicator.badge_opacity = ime.badge_opacity;
     settings.ime_indicator.badge_on_ibeam = ime.badge_on_ibeam;
     settings.ime_indicator.badge_keep_at_caret = ime.badge_keep_at_caret;
+    settings.ime_indicator.app_modes_enabled = ime.app_modes_enabled;
+    settings.ime_indicator.app_modes = ime
+        .app_modes
+        .iter()
+        .map(|rule| AppImeModeSetting {
+            app: rule.app.clone(),
+            mode: rule.mode.as_setting().to_string(),
+        })
+        .collect();
     settings.log.enabled = form.log;
     settings.update.check_on_startup = form.check_update;
     settings.update.check_every_hours = form.update_every_hours;
