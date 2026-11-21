@@ -235,7 +235,7 @@ const PAGE_IME: &[Item] = &[
     item(ID_BADGE_OPACITY, Kind::NumberEdit, "", 424, 348, 34, 24),
     item(238, Kind::Label, "%", 462, 348, 16, 24),
     item(ID_BADGE_KEEP, Kind::Check, "入力位置では出し続ける", 24, 374, 170, 22),
-    item(ID_BADGE_IBEAM, Kind::Check, "マウスが文字入力の形（I）になったら出す", 200, 374, 280, 22),
+    item(ID_BADGE_IBEAM, Kind::Check, "マウスが I の形のときも出す", 200, 374, 284, 22),
     item(ID_FULLSCREEN, Kind::Check, "全画面のアプリでは表示しない", 16, 404, 212, 22),
     item(ID_NO_CAPTURE, Kind::Check, "スクリーンショット・画面共有に写さない", 232, 404, 252, 22),
 ];

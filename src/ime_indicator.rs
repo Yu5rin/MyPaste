@@ -214,7 +214,7 @@ impl Params {
         badge_when: BadgeWhen::Auto,
         badge_hold_ms: ime_logic::DEFAULT_BADGE_HOLD_MS,
         badge_opacity: ime_logic::DEFAULT_BADGE_OPACITY,
-        badge_on_ibeam: true,
+        badge_on_ibeam: false,
         badge_keep_at_caret: true,
         app_modes_enabled: true,
         app_modes: Vec::new(),

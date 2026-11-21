@@ -289,12 +289,14 @@ pub struct BadgeEvents {
 /// 入力モードを知らせる」ためのものなので、文字を打つ場所だと分かる出来事だけを数える。
 ///
 /// - モードを切り替えた: いつも数える。
-/// - クリック: 入力欄をクリックしたときだけ。入力位置が分かるか（「おまかせ」では）マウスカーソルが
-///   文字入力の形のときに押した場合。ボタンや余白のクリックは数えない。
+/// - クリック: 入力欄をクリックしたときだけ（押した直後に入力位置が分かるようになった場合）。
+///   ボタンや余白、読むだけの文字のクリックは数えない。「おまかせ」で `on_ibeam` が真のときは、
+///   マウスカーソルが文字入力の形のときに押した場合も数える（入力位置が分からないアプリ向け）。
 /// - 入力欄に来た: 「おまかせ」のとき。ただし打っている最中は数えない（Excel のセルのように、
 ///   打ち始めると入力位置ができるアプリで、打っている文字の横に出さないように）。
 /// - マウスカーソルが文字入力の形に変わった: 「おまかせ」で `on_ibeam` が真、入力位置が
-///   分からないときだけ（分かるときは、入力位置の横に出すので要らない）。
+///   分からないときだけ（分かるときは、入力位置の横に出すので要らない）。読むだけの文字の上でも
+///   その形になるので、`on_ibeam` は既定で偽にしている。
 pub fn badge_triggered(when: BadgeWhen, on_ibeam: bool, events: BadgeEvents) -> bool {
     match when {
         BadgeWhen::Always => false,
@@ -302,7 +304,7 @@ pub fn badge_triggered(when: BadgeWhen, on_ibeam: bool, events: BadgeEvents) -> 
         BadgeWhen::Auto => {
             events.mode_switched
                 || (events.caret_appeared && !events.typing)
-                || (events.click && (events.caret_known || events.click_ibeam))
+                || (events.click && (events.caret_known || (on_ibeam && events.click_ibeam)))
                 || (on_ibeam && events.ibeam_entered && !events.caret_known)
         }
     }
@@ -1339,8 +1341,10 @@ mod tests {
         }
         // 入力欄に来た・文字入力の形のカーソルで押した・その形に変わった、は「おまかせ」だけ。
         assert!(badge_triggered(Auto, true, arrived));
-        assert!(badge_triggered(Auto, false, click_on_text));
+        assert!(badge_triggered(Auto, true, click_on_text));
         assert!(badge_triggered(Auto, true, ibeam));
+        // マウスカーソルの形を見ない設定（既定）では、読むだけの文字の上に乗せても・押しても出さない。
+        assert!(!badge_triggered(Auto, false, click_on_text));
         assert!(!badge_triggered(Auto, false, ibeam));
         assert!(!badge_triggered(Auto, true, ibeam_at_caret));
         assert!(!badge_triggered(Typing, true, arrived));

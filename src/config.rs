@@ -244,6 +244,7 @@ pub struct ImeIndicatorSettings {
     /// 小さな印の不透明度（%。20〜100）。
     pub badge_opacity: u32,
     /// 「おまかせ」のとき、マウスカーソルが文字入力の形（I の形）になったら小さな印を出すか。
+    #[serde(rename = "badge_on_text_cursor")]
     pub badge_on_ibeam: bool,
     /// 「おまかせ」のとき、入力位置の横では出し続けるか（打っている間は消す）。
     pub badge_keep_at_caret: bool,
@@ -299,7 +300,7 @@ impl Default for ImeIndicatorSettings {
             badge_when: "auto".to_string(),
             badge_hold_ms: crate::ime_logic::DEFAULT_BADGE_HOLD_MS,
             badge_opacity: crate::ime_logic::DEFAULT_BADGE_OPACITY,
-            badge_on_ibeam: true,
+            badge_on_ibeam: false,
             badge_keep_at_caret: true,
             app_modes_enabled: true,
             app_modes: Vec::new(),
@@ -585,7 +586,7 @@ pub fn save_from_settings_window(settings: &Settings) -> Result<(), String> {
             "badge_when": settings.ime_indicator.badge_when,
             "badge_hold_ms": settings.ime_indicator.badge_hold_ms,
             "badge_opacity": settings.ime_indicator.badge_opacity,
-            "badge_on_ibeam": settings.ime_indicator.badge_on_ibeam,
+            "badge_on_text_cursor": settings.ime_indicator.badge_on_ibeam,
             "badge_keep_at_caret": settings.ime_indicator.badge_keep_at_caret,
             "app_modes_enabled": settings.ime_indicator.app_modes_enabled,
             "app_modes": settings.ime_indicator.app_modes,
