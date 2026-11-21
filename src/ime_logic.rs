@@ -279,6 +279,9 @@ pub struct BadgeEvents {
     pub ibeam_entered: bool,
     /// 入力位置（キャレット）が分かる。
     pub caret_known: bool,
+    /// クリックのあと、フォーカスが編集できる入力欄にあると分かった（入力位置を知らせないアプリ
+    /// でも、アクセシビリティの情報から分かることがある）。
+    pub focus_editable: bool,
     /// 入力欄に来た（入力位置が分かるようになった・入力位置のある別の入力欄に移った）。
     pub caret_appeared: bool,
     /// 打っている最中（最後にキーを打ってから [`BADGE_TYPING_QUIET_MS`] たっていない）。
@@ -289,8 +292,9 @@ pub struct BadgeEvents {
 /// 入力モードを知らせる」ためのものなので、文字を打つ場所だと分かる出来事だけを数える。
 ///
 /// - モードを切り替えた: いつも数える。
-/// - クリック: 入力欄をクリックしたときだけ（押した直後に入力位置が分かるようになった場合）。
-///   ボタンや余白、読むだけの文字のクリックは数えない。「おまかせ」で `on_ibeam` が真のときは、
+/// - クリック: 入力欄をクリックしたときだけ（押した直後に入力位置が分かるようになった場合か、
+///   フォーカスが編集できる入力欄にあると分かった場合）。ボタンや余白、読むだけの文字のクリックは
+///   数えない。「おまかせ」で `on_ibeam` が真のときは、
 ///   マウスカーソルが文字入力の形のときに押した場合も数える（入力位置が分からないアプリ向け）。
 /// - 入力欄に来た: 「おまかせ」のとき。ただし打っている最中は数えない（Excel のセルのように、
 ///   打ち始めると入力位置ができるアプリで、打っている文字の横に出さないように）。
@@ -300,11 +304,16 @@ pub struct BadgeEvents {
 pub fn badge_triggered(when: BadgeWhen, on_ibeam: bool, events: BadgeEvents) -> bool {
     match when {
         BadgeWhen::Always => false,
-        BadgeWhen::Typing => events.mode_switched || (events.click && events.caret_known),
+        BadgeWhen::Typing => {
+            events.mode_switched || (events.click && (events.caret_known || events.focus_editable))
+        }
         BadgeWhen::Auto => {
             events.mode_switched
                 || (events.caret_appeared && !events.typing)
-                || (events.click && (events.caret_known || (on_ibeam && events.click_ibeam)))
+                || (events.click
+                    && (events.caret_known
+                        || events.focus_editable
+                        || (on_ibeam && events.click_ibeam)))
                 || (on_ibeam && events.ibeam_entered && !events.caret_known)
         }
     }
@@ -335,6 +344,8 @@ pub struct BadgeInput {
     pub focus: isize,
     /// 入力位置（キャレット）が分かる。
     pub caret_known: bool,
+    /// まだ数えていないクリックのあとで、フォーカスが編集できる入力欄にあると分かった。
+    pub focus_editable: bool,
 }
 
 /// 小さな印のきっかけを、監視のたびに数えるための状態。
@@ -359,6 +370,11 @@ pub struct BadgeTracker {
 }
 
 impl BadgeTracker {
+    /// まだきっかけとして数えていないクリック（押した時刻と、そのとき I の形だったか）。
+    pub fn pending_click(&self) -> Option<(u32, bool)> {
+        self.click
+    }
+
     /// 監視 1 回分の様子を受け取り、キーを打った時刻ときっかけの時刻を更新する。
     pub fn step(&mut self, when: BadgeWhen, on_ibeam: bool, input: BadgeInput) {
         let now = input.now;
@@ -392,6 +408,7 @@ impl BadgeTracker {
             mode_switched: self.seen.is_some() && input.mode.is_some() && self.seen != input.mode,
             ibeam_entered: input.ibeam && !self.ibeam,
             caret_known: input.caret_known,
+            focus_editable: input.focus_editable,
             caret_appeared,
             typing: self.key.is_some_and(|at| within(at, BADGE_TYPING_QUIET_MS)),
         };
@@ -1338,6 +1355,10 @@ mod tests {
             assert!(badge_triggered(when, true, click_in_input));
             // 入力欄ではない所（ボタン・余白）のクリックは数えない。
             assert!(!badge_triggered(when, true, click));
+            // 入力位置を知らせない入力欄（エクスプローラーの検索欄など）でも、フォーカスが
+            // 編集できる入力欄にあると分かれば数える。
+            let click_in_edit = BadgeEvents { click: true, focus_editable: true, ..none };
+            assert!(badge_triggered(when, false, click_in_edit));
         }
         // 入力欄に来た・文字入力の形のカーソルで押した・その形に変わった、は「おまかせ」だけ。
         assert!(badge_triggered(Auto, true, arrived));

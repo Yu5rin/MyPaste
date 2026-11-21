@@ -48,9 +48,16 @@ use windows::Win32::Graphics::Gdi::{
     DT_VCENTER, FF_DONTCARE, FW_BOLD, HFONT, HGDIOBJ, HMONITOR, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
-use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+    COINIT_MULTITHREADED,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Accessibility::{IAccessible, ObjectFromLresult};
+use windows::Win32::UI::Accessibility::{
+    CUIAutomation, IAccessible, IUIAutomation, IUIAutomation2, IUIAutomationValuePattern,
+    ObjectFromLresult, UIA_ComboBoxControlTypeId, UIA_DocumentControlTypeId,
+    UIA_EditControlTypeId, UIA_ValuePatternId,
+};
 use windows::Win32::System::SystemInformation::{GetTickCount, OSVERSIONINFOW};
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
@@ -864,6 +871,22 @@ unsafe fn update_badge(observed: Option<&Observed>) {
     let click = CLICK_TICK.swap(0, Ordering::Relaxed) != 0;
     let ibeam = cursor_is_ibeam();
     let caret_known = observed.is_some_and(|o| o.caret.is_some());
+    // 入力位置を知らせない入力欄のために、押したあと、フォーカスが編集できる入力欄にあるかを
+    // 調べる（エクスプローラーのアドレスバーのように、押す前は I の形でない欄もある）。結果は
+    // 専用のスレッドから少しあとに届く。
+    let pending = STATE.with(|s| s.borrow().as_ref().and_then(|st| st.badge.tracker.pending_click()));
+    let pending = if click { Some((now, ibeam)) } else { pending };
+    let wants_focus_check = params.badge_enabled
+        && params.badge_when != BadgeWhen::Always
+        && observed.is_some()
+        && !caret_known;
+    let focus_editable = match pending {
+        Some((at, _)) if wants_focus_check => {
+            request_focus_check(now);
+            focus_editable_since(at)
+        }
+        _ => false,
+    };
     let times = STATE.with(|s| {
         let mut s = s.borrow_mut();
         let badge = &mut s.as_mut()?.badge;
@@ -875,6 +898,7 @@ unsafe fn update_badge(observed: Option<&Observed>) {
             mode: observed.map(|o| o.mode),
             focus: observed.map_or(0, |o| o.focus.0 as isize),
             caret_known,
+            focus_editable,
         };
         badge.tracker.step(params.badge_when, params.badge_on_ibeam, input);
         Some((badge.tracker.key, badge.tracker.trigger))
@@ -1209,6 +1233,10 @@ struct AccCaret {
     request: isize,
     /// 最後に調べた結果（フォーカス先・入力位置・調べ終えた時刻）。
     result: Option<(isize, Option<RECT>, u32)>,
+    /// フォーカスが編集できる入力欄にあるかを調べてほしい（頼んだ時刻。0 は無し）。
+    focus_request: u32,
+    /// 最後に調べた結果（頼んだ時刻・編集できる入力欄か）。
+    focus_result: Option<(u32, bool)>,
     /// 専用のスレッドを作ったか。
     started: bool,
 }
@@ -1216,6 +1244,8 @@ struct AccCaret {
 static ACC_CARET: Mutex<AccCaret> = Mutex::new(AccCaret {
     request: 0,
     result: None,
+    focus_request: 0,
+    focus_result: None,
     started: false,
 });
 /// 専用のスレッドに、新しい頼みが来たことを知らせる。
@@ -1230,15 +1260,7 @@ fn cached_accessible_caret(focus: HWND) -> Option<RECT> {
     let focus = focus.0 as isize;
     let now = unsafe { GetTickCount() };
     let mut acc = ACC_CARET.lock().unwrap_or_else(|p| p.into_inner());
-    if !acc.started {
-        acc.started = true;
-        let spawned = std::thread::Builder::new()
-            .name("accessible-caret".into())
-            .spawn(accessible_caret_thread);
-        if let Err(e) = spawned {
-            log::warn!("入力位置を調べるスレッドを開始できませんでした: {e}");
-        }
-    }
+    start_accessible_thread(&mut acc);
     acc.request = focus;
     ACC_CARET_WAKE.notify_one();
     match acc.result {
@@ -1249,24 +1271,111 @@ fn cached_accessible_caret(focus: HWND) -> Option<RECT> {
     }
 }
 
-/// 入力位置を調べる専用のスレッド。頼まれたフォーカス先を調べ、結果を置く（終了まで動く）。
-fn accessible_caret_thread() {
-    unsafe {
-        // アクセシビリティの情報を受け取るのに COM を使う。
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+/// 専用のスレッドを、まだなら作る。
+fn start_accessible_thread(acc: &mut AccCaret) {
+    if acc.started {
+        return;
     }
+    acc.started = true;
+    let spawned = std::thread::Builder::new()
+        .name("accessible-caret".into())
+        .spawn(accessible_caret_thread);
+    if let Err(e) = spawned {
+        log::warn!("入力位置を調べるスレッドを開始できませんでした: {e}");
+    }
+}
+
+/// フォーカスが編集できる入力欄にあるかを、専用のスレッドに調べてもらう（`now` は頼んだ時刻）。
+fn request_focus_check(now: u32) {
+    let mut acc = ACC_CARET.lock().unwrap_or_else(|p| p.into_inner());
+    start_accessible_thread(&mut acc);
+    acc.focus_request = now.max(1);
+    ACC_CARET_WAKE.notify_one();
+}
+
+/// `since` 以後に頼んだ調べで、フォーカスが編集できる入力欄にあると分かったか。
+fn focus_editable_since(since: u32) -> bool {
+    let acc = ACC_CARET.lock().unwrap_or_else(|p| p.into_inner());
+    acc.focus_result.is_some_and(|(at, editable)| {
+        // 時刻は約 49 日で 0 に戻るので、差で比べる（頼んだのが押したあとなら、差は小さい）。
+        editable && at.wrapping_sub(since) < 60_000
+    })
+}
+
+/// 入力位置を調べる専用のスレッド。頼まれたフォーカス先を調べ、結果を置く（終了まで動く）。
+/// クリックのあとには、フォーカスが編集できる入力欄にあるかも調べる。
+fn accessible_caret_thread() {
+    // アクセシビリティの情報を受け取るのに COM を使う。UI オートメーションの呼び出し元は
+    // マルチスレッドのアパートメントにする（メッセージを回さないスレッドのため）。
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    let mut automation: Option<IUIAutomation> = None;
     loop {
-        let focus = {
+        let (focus, focus_request) = {
             let mut acc = ACC_CARET.lock().unwrap_or_else(|p| p.into_inner());
-            while acc.request == 0 {
+            while acc.request == 0 && acc.focus_request == 0 {
                 acc = ACC_CARET_WAKE.wait(acc).unwrap_or_else(|p| p.into_inner());
             }
-            std::mem::take(&mut acc.request)
+            (std::mem::take(&mut acc.request), std::mem::take(&mut acc.focus_request))
         };
-        let rect = unsafe { accessible_caret_rect(HWND(focus as *mut core::ffi::c_void)) };
-        let at = unsafe { GetTickCount() };
-        ACC_CARET.lock().unwrap_or_else(|p| p.into_inner()).result = Some((focus, rect, at));
+        if focus != 0 {
+            let rect = unsafe { accessible_caret_rect(HWND(focus as *mut core::ffi::c_void)) };
+            let at = unsafe { GetTickCount() };
+            ACC_CARET.lock().unwrap_or_else(|p| p.into_inner()).result = Some((focus, rect, at));
+        }
+        if focus_request != 0 {
+            if automation.is_none() {
+                automation = unsafe { create_automation() };
+            }
+            let editable = automation
+                .as_ref()
+                .and_then(|a| unsafe { focused_element_is_editable(a) })
+                .unwrap_or(false);
+            ACC_CARET.lock().unwrap_or_else(|p| p.into_inner()).focus_result =
+                Some((focus_request, editable));
+        }
     }
+}
+
+/// UI オートメーションを使えるようにする。相手が固まっていても長く待たないよう、待つ時間を短くする。
+unsafe fn create_automation() -> Option<IUIAutomation> {
+    let automation: IUIAutomation =
+        match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
+            Ok(automation) => automation,
+            Err(e) => {
+                log::debug!("入力モード: UI オートメーションを使えません: {e}");
+                return None;
+            }
+        };
+    if let Ok(timeouts) = automation.cast::<IUIAutomation2>() {
+        let _ = timeouts.SetConnectionTimeout(500);
+        let _ = timeouts.SetTransactionTimeout(500);
+    }
+    Some(automation)
+}
+
+/// フォーカスのある部品が、文字を入力できる欄か（UI オートメーションで調べる）。
+///
+/// 入力位置（キャレット）を Windows に知らせない入力欄（エクスプローラーの検索欄・アドレスバー
+/// など）でも、入力欄であることは分かる。読むだけの文字（読み取り専用の欄・ページの本文）は
+/// 入力欄に数えない。分からなければ `None`。
+unsafe fn focused_element_is_editable(automation: &IUIAutomation) -> Option<bool> {
+    let element = automation.GetFocusedElement().ok()?;
+    let control = element.CurrentControlType().ok()?;
+    let read_only = element
+        .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+        .ok()
+        .and_then(|value| value.CurrentIsReadOnly().ok())
+        .map(|read_only| read_only.as_bool());
+    Some(if control == UIA_EditControlTypeId {
+        read_only != Some(true)
+    } else if control == UIA_DocumentControlTypeId || control == UIA_ComboBoxControlTypeId {
+        // 文書（ページ全体など）や組み合わせの欄は、書き換えられると分かったときだけ。
+        read_only == Some(false)
+    } else {
+        false
+    })
 }
 
 /// アクセシビリティの情報（`OBJID_CARET`）から、入力位置を画面座標で返す。
