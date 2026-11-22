@@ -213,7 +213,7 @@ impl BadgeWhen {
 }
 
 /// 「打ち始めたときだけ」のときに、小さな印を出しておく時間の範囲と既定（ミリ秒）。
-pub const BADGE_HOLD_MS_MIN: u64 = 1000;
+pub const BADGE_HOLD_MS_MIN: u64 = 200;
 pub const BADGE_HOLD_MS_MAX: u64 = 10_000;
 pub const DEFAULT_BADGE_HOLD_MS: u64 = 2000;
 /// 小さな印の不透明度の範囲と既定（%）。
@@ -386,9 +386,11 @@ impl BadgeTracker {
         }
         if input.click {
             self.click = Some((now, input.ibeam));
-            // 押したら、それまでのきっかけは終わり（入力欄の外を押したときに、前に入力欄で出した印を
-            // 残りの時間だけ出し続けないように）。押した先が入力欄なら、すぐに数え直して出す。
+            // 押したら、それまでのきっかけと、打ったキーは終わり（入力欄の外を押したときに、前に
+            // 入力欄で出した印を残りの時間だけ出し続けないように）。押した先が入力欄なら、すぐに
+            // 数え直して出す。
             self.trigger = None;
+            self.key = None;
         }
         self.click = self.click.filter(|(at, _)| within(*at, BADGE_CLICK_PENDING_MS));
 
@@ -1506,6 +1508,11 @@ mod tests {
         assert!(run(&mut t, base(10_500)));
         assert!(!run(&mut t, BadgeInput { click: true, ..base(10_600) }));
         assert!(!run(&mut t, base(10_700)));
+        // 入力欄で打った直後に外を押したときも、すぐに消す（打ったことで出している印も消す）。
+        let mut t = BadgeTracker::default();
+        run(&mut t, base(15_000));
+        assert!(run(&mut t, BadgeInput { key: true, ..base(15_100) }));
+        assert!(!run(&mut t, BadgeInput { click: true, ..base(15_300) }));
         // 入力位置の横に出していたときも、外を押して入力位置が無くなったら、すぐに消す。
         let mut t = BadgeTracker::default();
         run(&mut t, at_caret(20_000, ImeMode::Hiragana));

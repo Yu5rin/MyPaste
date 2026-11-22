@@ -239,7 +239,7 @@ pub struct ImeIndicatorSettings {
     pub badge_size: u32,
     /// 小さな印を出すとき（`"auto"`＝おまかせ / `"typing"`＝打ち始めたときだけ / `"always"`＝出し続ける）。
     pub badge_when: String,
-    /// 「打ち始めたときだけ」のときに、出しておく時間（ミリ秒。1000〜10000）。
+    /// 「打ち始めたときだけ」のときに、出しておく時間（ミリ秒。200〜10000）。
     pub badge_hold_ms: u64,
     /// 小さな印の不透明度（%。20〜100）。
     pub badge_opacity: u32,

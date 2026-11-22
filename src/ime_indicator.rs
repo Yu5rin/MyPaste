@@ -39,7 +39,10 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use windows::core::{w, Interface, VARIANT};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::System::Ole::{
+    SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetLBound, SafeArrayGetUBound, SafeArrayUnaccessData,
+};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, ClientToScreen, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject,
     DrawTextW, EndPaint, FillRect, GetMonitorInfoW, InvalidateRect, MonitorFromPoint,
@@ -54,9 +57,11 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IAccessible, IUIAutomation, IUIAutomation2, IUIAutomationValuePattern,
-    ObjectFromLresult, UIA_ComboBoxControlTypeId, UIA_DocumentControlTypeId,
-    UIA_EditControlTypeId, UIA_ValuePatternId,
+    CUIAutomation, IAccessible, IUIAutomation, IUIAutomation2, IUIAutomationElement,
+    IUIAutomationTextPattern2, IUIAutomationTextRange, IUIAutomationValuePattern,
+    ObjectFromLresult, TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start,
+    TextUnit_Character, UIA_ComboBoxControlTypeId, UIA_DocumentControlTypeId,
+    UIA_EditControlTypeId, UIA_TextPattern2Id, UIA_ValuePatternId,
 };
 use windows::Win32::System::SystemInformation::{GetTickCount, OSVERSIONINFOW};
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
@@ -1182,7 +1187,7 @@ unsafe fn query_foreground_ime(accessible: bool) -> Option<Observed> {
     // 調べたものを使う（相手が固まっても、この監視を止めないように）。
     let caret = if have_info {
         system_caret_rect(&info)
-            .or_else(|| if accessible { cached_accessible_caret(info.hwndFocus) } else { None })
+            .or_else(|| if accessible { cached_accessible_caret(info.hwndFocus, pid) } else { None })
             .filter(|rc| caret_in_window(rc, focus))
     } else {
         None
@@ -1231,6 +1236,8 @@ unsafe fn caret_in_window(caret: &RECT, focus: HWND) -> bool {
 struct AccCaret {
     /// 調べてほしいフォーカス先（最新の 1 つだけ。0 は無し）。
     request: isize,
+    /// 調べてほしいフォーカス先のプロセス（UI オートメーションで、別のアプリの部品を拾わないため）。
+    request_pid: u32,
     /// 最後に調べた結果（フォーカス先・入力位置・調べ終えた時刻）。
     result: Option<(isize, Option<RECT>, u32)>,
     /// フォーカスが編集できる入力欄にあるかを調べてほしい（頼んだ時刻。0 は無し）。
@@ -1243,6 +1250,7 @@ struct AccCaret {
 
 static ACC_CARET: Mutex<AccCaret> = Mutex::new(AccCaret {
     request: 0,
+    request_pid: 0,
     result: None,
     focus_request: 0,
     focus_result: None,
@@ -1253,7 +1261,7 @@ static ACC_CARET_WAKE: Condvar = Condvar::new();
 
 /// `focus` の入力位置を、専用のスレッドで調べた結果から返す。同じフォーカス先の新しい結果が
 /// 無ければ `None`（いまは分からないことにする）。あわせて、次の結果を頼んでおく。
-fn cached_accessible_caret(focus: HWND) -> Option<RECT> {
+fn cached_accessible_caret(focus: HWND, pid: u32) -> Option<RECT> {
     if focus.is_invalid() {
         return None;
     }
@@ -1262,6 +1270,7 @@ fn cached_accessible_caret(focus: HWND) -> Option<RECT> {
     let mut acc = ACC_CARET.lock().unwrap_or_else(|p| p.into_inner());
     start_accessible_thread(&mut acc);
     acc.request = focus;
+    acc.request_pid = pid;
     ACC_CARET_WAKE.notify_one();
     match acc.result {
         Some((window, rect, at)) if window == focus && now.wrapping_sub(at) < ACC_RESULT_FRESH_MS => {
@@ -1311,23 +1320,49 @@ fn accessible_caret_thread() {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
     let mut automation: Option<IUIAutomation> = None;
+    // UI オートメーションで調べた入力欄の位置（フォーカス先・位置・調べた時刻）。何度も問い合わせない
+    // よう、少しの間は使い回す。
+    let mut uia_cache: Option<(isize, Option<RECT>, u32)> = None;
     loop {
-        let (focus, focus_request) = {
+        let (focus, pid, focus_request) = {
             let mut acc = ACC_CARET.lock().unwrap_or_else(|p| p.into_inner());
             while acc.request == 0 && acc.focus_request == 0 {
                 acc = ACC_CARET_WAKE.wait(acc).unwrap_or_else(|p| p.into_inner());
             }
-            (std::mem::take(&mut acc.request), std::mem::take(&mut acc.focus_request))
+            (
+                std::mem::take(&mut acc.request),
+                acc.request_pid,
+                std::mem::take(&mut acc.focus_request),
+            )
         };
+        if (focus != 0 || focus_request != 0) && automation.is_none() {
+            automation = unsafe { create_automation() };
+        }
         if focus != 0 {
-            let rect = unsafe { accessible_caret_rect(HWND(focus as *mut core::ffi::c_void)) };
+            let mut rect = unsafe { accessible_caret_rect(HWND(focus as *mut core::ffi::c_void)) };
+            if rect.is_none() {
+                // 入力位置を知らせない入力欄（エクスプローラーの検索欄など）は、UI オートメーションで
+                // 入力欄の位置を調べる。
+                let now = unsafe { GetTickCount() };
+                rect = match uia_cache {
+                    Some((window, cached, at))
+                        if window == focus && now.wrapping_sub(at) < UIA_CARET_REUSE_MS =>
+                    {
+                        cached
+                    }
+                    _ => {
+                        let found = automation
+                            .as_ref()
+                            .and_then(|a| unsafe { uia_input_rect(a, pid) });
+                        uia_cache = Some((focus, found, unsafe { GetTickCount() }));
+                        found
+                    }
+                };
+            }
             let at = unsafe { GetTickCount() };
             ACC_CARET.lock().unwrap_or_else(|p| p.into_inner()).result = Some((focus, rect, at));
         }
         if focus_request != 0 {
-            if automation.is_none() {
-                automation = unsafe { create_automation() };
-            }
             let editable = automation
                 .as_ref()
                 .and_then(|a| unsafe { focused_element_is_editable(a) })
@@ -1355,6 +1390,88 @@ unsafe fn create_automation() -> Option<IUIAutomation> {
     Some(automation)
 }
 
+/// UI オートメーションで調べた入力欄の位置を、使い回す時間（ミリ秒）。
+const UIA_CARET_REUSE_MS: u32 = 250;
+
+/// フォーカスのある部品が `pid` のアプリの、文字を入力できる欄なら、入力位置（分からなければ
+/// 入力欄そのもの）の画面上の四角を返す（UI オートメーションで調べる）。
+unsafe fn uia_input_rect(automation: &IUIAutomation, pid: u32) -> Option<RECT> {
+    let element = automation.GetFocusedElement().ok()?;
+    if element.CurrentProcessId().ok()? as u32 != pid || !element_is_editable(&element)? {
+        return None;
+    }
+    // 入力位置が分かれば、そこ。分からなければ、入力欄の右の端（印を入力欄の右に出す）。
+    if let Some(rect) = uia_caret_rect(&element) {
+        return Some(rect);
+    }
+    let bounds = element.CurrentBoundingRectangle().ok()?;
+    (bounds.right > bounds.left && bounds.bottom > bounds.top).then_some(RECT {
+        left: bounds.right - 1,
+        ..bounds
+    })
+}
+
+/// 入力欄の入力位置を、文字の範囲の機能（TextPattern2）から調べる。
+unsafe fn uia_caret_rect(element: &IUIAutomationElement) -> Option<RECT> {
+    let pattern = element
+        .GetCurrentPatternAs::<IUIAutomationTextPattern2>(UIA_TextPattern2Id)
+        .ok()?;
+    let mut active = BOOL(0);
+    let caret = pattern.GetCaretRange(&mut active).ok()?;
+    if let Some(rect) = range_rect(&caret) {
+        return Some(RECT { left: rect.left, right: rect.left + 1, ..rect });
+    }
+    // 幅の無い範囲は四角が返らないことがある。後ろの 1 文字・前の 1 文字に広げて調べる。
+    let next = caret.Clone().ok()?;
+    if next
+        .MoveEndpointByUnit(TextPatternRangeEndpoint_End, TextUnit_Character, 1)
+        .is_ok_and(|moved| moved == 1)
+    {
+        if let Some(rect) = range_rect(&next) {
+            return Some(RECT { right: rect.left + 1, ..rect });
+        }
+    }
+    let previous = caret.Clone().ok()?;
+    if previous
+        .MoveEndpointByUnit(TextPatternRangeEndpoint_Start, TextUnit_Character, -1)
+        .is_ok_and(|moved| moved == -1)
+    {
+        if let Some(rect) = range_rect(&previous) {
+            return Some(RECT { left: rect.right - 1, ..rect });
+        }
+    }
+    None
+}
+
+/// 文字の範囲の、最初の四角（画面座標）。
+unsafe fn range_rect(range: &IUIAutomationTextRange) -> Option<RECT> {
+    let array = range.GetBoundingRectangles().ok()?;
+    if array.is_null() {
+        return None;
+    }
+    let rect = (|| {
+        let lower = SafeArrayGetLBound(array, 1).ok()?;
+        let upper = SafeArrayGetUBound(array, 1).ok()?;
+        // 四角 1 つにつき、左・上・幅・高さの 4 つの数。
+        if upper - lower + 1 < 4 {
+            return None;
+        }
+        let mut data: *mut core::ffi::c_void = std::ptr::null_mut();
+        SafeArrayAccessData(array, &mut data).ok()?;
+        let values = std::slice::from_raw_parts(data as *const f64, 4);
+        let (left, top, width, height) = (values[0], values[1], values[2], values[3]);
+        let _ = SafeArrayUnaccessData(array);
+        (height > 0.0).then(|| RECT {
+            left: left.round() as i32,
+            top: top.round() as i32,
+            right: (left + width.max(1.0)).round() as i32,
+            bottom: (top + height).round() as i32,
+        })
+    })();
+    let _ = SafeArrayDestroy(array);
+    rect
+}
+
 /// フォーカスのある部品が、文字を入力できる欄か（UI オートメーションで調べる）。
 ///
 /// 入力位置（キャレット）を Windows に知らせない入力欄（エクスプローラーの検索欄・アドレスバー
@@ -1362,6 +1479,11 @@ unsafe fn create_automation() -> Option<IUIAutomation> {
 /// 入力欄に数えない。分からなければ `None`。
 unsafe fn focused_element_is_editable(automation: &IUIAutomation) -> Option<bool> {
     let element = automation.GetFocusedElement().ok()?;
+    element_is_editable(&element)
+}
+
+/// 部品が、文字を入力できる欄か。読み取り専用の欄やページの本文は数えない。
+unsafe fn element_is_editable(element: &IUIAutomationElement) -> Option<bool> {
     let control = element.CurrentControlType().ok()?;
     let read_only = element
         .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
