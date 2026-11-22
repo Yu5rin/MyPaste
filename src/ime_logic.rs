@@ -386,6 +386,9 @@ impl BadgeTracker {
         }
         if input.click {
             self.click = Some((now, input.ibeam));
+            // 押したら、それまでのきっかけは終わり（入力欄の外を押したときに、前に入力欄で出した印を
+            // 残りの時間だけ出し続けないように）。押した先が入力欄なら、すぐに数え直して出す。
+            self.trigger = None;
         }
         self.click = self.click.filter(|(at, _)| within(*at, BADGE_CLICK_PENDING_MS));
 
@@ -1490,6 +1493,29 @@ mod tests {
         t.step(BadgeWhen::Auto, false, BadgeInput { click: true, ..base(10_100) });
         t.step(BadgeWhen::Auto, false, BadgeInput { ibeam: true, ..base(10_200) });
         assert_eq!(t.trigger, None);
+    }
+
+    #[test]
+    fn clicking_outside_the_input_hides_the_badge_at_once() {
+        // 入力位置を知らせない入力欄（マウスの横に出す）をクリックして印が出たあと、入力欄の外を
+        // クリックしたら、残りの時間を待たずに消す。
+        let base = |now| BadgeInput { now, mode: Some(ImeMode::Hiragana), focus: 7, ..BadgeInput::default() };
+        let mut t = BadgeTracker::default();
+        run(&mut t, base(10_000));
+        assert!(run(&mut t, BadgeInput { click: true, focus_editable: true, ..base(10_100) }));
+        assert!(run(&mut t, base(10_500)));
+        assert!(!run(&mut t, BadgeInput { click: true, ..base(10_600) }));
+        assert!(!run(&mut t, base(10_700)));
+        // 入力位置の横に出していたときも、外を押して入力位置が無くなったら、すぐに消す。
+        let mut t = BadgeTracker::default();
+        run(&mut t, at_caret(20_000, ImeMode::Hiragana));
+        assert!(run(&mut t, BadgeInput { click: true, ..at_caret(20_100, ImeMode::Hiragana) }));
+        assert!(!run(&mut t, BadgeInput { click: true, ..base(20_600) }));
+        // 同じ入力欄の中を押し直したときは、消さずに出したまま。
+        let mut t = BadgeTracker::default();
+        run(&mut t, at_caret(30_000, ImeMode::Hiragana));
+        assert!(run(&mut t, BadgeInput { click: true, ..at_caret(30_100, ImeMode::Hiragana) }));
+        assert!(run(&mut t, BadgeInput { click: true, ..at_caret(30_400, ImeMode::Hiragana) }));
     }
 
     #[test]
